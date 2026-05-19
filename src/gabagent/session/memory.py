@@ -29,11 +29,29 @@ class MemoryManager:
         with open(self._path, "a", encoding="utf-8") as f:
             f.write(entry)
 
+    def rewrite(self, content: str) -> None:
+        self._path.write_text(content, encoding="utf-8")
+
     def clear(self) -> None:
         self._path.write_text("")
 
-    def rewrite(self, content: str) -> None:
-        self._path.write_text(content, encoding="utf-8")
+    def health_check(self) -> None:
+        """Archiving logic: if memory file > 200 lines, archive oldest and keep newest."""
+        if not self._path.exists():
+            return
+            
+        lines = self._path.read_text(encoding="utf-8").splitlines()
+        if len(lines) < 200:
+            return
+            
+        # Split: keep last 50 lines in memory, archive the rest
+        keep, archive = lines[-50:], lines[:-50]
+        
+        archive_path = self._path.with_name(f"{self._path.stem}-archive.md")
+        with archive_path.open("a", encoding="utf-8") as f:
+            f.write("\n".join(archive) + "\n")
+            
+        self._path.write_text("\n".join(keep), encoding="utf-8")
 
 
 @registry.register
@@ -61,6 +79,8 @@ class MemoryWriteTool(ToolBase):
             mgr.rewrite(content)
         else:
             mgr.append(content)
+            mgr.health_check()
+            
         ctx.system_prompt = _rebuild_system_prompt(ctx)
         return ToolResult(output=f"Memory {'replaced' if replace_all else 'updated'}.")
 
