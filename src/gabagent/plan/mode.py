@@ -67,4 +67,22 @@ class WritePlanTool(ToolBase):
             ctx.plan_file_path = ctx.cwd / ".claude" / f"plan-{uuid.uuid4().hex[:8]}.md"
             ctx.plan_file_path.parent.mkdir(parents=True, exist_ok=True)
         ctx.plan_file_path.write_text(content, encoding="utf-8")
-        return ToolResult(output=f"Plan written to {ctx.plan_file_path}")
+
+        if not ctx.plan_mode:
+            ctx.plan_mode = True
+            ctx.system_prompt += (
+                "\n\n---\n# PLAN MODE ACTIVE\n"
+                "You are now in plan mode. Writes, edits, and shell mutations are BLOCKED. "
+                f"Plan file: {ctx.plan_file_path}\n"
+                "Present a summary of the plan to the user and STOP. "
+                "Do NOT write files, run commands, or make edits. "
+                "Wait for the user to type /approve before proceeding."
+            )
+
+        return ToolResult(
+            output=(
+                f"Plan written to {ctx.plan_file_path}. "
+                "PLAN MODE ACTIVE — present the plan summary to the user and STOP. "
+                "Do not execute anything. Wait for /approve."
+            )
+        )

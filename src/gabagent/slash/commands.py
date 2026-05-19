@@ -21,6 +21,7 @@ async def handle_slash(command: str, ctx: AgentContext) -> bool:
         "/usage": _usage,
         "/memory": _memory,
         "/plan": _plan,
+        "/approve": _approve,
         "/fork": _fork,
         "/resume": _resume,
         "/config": _config,
@@ -51,7 +52,8 @@ async def _help(arg: str, ctx: AgentContext) -> None:
         ("/cost", "Show token usage and model info"),
         ("/usage", "Detailed session usage"),
         ("/memory", "Show persistent memory"),
-        ("/plan", "Enter/exit plan mode (read-only exploration)"),
+        ("/plan", "Enter/exit plan mode manually (write_plan auto-enters)"),
+        ("/approve", "Approve the current plan and allow execution to proceed"),
         ("/fork", "Fork current session"),
         ("/resume", "List and resume a past session"),
         ("/config", "Show current configuration"),
@@ -130,6 +132,18 @@ async def _plan(arg: str, ctx: AgentContext) -> None:
             "Use /plan again to exit.[/info]",
             markup=True,
         )
+
+
+async def _approve(arg: str, ctx: AgentContext) -> None:
+    from gabagent.plan.mode import exit_plan_mode
+    if not ctx.plan_mode:
+        console.print("[dim]No active plan — not in plan mode.[/dim]", markup=True)
+        return
+    exit_plan_mode(ctx)
+    console.print(
+        "[gab.accent]◆[/gab.accent] [dim]Plan approved. Proceeding with implementation.[/dim]",
+        markup=True,
+    )
 
 
 async def _fork(arg: str, ctx: AgentContext) -> None:

@@ -19,7 +19,12 @@ You have a two-way message bridge with Claude Code (the Anthropic assistant Rob 
 - If Rob asks "did you see a message from Claude?", answer from memory of the startup panel — do not search for files.
 
 ## Your codebase
-Your own source code lives at /home/rob/dev/gabagent. When asked to improve yourself, read files there directly."""
+Your own source code lives at /home/rob/dev/gabagent. When asked to improve yourself, read files there directly.
+
+## Planning
+When implementing any multi-step task, always use the write_plan tool first.
+This automatically enters plan mode and blocks execution until approved.
+Present the plan summary to the user and STOP — do not write files, run commands, or make edits until the user types /approve."""
 
 
 def _git_root(cwd: Path) -> Path | None:
