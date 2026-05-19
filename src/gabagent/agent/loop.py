@@ -53,7 +53,7 @@ async def _compact_context(ctx: AgentContext) -> None:
     shutil.copy2(old_path, pre_path)
     ctx.session.replace_all(new_messages)
     ctx.token_estimate = _estimate_tokens(new_messages)
-    console.print("[info]Context compacted.[/info]", markup=True)
+    console.print("[gab.accent]◆[/gab.accent] [dim]Context compacted.[/dim]", markup=True)
 
 
 async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None:
@@ -291,7 +291,7 @@ async def _execute_tool_calls(
             if override and override != (ctx.active_model or router.simple_model):
                 ctx.active_model = override
                 console.print(
-                    f"[dim]→ escalating to {override} (complex tool)[/dim]", markup=True
+                    f"[gab.accent]▸[/gab.accent] [dim]escalating to {override} (complex tool)[/dim]", markup=True
                 )
 
         start_time = time.time()
@@ -305,7 +305,7 @@ async def _execute_tool_calls(
             if override:
                 ctx.active_model = override
                 console.print(
-                    f"[dim]→ escalating to {override} (command failed)[/dim]", markup=True
+                    f"[gab.accent]▸[/gab.accent] [dim]escalating to {override} (command failed)[/dim]", markup=True
                 )
 
         if hooks_runner:

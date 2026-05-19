@@ -131,12 +131,12 @@ def main(
             else ctx.rate_limiter.badge
         )
         console.print(
-            f"[bold]Gab-Agent[/bold] [dim]v{__version__}[/dim]  "
+            f"[gab.accent]◆ Gab[/gab.accent] [dim]v{__version__}[/dim]  "
             f"session=[dim]{ctx.session_id[:8]}[/dim]  "
             f"[dim]{badge}[/dim]",
             markup=True,
         )
-        console.print("[dim]Type /help for commands. Ctrl-D or /exit to quit.[/dim]", markup=True)
+        console.print("[dim]  /help · Ctrl-D to exit[/dim]", markup=True)
 
     asyncio.run(_run(ctx, prompt))
 

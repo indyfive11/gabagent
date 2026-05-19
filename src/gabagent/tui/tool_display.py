@@ -9,16 +9,18 @@ class ToolCallDisplay:
         self.console = console
 
     def show_start(self, name: str, args_json: str) -> None:
+        budget = max(20, self.console.width - 35)
+        per_arg = min(80, budget // 3)
         try:
             args = json.loads(args_json) if args_json else {}
             args_summary = ", ".join(
-                f"{k}={repr(v)[:60]}" for k, v in list(args.items())[:3]
+                f"{k}={repr(v)[:per_arg]}" for k, v in list(args.items())[:3]
             )
         except Exception:
-            args_summary = args_json[:80] if args_json else ""
+            args_summary = args_json[:budget] if args_json else ""
         line = Text()
         line.append("  ⚙ ", style="dim")
-        line.append(name, style="bold cyan")
+        line.append(name, style="tool.name")
         line.append("(", style="dim")
         line.append(args_summary, style="dim white")
         line.append(")", style="dim")
@@ -26,12 +28,20 @@ class ToolCallDisplay:
 
     def show_result(self, name: str, result_text: str, is_error: bool = False, extra: str = "") -> None:
         icon = "✗" if is_error else "✓"
-        style = "bold red" if is_error else "green"
-        preview = result_text[:140].replace("\n", " ↵ ") if result_text else "(empty)"
+        style = "tool.error" if is_error else "tool.result"
+        
         line = Text()
         line.append(f"  {icon} ", style=style)
         line.append(f"{name}: ", style="dim")
-        line.append(preview, style="dim white")
+        
+        # Proper wrapping using rich text
+        if result_text:
+            content = Text(result_text, style="dim white")
+            line.append(content)
+        else:
+            line.append("(empty)", style="dim white")
+            
         if extra:
-            line.append(extra, style="dim")
-        self.console.print(line)
+            line.append(" " + extra)
+            
+        self.console.print(line, overflow="fold")

@@ -1,5 +1,4 @@
 from __future__ import annotations
-import sys
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -31,9 +30,8 @@ class InputHandler:
         )
 
     async def prompt(self, badge: str = "") -> str | None:
-        # Write newline via stdout so prompt_toolkit doesn't count it in prompt width
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        from gabagent.tui.renderer import console
+        console.print("", markup=False)
         if badge:
             pt: str | FormattedText = FormattedText([
                 ("bold fg:ansibrightcyan", "["),

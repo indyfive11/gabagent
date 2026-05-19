@@ -44,7 +44,7 @@ class PostMortemManager:
                 console.print(Panel(
                     crash.read_text(),
                     title=crash.name,
-                    border_style="blue"
+                    border_style="dim"
                 ))
             if Confirm.ask("Delete these crash reports?"):
                 for crash in crashes:

@@ -1,5 +1,4 @@
 from __future__ import annotations
-import sys
 from rich.console import Console
 
 
@@ -21,20 +20,24 @@ class StreamingDisplay:
     def append(self, token: str) -> None:
         self._buffer += token
         if self._active:
-            # Print model header lazily on first token so it only appears with real text output
             if not self._header_printed:
                 if self._model:
-                    self.console.print(f"[dim]{self._model}[/dim]", markup=True)
+                    self.console.print(
+                        f"[gab.accent]▸[/gab.accent] [dim]{self._model}[/dim]",
+                        markup=True,
+                    )
                     self.console.file.flush()
                 self._header_printed = True
-            sys.stdout.write(token)
-            sys.stdout.flush()
+            # markup=False: don't interpret model-returned [bold] etc. as Rich markup
+            # soft_wrap=True: pass token to terminal as-is; terminal handles physical wrap
+            self.console.print(token, end="", markup=False, soft_wrap=True, highlight=False)
+            self.console.file.flush()
 
     def stop(self) -> str:
         if self._active:
             if self._header_printed:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
+                self.console.print()
+                self.console.file.flush()
             self._active = False
         final = self._buffer
         self._buffer = ""

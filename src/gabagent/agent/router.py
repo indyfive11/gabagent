@@ -30,7 +30,7 @@ class ModelRouter:
             messages = [ChatMessage(role="user", content=_ROUTING_PROMPT.format(prompt=prompt))]
             tag = await client.complete_simple(messages, model=self.simple_model)
             model = self.simple_model if "[SIMPLE]" in tag else self.complex_model
-            console.print(f"[dim]→ routing to {model}[/dim]", markup=True)
+            console.print(f"[gab.accent]▸[/gab.accent] [dim]routing to {model}[/dim]", markup=True)
             return model
         except Exception:
             return self.simple_model
