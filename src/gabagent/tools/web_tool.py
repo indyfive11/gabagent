@@ -26,36 +26,43 @@ class WebFetchTool(ToolBase):
         "properties": {
             "url": {"type": "string", "description": "URL to fetch"},
             "raw": {"type": "boolean", "description": "Return raw HTML instead of Markdown"},
+            "js": {"type": "boolean", "description": "Use a headless browser to render JavaScript before extracting content. Slower (~2s) but works on SPAs and JS-heavy pages."},
         },
         "required": ["url"],
     }
 
     async def execute(
-        self, ctx: AgentContext, url: str, raw: bool = False, **kwargs: Any
+        self, ctx: AgentContext, url: str, raw: bool = False, js: bool = False, **kwargs: Any
     ) -> ToolResult:
         from gabagent.config.paths import web_cache_dir
 
-        cache_key = hashlib.sha256(url.encode()).hexdigest()
+        cache_key = hashlib.sha256(f"{url}:js={js}".encode()).hexdigest()
         cache_path = web_cache_dir() / f"{cache_key}.txt"
 
         if cache_path.exists() and (time.time() - cache_path.stat().st_mtime) < _CACHE_TTL:
             return ToolResult(output=cache_path.read_text(encoding="utf-8"))
 
-        try:
-            import httpx
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                ),
-            }
-            async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
-                resp = await client.get(url, headers=headers)
-                resp.raise_for_status()
-                content_type = resp.headers.get("content-type", "")
-                body = resp.text
-        except Exception as e:
-            return ToolResult(output="", error=f"Fetch failed: {e}")
+        if js:
+            body = await _fetch_with_browser(url)
+            if isinstance(body, Exception):
+                return ToolResult(output="", error=f"Browser fetch failed: {body}")
+            content_type = "text/html"
+        else:
+            try:
+                import httpx
+                headers = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                }
+                async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+                    resp = await client.get(url, headers=headers)
+                    resp.raise_for_status()
+                    content_type = resp.headers.get("content-type", "")
+                    body = resp.text
+            except Exception as e:
+                return ToolResult(output="", error=f"Fetch failed: {e}")
 
         if raw or "text/html" not in content_type:
             output = body[:_MAX_OUTPUT]
@@ -75,3 +82,17 @@ class WebFetchTool(ToolBase):
 
         cache_path.write_text(output, encoding="utf-8")
         return ToolResult(output=output)
+
+
+async def _fetch_with_browser(url: str) -> str | Exception:
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            body = await page.content()
+            await browser.close()
+            return body
+    except Exception as e:
+        return e

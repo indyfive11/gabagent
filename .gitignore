@@ -12,3 +12,19 @@ build/
 .mypy_cache/
 .ruff_cache/
 *.pyc
+
+# Secrets & Config
+.secrets/
+.env
+*.key
+
+# Logs
+*.log
+
+# User data
+.gabagent/
+cache/
+
+# IDE
+.vscode/
+.idea/

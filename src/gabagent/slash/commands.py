@@ -144,6 +144,8 @@ async def _approve(arg: str, ctx: AgentContext) -> None:
         "[gab.accent]◆[/gab.accent] [dim]Plan approved. Proceeding with implementation.[/dim]",
         markup=True,
     )
+    from gabagent.api.models import ChatMessage
+    ctx.session.append_message(ChatMessage(role="user", content="Plan approved. Proceed with the implementation."))
 
 
 async def _fork(arg: str, ctx: AgentContext) -> None:

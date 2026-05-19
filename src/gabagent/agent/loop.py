@@ -59,7 +59,9 @@ async def _compact_context(ctx: AgentContext) -> None:
 async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None:
     from gabagent.tools.registry import registry
 
-    streaming = StreamingDisplay(console)
+    from gabagent.tui.thinking import ThinkingIndicator
+    thinking = ThinkingIndicator(console.file)
+    streaming = StreamingDisplay(console, thinking=thinking)
     tool_display = ToolCallDisplay(console)
     hooks_runner = None
     try:
@@ -174,6 +176,9 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
                 "Use /compact to compress.[/warning]",
                 markup=True,
             )
+
+        if not ctx.headless:
+            thinking.start()
 
         # Intent-based routing — only on fresh user turns, not tool continuations
         if router and _last_role == "user" and ctx.active_model is None:

@@ -36,10 +36,10 @@ class ModelRouter:
             return self.simple_model
 
     def check_tool_complexity(self, tool_name: str, args: dict) -> str | None:
-        if tool_name in ("write_file", "edit"):
-            content = str(args.get("content", args.get("new_string", "")))
-            if len(content) > 2000:
-                return self.complex_model
+        # Any file modification always uses the complex model — no threshold.
+        # Arya stays on read-only work (grep, glob, read_file, bash queries).
+        if tool_name in ("write_file", "edit", "git_commit"):
+            return self.complex_model
         return None
 
     def check_reactive(

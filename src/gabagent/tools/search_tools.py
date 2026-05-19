@@ -91,49 +91,51 @@ class WebSearchTool(ToolBase):
         if cache_path.exists() and (time.time() - cache_path.stat().st_mtime) < 300:
             return ToolResult(output=cache_path.read_text())
 
+        # Try ddgs library (handles bot detection reliably)
         try:
-            import httpx
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-            async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-                resp = await client.get(
-                    "https://html.duckduckgo.com/html/",
-                    params={"q": query},
-                    headers=headers,
-                )
-                resp.raise_for_status()
-                html = resp.text
-        except Exception as e:
-            # Try SearxNG fallback
-            searxng = ctx.config.searxng_url
-            if searxng:
-                try:
-                    import httpx
-                    async with httpx.AsyncClient(timeout=30) as client:
-                        resp = await client.get(
-                            f"{searxng}/search",
-                            params={"q": query, "format": "json"},
-                        )
-                        data = resp.json()
-                        results = data.get("results", [])[:10]
-                        lines = [f"- [{r.get('title','')}]({r.get('url','')})\n  {r.get('content','')[:200]}" for r in results]
-                        output = "\n".join(lines)
-                        cache_path.write_text(output)
-                        return ToolResult(output=output or "(no results)")
-                except Exception as e2:
-                    return ToolResult(output="", error=f"Search failed: {e} / {e2}")
-            return ToolResult(output="", error=f"Search failed: {e}")
+            import asyncio
+            from ddgs import DDGS
 
-        results = _parse_ddg_html(html)
-        output = "\n".join(results[:10])
-        if output:
-            cache_path.write_text(output)
-        return ToolResult(output=output or "(no results)")
+            def _search() -> list[str]:
+                with DDGS() as ddgs:
+                    hits = list(ddgs.text(query, max_results=10))
+                lines = []
+                for r in hits:
+                    title = r.get("title", "")
+                    url = r.get("href", "")
+                    snippet = r.get("body", "")[:200]
+                    lines.append(f"- [{title}]({url})\n  {snippet}")
+                return lines
+
+            results = await asyncio.get_event_loop().run_in_executor(None, _search)
+            output = "\n".join(results)
+            if output:
+                cache_path.write_text(output)
+            return ToolResult(output=output or "(no results)")
+        except Exception as e:
+            pass
+
+        # SearxNG fallback
+        searxng = ctx.config.searxng_url
+        if searxng:
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.get(
+                        f"{searxng}/search",
+                        params={"q": query, "format": "json"},
+                    )
+                    data = resp.json()
+                    hits = data.get("results", [])[:10]
+                    lines = [f"- [{r.get('title','')}]({r.get('url','')})\n  {r.get('content','')[:200]}" for r in hits]
+                    output = "\n".join(lines)
+                    if output:
+                        cache_path.write_text(output)
+                    return ToolResult(output=output or "(no results)")
+            except Exception as e2:
+                return ToolResult(output="", error=f"Search failed: ddgs and searxng both unavailable")
+
+        return ToolResult(output="", error="Search unavailable: install ddgs or configure searxng_url")
 
 
 def _parse_ddg_html(html: str) -> list[str]:
