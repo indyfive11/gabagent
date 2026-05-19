@@ -29,8 +29,9 @@ class StreamingDisplay:
                     self.console.file.flush()
                 self._header_printed = True
             # markup=False: don't interpret model-returned [bold] etc. as Rich markup
-            # soft_wrap=True: pass token to terminal as-is; terminal handles physical wrap
-            self.console.print(token, end="", markup=False, soft_wrap=True, highlight=False)
+            # highlight=False: no syntax highlighting on raw token stream
+            # no soft_wrap: let Rich do word-boundary wrapping at terminal width
+            self.console.print(token, end="", markup=False, highlight=False)
             self.console.file.flush()
 
     def stop(self) -> str:
