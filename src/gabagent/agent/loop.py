@@ -263,6 +263,7 @@ async def _execute_tool_calls(
     results: dict[str, ToolResult] = {}
 
     async def _run_one(tc: ToolCallSpec) -> ToolResult:
+        import time
         try:
             args = json.loads(tc.arguments) if tc.arguments else {}
         except Exception:
@@ -293,8 +294,10 @@ async def _execute_tool_calls(
                     f"[dim]→ escalating to {override} (complex tool)[/dim]", markup=True
                 )
 
+        start_time = time.time()
         tool_display.show_start(tc.name, tc.arguments)
         result = await registry.dispatch(tc.name, args, ctx)
+        duration = time.time() - start_time
 
         # Reactive escalation
         if router and not ctx.force_model:
@@ -308,7 +311,12 @@ async def _execute_tool_calls(
         if hooks_runner:
             await hooks_runner.run_post_tool(tc.name, args, result)
 
-        tool_display.show_result(tc.name, result.to_content(), is_error=not result.success)
+        tool_display.show_result(
+            tc.name,
+            result.to_content(),
+            is_error=not result.success,
+            extra=f" ({duration:.2f}s)",
+        )
         return result
 
     if parallel:
