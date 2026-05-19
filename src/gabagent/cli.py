@@ -119,8 +119,13 @@ def main(
     ctx.force_model = bool(model)
 
     if not headless:
+        from gabagent.session.postmortem import PostMortemManager
+        pm = PostMortemManager(cwd=ctx.cwd)
+        pm.check_for_crashes()
+
         from gabagent import __version__
         badge = (
+
             ctx.rate_limiter.forced_badge(ctx.config.model)
             if ctx.force_model
             else ctx.rate_limiter.badge
@@ -152,8 +157,21 @@ async def _run(ctx, prompt: str | None) -> None:
 
     try:
         await run_loop(ctx, initial_prompt=prompt)
+    except Exception:
+        import sys
+        import traceback
+        from gabagent.session.postmortem import PostMortemManager
+        
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        
+        pm = PostMortemManager(cwd=ctx.cwd)
+        pm.log_crash(description=f"Unhandled agent loop exception:\n{tb_text}")
+        
+        raise
     except KeyboardInterrupt:
         pass
+
     finally:
         if ctx.shell_state:
             ctx.shell_state.close()
