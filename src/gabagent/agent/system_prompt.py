@@ -50,7 +50,7 @@ def build_system_prompt(cwd: Path | None = None, memory: str | None = None) -> s
     if cwd is None:
         cwd = Path.cwd()
 
-    parts = [_BASE_SYSTEM]
+    parts = [_BASE_SYSTEM, f"\n## Working Directory\n\n{cwd}\n\nAll file operations, searches, and globs are relative to this directory unless an absolute path is given. Never search outside this directory without explicit user instruction."]
 
     candidates: list[tuple[Path, str]] = []
 
