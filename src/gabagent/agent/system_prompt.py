@@ -1,0 +1,87 @@
+from __future__ import annotations
+import subprocess
+from pathlib import Path
+
+
+_BASE_SYSTEM = """You are Gab-Agent, an expert software engineer and CLI assistant.
+You have access to tools that let you read and write files, run shell commands, search code, fetch web pages, and more.
+When given a coding task, think step by step, use tools to explore and understand the code, then make targeted changes.
+Prefer editing existing files over creating new ones. Write minimal, correct code.
+Never add unnecessary comments, docstrings, or abstractions beyond what the task requires.
+
+## Bridge channel with Claude Code
+You have a two-way message bridge with Claude Code (the Anthropic assistant Rob also uses).
+- Messages from Claude Code appear as a cyan panel BEFORE the first prompt when gabagent starts. If you saw that panel, you received a message — no tools needed to find it.
+- To send a message to Claude Code: use the `send_to_claude` tool.
+- To check for new messages mid-session: use the `check_inbox` tool.
+- NEVER use bash to run /msg or /inbox — those are not shell commands.
+- Claude Code and you are collaborators on improving gabagent. Trust its notes, act on them.
+- If Rob asks "did you see a message from Claude?", answer from memory of the startup panel — do not search for files.
+
+## Your codebase
+Your own source code lives at /home/rob/dev/gabagent. When asked to improve yourself, read files there directly."""
+
+
+def _git_root(cwd: Path) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return Path(result.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def _load_claude_md(path: Path) -> str | None:
+    if path.exists():
+        try:
+            return path.read_text(encoding="utf-8")
+        except Exception:
+            pass
+    return None
+
+
+def build_system_prompt(cwd: Path | None = None, memory: str | None = None) -> str:
+    if cwd is None:
+        cwd = Path.cwd()
+
+    parts = [_BASE_SYSTEM]
+
+    candidates: list[tuple[Path, str]] = []
+
+    # Global user config
+    global_claude_md = Path.home() / ".claude" / "CLAUDE.md"
+    content = _load_claude_md(global_claude_md)
+    if content:
+        candidates.append((global_claude_md, content))
+
+    # Git root project config
+    git_root = _git_root(cwd)
+    if git_root and git_root != cwd:
+        for rel in [".claude/CLAUDE.md", "CLAUDE.md"]:
+            p = git_root / rel
+            content = _load_claude_md(p)
+            if content:
+                candidates.append((p, content))
+
+    # Current directory config
+    for rel in [".claude/CLAUDE.md", "CLAUDE.md"]:
+        p = cwd / rel
+        if git_root and p == git_root / rel:
+            continue
+        content = _load_claude_md(p)
+        if content:
+            candidates.append((p, content))
+
+    for path, content in candidates:
+        parts.append(f"\n---\n# Source: {path}\n\n{content}")
+
+    if memory:
+        parts.append(f"\n---\n# Memory\n\n{memory}")
+
+    return "\n".join(parts)
