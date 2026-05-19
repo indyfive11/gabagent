@@ -34,14 +34,17 @@ class ToolCallDisplay:
         line.append(f"  {icon} ", style=style)
         line.append(f"{name}: ", style="dim")
         
-        # Proper wrapping using rich text
+        # Truncate and sanitize result_text for preview
         if result_text:
-            content = Text(result_text, style="dim white")
-            line.append(content)
+            budget = max(60, self.console.width - 20)
+            preview = result_text.replace("\n", " ↵ ")
+            if len(preview) > budget:
+                preview = preview[:budget - 3] + "..."
+            line.append(preview, style="dim white")
         else:
             line.append("(empty)", style="dim white")
             
         if extra:
-            line.append(" " + extra)
+            line.append(" " + extra, style="dim")
             
-        self.console.print(line, overflow="fold")
+        self.console.print(line)
