@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from gabagent.api.models import ToolResult
 from gabagent.tools.base import ToolBase
 from gabagent.tools.registry import registry

@@ -5,7 +5,6 @@ from gabagent.api.models import ToolResult
 from gabagent.tools.base import ToolBase
 from gabagent.tools.registry import registry
 from typing import Any, TYPE_CHECKING
-from gabagent.session.postmortem import PostMortemManager
 
 if TYPE_CHECKING:
     from gabagent.agent.context import AgentContext
