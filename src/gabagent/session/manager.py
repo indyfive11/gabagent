@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import shutil
 import uuid
 from pathlib import Path
@@ -59,10 +60,32 @@ class SessionManager:
                 (m.content for m in msgs if m.role == "user" and m.content),
                 "(empty session)",
             )
+            name = self.get_session_name(f.stem)
             sessions.append({
                 "id": f.stem,
                 "mtime": f.stat().st_mtime,
                 "message_count": len(msgs),
-                "preview": (first_user or "")[:80],
+                "preview": name or (first_user or "")[:80],
             })
         return sessions
+
+    def get_session_name(self, session_id: str) -> str | None:
+        metadata_path = self._sessions_dir / f"{session_id}.metadata.json"
+        if not metadata_path.exists():
+            return None
+        try:
+            data = json.loads(metadata_path.read_text())
+            return data.get("name")
+        except Exception:
+            return None
+
+    def set_session_name(self, session_id: str, name: str) -> None:
+        metadata_path = self._sessions_dir / f"{session_id}.metadata.json"
+        data = {}
+        if metadata_path.exists():
+            try:
+                data = json.loads(metadata_path.read_text())
+            except Exception:
+                pass
+        data["name"] = name
+        metadata_path.write_text(json.dumps(data, indent=2))

@@ -87,6 +87,12 @@ class WebFetchTool(ToolBase):
 async def _fetch_with_browser(url: str) -> str | Exception:
     try:
         from playwright.async_api import async_playwright
+    except ModuleNotFoundError:
+        return ModuleNotFoundError(
+            "playwright not installed — run: pip install playwright"
+        )
+    
+    try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
@@ -95,4 +101,10 @@ async def _fetch_with_browser(url: str) -> str | Exception:
             await browser.close()
             return body
     except Exception as e:
+        # Check for missing Chromium executable
+        err_msg = str(e)
+        if "Executable doesn't exist" in err_msg or "chromium" in err_msg.lower():
+            return Exception(
+                "Chromium not downloaded — run: playwright install chromium"
+            )
         return e

@@ -61,6 +61,7 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
 
     from gabagent.tui.thinking import ThinkingIndicator
     thinking = ThinkingIndicator(console.file)
+    ctx._thinking_indicator = thinking  # Store for tool execution state changes
     streaming = StreamingDisplay(console, thinking=thinking)
     tool_display = ToolCallDisplay(console)
     hooks_runner = None
@@ -178,6 +179,7 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
             )
 
         if not ctx.headless:
+            thinking.set_state("THINKING")
             thinking.start()
 
         # Intent-based routing — only on fresh user turns, not tool continuations
@@ -206,7 +208,17 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
             streaming.stop()
         except Exception as e:
             streaming.stop()
-            console.print(f"[error]API error: {e}[/error]", markup=True)
+            if not ctx.headless:
+                from gabagent.tui.diagnostic import render_diagnostic
+                thinking.set_state("ERROR")
+                render_diagnostic(
+                    console,
+                    title="API Error",
+                    context="Streaming completion request",
+                    cause=str(e),
+                    recovery="Forcing fresh user input",
+                )
+                thinking.stop()
             if ctx.headless:
                 break
             _force_input = True
@@ -301,8 +313,18 @@ async def _execute_tool_calls(
 
         start_time = time.time()
         tool_display.show_start(tc.name, tc.arguments)
+        
+        # Set state to indicate tool execution
+        from gabagent.tui.thinking import ThinkingIndicator
+        if hasattr(ctx, '_thinking_indicator'):
+            ctx._thinking_indicator.set_state("TOOL_EXECUTING")
+        
         result = await registry.dispatch(tc.name, args, ctx)
         duration = time.time() - start_time
+        
+        # Reset state back to thinking
+        if hasattr(ctx, '_thinking_indicator'):
+            ctx._thinking_indicator.set_state("THINKING")
 
         # Reactive escalation
         if router and not ctx.force_model:

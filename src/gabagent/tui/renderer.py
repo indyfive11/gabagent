@@ -15,6 +15,9 @@ THEME = Theme({
     "info":       "dim cyan",
     "warning":    "bold yellow",
     "error":      "bold red",
+    "state.thinking": "color(63)",
+    "state.tool":     "cyan",
+    "state.error":    "red",
     "gab.accent": GAB_ACCENT,
 })
 

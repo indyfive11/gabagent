@@ -34,13 +34,17 @@ class InputHandler:
         console.print("", markup=False)
         if badge:
             pt: str | FormattedText = FormattedText([
+                ("bold fg:ansimagenta", "◆ "),
                 ("bold fg:ansibrightcyan", "["),
                 ("bold fg:ansibrightcyan", badge),
                 ("bold fg:ansibrightcyan", "]"),
-                ("bold", " > "),
+                ("bold", " ▶ "),
             ])
         else:
-            pt = "> "
+            pt: str | FormattedText = FormattedText([
+                ("bold fg:ansimagenta", "◆ "),
+                ("bold", "▶ "),
+            ])
         try:
             return await self._session.prompt_async(pt, key_bindings=_KB)
         except (EOFError, KeyboardInterrupt):

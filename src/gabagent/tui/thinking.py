@@ -4,9 +4,14 @@ import itertools
 from typing import IO
 
 _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-_MAGENTA_DIM = "\x1b[2;35m"
 _RESET = "\x1b[0m"
 _ERASE = "\r\x1b[2K"
+
+_STATE_COLORS = {
+    "THINKING": "\x1b[38;5;63m",      # muted indigo
+    "TOOL_EXECUTING": "\x1b[36m",     # cyan
+    "ERROR": "\x1b[91m",               # bright red
+}
 
 
 class ThinkingIndicator:
@@ -15,17 +20,24 @@ class ThinkingIndicator:
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._active = False
+        self._state = "THINKING"
 
     async def _run(self) -> None:
         for frame in itertools.cycle(_FRAMES):
             if self._stop_event.is_set():
                 break
-            self._file.write(f"\r{_MAGENTA_DIM}{frame} thinking...{_RESET}")
+            color = _STATE_COLORS.get(self._state, _STATE_COLORS["THINKING"])
+            label = "thinking..." if self._state == "THINKING" else self._state.lower().replace("_", " ")
+            self._file.write(f"\r{color}{frame} {label}{_RESET}")
             self._file.flush()
             try:
                 await asyncio.sleep(0.1)
             except asyncio.CancelledError:
                 break
+
+    def set_state(self, state: str) -> None:
+        """Set the visual state: THINKING, TOOL_EXECUTING, ERROR"""
+        self._state = state
 
     def start(self) -> None:
         if self._active:
@@ -41,3 +53,4 @@ class ThinkingIndicator:
         self._active = False
         self._file.write(_ERASE)
         self._file.flush()
+        self._state = "THINKING"

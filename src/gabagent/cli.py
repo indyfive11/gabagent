@@ -130,13 +130,17 @@ def main(
             if ctx.force_model
             else ctx.rate_limiter.badge
         )
+        from gabagent.session.manager import SessionManager
+        mgr = SessionManager(ctx.cwd)
+        session_name = mgr.get_session_name(ctx.session_id)
+        name_display = f" [dim cyan]'{session_name}'[/dim cyan]" if session_name else ""
         console.print(
             f"[gab.accent]◆ Gab[/gab.accent] [dim]v{__version__}[/dim]  "
-            f"session=[dim]{ctx.session_id[:8]}[/dim]  "
+            f"session=[dim]{ctx.session_id[:8]}[/dim]{name_display}  "
             f"[dim]{badge}[/dim]",
             markup=True,
         )
-        console.print("[dim]  /help · Ctrl-D to exit[/dim]", markup=True)
+        console.print("[dim]  /help · /tools · Ctrl-D to exit[/dim]", markup=True)
 
     asyncio.run(_run(ctx, prompt))
 

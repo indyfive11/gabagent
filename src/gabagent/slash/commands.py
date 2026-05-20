@@ -20,6 +20,8 @@ async def handle_slash(command: str, ctx: AgentContext) -> bool:
         "/cost": _cost,
         "/usage": _usage,
         "/memory": _memory,
+        "/tools": _tools,
+        "/rename": _rename,
         "/plan": _plan,
         "/approve": _approve,
         "/fork": _fork,
@@ -52,6 +54,8 @@ async def _help(arg: str, ctx: AgentContext) -> None:
         ("/cost", "Show token usage and model info"),
         ("/usage", "Detailed session usage"),
         ("/memory", "Show persistent memory"),
+        ("/tools", "Show list of available capabilities"),
+        ("/rename <name>", "Rename the current conversation"),
         ("/plan", "Enter/exit plan mode manually (write_plan auto-enters)"),
         ("/approve", "Approve the current plan and allow execution to proceed"),
         ("/fork", "Fork current session"),
@@ -118,6 +122,31 @@ async def _memory(arg: str, ctx: AgentContext) -> None:
     if arg == "clear":
         mgr.clear()
         console.print("[info]Memory cleared.[/info]", markup=True)
+
+
+async def _tools(arg: str, ctx: AgentContext) -> None:
+    from gabagent.tools.registry import registry
+    from rich.table import Table
+    schemas = registry.get_schemas()
+    t = Table(title="Available Tools", show_header=True)
+    t.add_column("Tool", style="cyan", no_wrap=True)
+    t.add_column("Description")
+    for schema in sorted(schemas, key=lambda s: s.get("function", {}).get("name", "")):
+        func = schema.get("function", {})
+        name = func.get("name", "unknown")
+        desc = func.get("description", "")
+        t.add_row(name, desc[:80] + ("..." if len(desc) > 80 else ""))
+    console.print(t)
+
+
+async def _rename(arg: str, ctx: AgentContext) -> None:
+    if not arg.strip():
+        console.print("[warning]/rename requires a name: /rename <name>[/warning]", markup=True)
+        return
+    from gabagent.session.manager import SessionManager
+    mgr = SessionManager(ctx.cwd)
+    mgr.set_session_name(ctx.session_id, arg.strip())
+    console.print(f"[info]Session renamed to: {arg.strip()}[/info]", markup=True)
 
 
 async def _plan(arg: str, ctx: AgentContext) -> None:
