@@ -37,7 +37,13 @@ class GabAIClient:
         tc_args: dict[int, str] = defaultdict(str)
         text_buf = ""
 
-        stream = await self._client.chat.completions.create(**kwargs)
+        try:
+            stream = await self._client.chat.completions.create(**kwargs)
+        except Exception as e:
+            body = getattr(e, "body", None)
+            if body:
+                raise type(e)(f"{e} | body={body}") from e
+            raise
         async for chunk in stream:
             choice = chunk.choices[0] if chunk.choices else None
             if choice is None:

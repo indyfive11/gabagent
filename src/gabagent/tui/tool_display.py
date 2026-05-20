@@ -9,15 +9,17 @@ class ToolCallDisplay:
         self.console = console
 
     def show_start(self, name: str, args_json: str) -> None:
-        budget = max(20, self.console.width - 35)
-        per_arg = min(80, budget // 3)
         try:
             args = json.loads(args_json) if args_json else {}
-            args_summary = ", ".join(
-                f"{k}={repr(v)[:per_arg]}" for k, v in list(args.items())[:3]
-            )
+            parts = []
+            for k, v in list(args.items())[:2]:
+                vs = str(v).replace("\n", "⏎")
+                vt = (vs[:48] + "…") if len(vs) > 48 else vs
+                parts.append(f"{k}={repr(vt)}")
+            args_summary = ", ".join(parts)
         except Exception:
-            args_summary = args_json[:budget] if args_json else ""
+            raw = (args_json or "")[:60]
+            args_summary = (raw[:57] + "…") if len(raw) > 57 else raw
         line = Text()
         line.append("  ⚙ ", style="dim")
         line.append(name, style="tool.name")
@@ -29,22 +31,19 @@ class ToolCallDisplay:
     def show_result(self, name: str, result_text: str, is_error: bool = False, extra: str = "") -> None:
         icon = "✗" if is_error else "✓"
         style = "tool.error" if is_error else "tool.result"
-        
+
         line = Text()
         line.append(f"  {icon} ", style=style)
-        line.append(f"{name}: ", style="dim")
-        
-        # Truncate and sanitize result_text for preview
-        if result_text:
-            budget = max(60, self.console.width - 20)
-            preview = result_text.replace("\n", " ↵ ")
-            if len(preview) > budget:
-                preview = preview[:budget - 3] + "..."
-            line.append(preview, style="dim white")
+        line.append(f"{name}:", style="dim")
+
+        if result_text and result_text.strip():
+            first = next((l.strip() for l in result_text.splitlines() if l.strip()), "")
+            preview = (first[:70] + "…") if len(first) > 70 else first
+            line.append(f" {preview}", style="dim white")
         else:
-            line.append("(empty)", style="dim white")
-            
+            line.append(" (no output)", style="dim white")
+
         if extra:
-            line.append(" " + extra, style="dim")
-            
+            line.append(f" {extra.strip()}", style="dim")
+
         self.console.print(line)

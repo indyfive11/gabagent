@@ -29,6 +29,7 @@ async def handle_slash(command: str, ctx: AgentContext) -> bool:
         "/config": _config,
         "/msg": _msg,
         "/inbox": _inbox,
+        "/local": _local,
         "/exit": _exit,
         "/quit": _exit,
     }
@@ -63,6 +64,7 @@ async def _help(arg: str, ctx: AgentContext) -> None:
         ("/config", "Show current configuration"),
         ("/msg <text>", "Send a message to Claude Code"),
         ("/inbox", "Check messages from Claude Code"),
+        ("/local [on|off]", "Toggle local Ollama model (starts on demand)"),
         ("/exit", "Exit Gab-Agent"),
     ]
     for cmd, desc in rows:
@@ -247,6 +249,50 @@ async def _inbox(arg: str, ctx: AgentContext) -> None:
         console.print("[dim]────────────────────────────────[/dim]", markup=True)
     except Exception as e:
         console.print(f"[error]Bridge error: {e}[/error]", markup=True)
+
+
+async def _local(arg: str, ctx: AgentContext) -> None:
+    if not ctx.config.local_model:
+        console.print(
+            "[warning]No local model configured. "
+            "Set local_model in ~/.config/gabagent/settings.json[/warning]",
+            markup=True,
+        )
+        return
+
+    sub = arg.strip().lower() or ("off" if ctx.local_mode else "on")
+
+    if sub == "on" and not ctx.local_mode:
+        from gabagent.local.ollama import ensure_ollama_running
+        from gabagent.api.client import GabAIClient
+        console.print("[dim]Starting local model…[/dim]", markup=True)
+        ok = await ensure_ollama_running(ctx)
+        if not ok:
+            console.print(
+                "[error]Could not start Ollama. Is ollama-rocm installed?[/error]", markup=True
+            )
+            return
+        if ctx.local_client is None:
+            ctx.local_client = GabAIClient(
+                api_key="ollama",
+                base_url=ctx.config.local_base_url,
+                model=ctx.config.local_model,
+                rate_limiter=ctx.rate_limiter,
+            )
+        ctx.local_mode = True
+        console.print(
+            f"[gab.accent]◆[/gab.accent] [dim]Local mode ON — {ctx.config.local_model}[/dim]",
+            markup=True,
+        )
+
+    elif sub == "off" and ctx.local_mode:
+        ctx.local_mode = False
+        console.print("[dim]Local mode OFF — using primary model[/dim]", markup=True)
+
+    else:
+        state = "[green]ON[/green]" if ctx.local_mode else "[dim]OFF[/dim]"
+        model = ctx.config.local_model or "(not configured)"
+        console.print(f"[dim]Local mode: {state}  model: {model}[/dim]", markup=True)
 
 
 async def _exit(arg: str, ctx: AgentContext) -> None:

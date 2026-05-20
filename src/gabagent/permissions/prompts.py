@@ -20,6 +20,7 @@ async def interactive_approve(tool_name: str, args: dict, ctx: AgentContext) -> 
             f"[bold]{tool_name}[/bold]\n[dim]{args_display}[/dim]",
             title="[yellow]Permission Required[/yellow]",
             border_style="yellow",
+            width=min(72, console.width - 2),
         )
     )
 

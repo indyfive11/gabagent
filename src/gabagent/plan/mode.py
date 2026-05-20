@@ -53,7 +53,12 @@ def exit_plan_mode(ctx: AgentContext) -> None:
 @registry.register
 class WritePlanTool(ToolBase):
     name = "write_plan"
-    description = "Write or update the plan document (allowed even in plan mode)."
+    description = (
+        "Write or update the implementation plan. "
+        "Only call this when the user has explicitly asked to implement or build something — "
+        "NOT for exploratory discussion, conceptual questions, or when intent is ambiguous. "
+        "Discuss and clarify first; plan only when it is clear the user wants execution."
+    )
     parameters = {
         "type": "object",
         "properties": {

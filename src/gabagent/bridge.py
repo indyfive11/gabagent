@@ -40,13 +40,15 @@ def read_inbox(mark_read: bool = True) -> list[dict]:
     return messages
 
 
-def read_outbox() -> list[dict]:
+def read_outbox(mark_read: bool = True) -> list[dict]:
     """Read all messages Gab has sent (for Claude Code to consume)."""
     _ensure()
     if not _OUTBOX.exists():
         return []
     lines = _OUTBOX.read_text().splitlines()
     messages = [json.loads(l) for l in lines if l.strip()]
+    if mark_read and messages:
+        _OUTBOX.unlink()
     return messages
 
 

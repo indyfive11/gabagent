@@ -30,7 +30,8 @@ class ModelRouter:
             messages = [ChatMessage(role="user", content=_ROUTING_PROMPT.format(prompt=prompt))]
             tag = await client.complete_simple(messages, model=self.simple_model)
             model = self.simple_model if "[SIMPLE]" in tag else self.complex_model
-            console.print(f"[gab.accent]▸[/gab.accent] [dim]routing to {model}[/dim]", markup=True)
+            if model != self.simple_model:
+                console.print(f"[gab.accent]▸[/gab.accent] [dim]routing → {model}[/dim]", markup=True)
             return model
         except Exception:
             return self.simple_model
@@ -45,7 +46,6 @@ class ModelRouter:
     def check_reactive(
         self, tool_name: str, exit_code: int | None, active_model: str | None
     ) -> str | None:
-        current = active_model or self.simple_model
-        if tool_name == "bash" and exit_code is not None and exit_code != 0 and current == self.simple_model:
-            return self.complex_model
+        # Disabled: bash exit code 1 is normal for grep/find with no matches,
+        # and caused runaway escalation to the paid model during routine searches.
         return None

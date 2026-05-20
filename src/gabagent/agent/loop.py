@@ -15,6 +15,39 @@ CONTEXT_WARN_RATIO = 0.7
 CONTEXT_COMPACT_RATIO = 0.85
 
 
+def _active_client(ctx: AgentContext):
+    """Return local client when local mode is on, otherwise primary."""
+    if ctx.local_mode and ctx.local_client is not None:
+        return ctx.local_client
+    return ctx.client
+
+_TOOL_KEEP_RECENT = 6    # keep last N tool results in full
+_TOOL_TRIM_CHARS = 400   # trim older ones to this many chars
+
+
+def _trim_old_tool_results(messages: list[ChatMessage]) -> list[ChatMessage]:
+    """Trim old tool result messages to prevent O(n²) context growth.
+
+    The last _TOOL_KEEP_RECENT results are kept in full. Older ones are
+    truncated to _TOOL_TRIM_CHARS — the model already processed them when
+    they were returned; they don't need to be re-read verbatim on every turn.
+    """
+    tool_positions = [i for i, m in enumerate(messages) if m.role == "tool"]
+    cutoff = len(tool_positions) - _TOOL_KEEP_RECENT
+    if cutoff <= 0:
+        return messages
+    trim_indices = set(tool_positions[:cutoff])
+    out: list[ChatMessage] = []
+    for i, m in enumerate(messages):
+        if i in trim_indices and m.content and len(m.content) > _TOOL_TRIM_CHARS:
+            clipped = m.content[:_TOOL_TRIM_CHARS]
+            note = f"\n…[{len(m.content) - _TOOL_TRIM_CHARS} chars not repeated in history]"
+            out.append(ChatMessage(role="tool", content=clipped + note, tool_call_id=m.tool_call_id))
+        else:
+            out.append(m)
+    return out
+
+
 def _estimate_tokens(messages: list[ChatMessage]) -> int:
     total = sum(
         len(json.dumps(m.to_dict())) for m in messages
@@ -103,6 +136,7 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
                         title=f"[bold cyan]✉ Claude Code [{topic}][/bold cyan]",
                         border_style="cyan",
                         padding=(0, 1),
+                        width=min(80, console.width - 2),
                     ))
             # Inject into conversation history so the model can reference them
             combined = "\n\n".join(
@@ -130,7 +164,9 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
             if not ctx.headless:
                 from gabagent.tui.input_handler import InputHandler
                 handler = InputHandler(vim_mode=ctx.config.vim_mode)
-                if ctx.force_model:
+                if ctx.local_mode and ctx.config.local_model:
+                    badge = f"LOCAL:{ctx.config.local_model}"
+                elif ctx.force_model:
                     badge = ctx.rate_limiter.forced_badge(ctx.config.model)
                 else:
                     badge = ctx.rate_limiter.badge
@@ -162,14 +198,45 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
         initial_prompt = None
 
         messages = ctx.session.messages()
-        system_msg = ChatMessage(role="system", content=ctx.system_prompt)
-        all_messages = [system_msg] + messages
+
+        # Merge any system messages stored in the session into the system prompt.
+        # Some APIs (including Gab AI) reject consecutive system messages or
+        # system messages in non-leading positions.
+        extra_sys = [m.content for m in messages if m.role == "system" and m.content]
+        non_sys_messages = _trim_old_tool_results([m for m in messages if m.role != "system"])
+        system_content = ctx.system_prompt
+        if extra_sys:
+            system_content = ctx.system_prompt + "\n\n" + "\n\n".join(extra_sys)
+        if ctx.local_mode:
+            system_content += (
+                "\n\n## Local model mode\n"
+                "You are running as a local model. "
+                "Reply directly and conversationally to greetings and simple questions — "
+                "do NOT call any tools for small talk or one-word prompts. "
+                "Only invoke tools when the task genuinely requires reading files, running commands, or searching code."
+            )
+        system_msg = ChatMessage(role="system", content=system_content)
+        all_messages = [system_msg] + non_sys_messages
 
         ctx.token_estimate = _estimate_tokens(all_messages)
         if ctx.token_estimate > ctx.config.max_context_tokens * CONTEXT_COMPACT_RATIO:
             await _compact_context(ctx)
             messages = ctx.session.messages()
-            all_messages = [system_msg] + messages
+            extra_sys = [m.content for m in messages if m.role == "system" and m.content]
+            non_sys_messages = _trim_old_tool_results([m for m in messages if m.role != "system"])
+            system_content = ctx.system_prompt
+            if extra_sys:
+                system_content = ctx.system_prompt + "\n\n" + "\n\n".join(extra_sys)
+            if ctx.local_mode:
+                system_content += (
+                    "\n\n## Local model mode\n"
+                    "You are running as a local model. "
+                    "Reply directly and conversationally to greetings and simple questions — "
+                    "do NOT call any tools for small talk or one-word prompts. "
+                    "Only invoke tools when the task genuinely requires reading files, running commands, or searching code."
+                )
+            system_msg = ChatMessage(role="system", content=system_content)
+            all_messages = [system_msg] + non_sys_messages
         elif ctx.token_estimate > ctx.config.max_context_tokens * CONTEXT_WARN_RATIO:
             console.print(
                 f"[warning]Context {ctx.token_estimate:,} tokens "
@@ -182,8 +249,9 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
             thinking.set_state("THINKING")
             thinking.start()
 
-        # Intent-based routing — only on fresh user turns, not tool continuations
-        if router and _last_role == "user" and ctx.active_model is None:
+        # Intent-based routing — only on fresh user turns, not tool continuations.
+        # Skip entirely in local mode; routing arya↔sonnet doesn't apply there.
+        if router and _last_role == "user" and ctx.active_model is None and not ctx.local_mode:
             last_user = next(
                 (m.content for m in reversed(messages) if m.role == "user" and m.content),
                 "",
@@ -196,9 +264,12 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
         tool_calls: list[ToolCallSpec] = []
 
         try:
-            streaming.start(model=ctx.active_model or ctx.config.model)
-            async for chunk in ctx.client.stream_complete(
-                all_messages, tools or None, model=ctx.active_model
+            display_model = ctx.config.local_model if ctx.local_mode else (ctx.active_model or ctx.config.model)
+            # In local mode pass model=None so the local client uses its configured model name
+            request_model = None if ctx.local_mode else ctx.active_model
+            streaming.start(model=display_model)
+            async for chunk in _active_client(ctx).stream_complete(
+                all_messages, tools or None, model=request_model
             ):
                 if isinstance(chunk, str):
                     streaming.append(chunk)
@@ -206,6 +277,8 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
                 elif isinstance(chunk, list):
                     tool_calls = chunk
             streaming.stop()
+            # Local models sometimes emit malformed tool calls with no name; discard them.
+            tool_calls = [tc for tc in tool_calls if tc.name]
         except Exception as e:
             streaming.stop()
             if not ctx.headless:
@@ -251,7 +324,6 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
                     role="tool",
                     content=result.to_content(),
                     tool_call_id=tc.id,
-                    name=tc.name,
                 )
             )
 

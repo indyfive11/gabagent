@@ -62,7 +62,11 @@ def _build_context(
     mem_mgr = MemoryManager(cwd=cwd)
     memory = mem_mgr.load()
 
-    system_prompt = build_system_prompt(cwd=cwd, memory=memory or None)
+    system_prompt = build_system_prompt(
+        cwd=cwd,
+        memory=memory or None,
+        load_global_claude_md=cfg.load_global_claude_md,
+    )
 
     ctx = AgentContext(
         config=cfg,
@@ -142,6 +146,12 @@ def main(
         )
         console.print("[dim]  /help · /tools · Ctrl-D to exit[/dim]", markup=True)
 
+    import signal
+    try:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except AttributeError:
+        pass  # Windows has no SIGPIPE
+
     asyncio.run(_run(ctx, prompt))
 
 
@@ -161,24 +171,27 @@ async def _run(ctx, prompt: str | None) -> None:
 
     try:
         await run_loop(ctx, initial_prompt=prompt)
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
     except Exception:
         import sys
         import traceback
         from gabagent.session.postmortem import PostMortemManager
-        
+
         exc_type, exc_value, exc_traceback = sys.exc_info()
         tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
-        
+
         pm = PostMortemManager(cwd=ctx.cwd)
         pm.log_crash(description=f"Unhandled agent loop exception:\n{tb_text}")
-        
+
         raise
-    except KeyboardInterrupt:
-        pass
 
     finally:
         if ctx.shell_state:
             ctx.shell_state.close()
+        if ctx.local_process is not None:
+            from gabagent.local.ollama import stop_ollama
+            stop_ollama(ctx)
 
 
 def _register_tools() -> None:

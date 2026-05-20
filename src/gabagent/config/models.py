@@ -62,3 +62,6 @@ class GabAgentConfig(BaseSettings):
     searxng_url: str = ""
     vim_mode: bool = False
     theme: str = "monokai"
+    load_global_claude_md: bool = False
+    local_base_url: str = "http://localhost:11434/v1"
+    local_model: str = ""

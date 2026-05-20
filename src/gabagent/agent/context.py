@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from gabagent.api.client import GabAIClient
@@ -27,3 +27,6 @@ class AgentContext:
     token_estimate: int = 0
     active_model: str | None = None
     force_model: bool = False
+    local_client: Any = field(default=None)
+    local_mode: bool = False
+    local_process: Any = field(default=None)

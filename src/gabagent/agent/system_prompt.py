@@ -22,9 +22,14 @@ You have a two-way message bridge with Claude Code (the Anthropic assistant Rob 
 Your own source code lives at /home/rob/dev/gabagent. When asked to improve yourself, read files there directly.
 
 ## Planning
-When implementing any multi-step task, always use the write_plan tool first.
-This automatically enters plan mode and blocks execution until approved.
-Present the plan summary to the user and STOP — do not write files, run commands, or make edits until the user types /approve."""
+Not every message is a request to implement something. If the user says "consider", "think about", "what do you think", "is it possible", or describes an idea without asking you to build it — discuss it first. Ask clarifying questions. Explore trade-offs. Respond conversationally.
+
+Only use write_plan when the user has clearly asked for implementation: explicit words like "implement", "build", "go ahead", "do it", "let's do this", or a direct task like "add X to Y". If intent is ambiguous, ask before planning.
+
+When you ARE implementing a multi-step task:
+- Use write_plan to document the approach before touching any files
+- This enters plan mode and blocks execution until approved
+- Present a plan summary and STOP — do not write files, run commands, or make edits until the user types /approve"""
 
 
 def _git_root(cwd: Path) -> Path | None:
@@ -51,7 +56,11 @@ def _load_claude_md(path: Path) -> str | None:
     return None
 
 
-def build_system_prompt(cwd: Path | None = None, memory: str | None = None) -> str:
+def build_system_prompt(
+    cwd: Path | None = None,
+    memory: str | None = None,
+    load_global_claude_md: bool = False,
+) -> str:
     if cwd is None:
         cwd = Path.cwd()
 
@@ -59,11 +68,14 @@ def build_system_prompt(cwd: Path | None = None, memory: str | None = None) -> s
 
     candidates: list[tuple[Path, str]] = []
 
-    # Global user config
-    global_claude_md = Path.home() / ".claude" / "CLAUDE.md"
-    content = _load_claude_md(global_claude_md)
-    if content:
-        candidates.append((global_claude_md, content))
+    # Global user config (~/.claude/CLAUDE.md) — disabled by default because it
+    # was written for Claude Code and adds ~600 tokens of irrelevant content to
+    # every Gab session. Enable via load_global_claude_md: true in settings.json.
+    if load_global_claude_md:
+        global_claude_md = Path.home() / ".claude" / "CLAUDE.md"
+        content = _load_claude_md(global_claude_md)
+        if content:
+            candidates.append((global_claude_md, content))
 
     # Git root project config
     git_root = _git_root(cwd)

@@ -107,8 +107,8 @@ def _run_in_shell(state: ShellState, command: str, timeout: int = _CMD_TIMEOUT) 
                 break
 
         output = "".join(output_lines)
-        if len(output) > 30000:
-            output = output[:30000] + "\n...[output truncated at 30,000 chars]"
+        if len(output) > 8000:
+            output = output[:8000] + "\n...[output truncated at 8,000 chars]"
         return output, exit_code
 
 
