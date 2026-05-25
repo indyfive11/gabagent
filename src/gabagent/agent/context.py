@@ -30,3 +30,4 @@ class AgentContext:
     local_client: Any = field(default=None)
     local_mode: bool = False
     local_process: Any = field(default=None)
+    local_context_summary: str | None = None

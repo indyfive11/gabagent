@@ -1,10 +1,62 @@
 from __future__ import annotations
 import json
+import re
+import uuid as _uuid_mod
 from collections import defaultdict
 from typing import AsyncIterator
 from openai import AsyncOpenAI
 from .models import ChatMessage, ToolCallSpec
 from .rate_limit import UsageTracker
+
+# Matches ```json ... ``` or ``` ... ``` blocks containing a JSON tool call object
+_TC_BLOCK = re.compile(
+    r"```(?:json)?\s*\n?(\{.*?\})\s*\n?```",
+    re.DOTALL,
+)
+
+
+def _extract_text_tool_calls(content: str) -> tuple[str, list[ToolCallSpec]]:
+    """Split model text that embeds tool calls as JSON into prose and ToolCallSpecs.
+
+    Handles local models (e.g. qwen2.5-coder via Ollama) that emit tool calls
+    as plain JSON text rather than structured delta.tool_calls.
+    """
+    specs: list[ToolCallSpec] = []
+
+    def _try_parse(raw: str) -> ToolCallSpec | None:
+        try:
+            obj = json.loads(raw.strip())
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(obj, dict) or "name" not in obj or "arguments" not in obj:
+            return None
+        args = obj["arguments"]
+        return ToolCallSpec(
+            id=f"local-{_uuid_mod.uuid4().hex[:8]}",
+            name=obj["name"],
+            arguments=json.dumps(args) if isinstance(args, dict) else str(args),
+        )
+
+    # Case 1: entire content is a bare JSON tool call
+    spec = _try_parse(content)
+    if spec:
+        return "", [spec]
+
+    # Case 2: prose with one or more ```json { ... } ``` blocks
+    text_parts: list[str] = []
+    last = 0
+    for m in _TC_BLOCK.finditer(content):
+        text_parts.append(content[last : m.start()])
+        spec = _try_parse(m.group(1))
+        if spec:
+            specs.append(spec)
+        else:
+            text_parts.append(m.group(0))  # not a tool call — keep as text
+        last = m.end()
+    text_parts.append(content[last:])
+    prose = "".join(text_parts).strip()
+
+    return prose, specs
 
 
 class GabAIClient:
@@ -12,23 +64,78 @@ class GabAIClient:
         self.model = model
         self.rate_limiter = rate_limiter
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self.tools_supported: bool = True  # set False if model rejects tool schemas
 
     async def stream_complete(
         self,
         messages: list[ChatMessage],
         tools: list[dict] | None = None,
         model: str | None = None,
+        stream: bool = True,
     ) -> AsyncIterator[str | list[ToolCallSpec]]:
         active_model = model or self.model
         self.rate_limiter.record(active_model)
 
         raw_messages = [m.to_dict() for m in messages]
-        kwargs: dict = {
+
+        if not stream:
+            # Non-streaming path: used for local models where streaming tool calls
+            # are unreliable (Ollama returns them as text instead of delta.tool_calls).
+            kwargs: dict = {
+                "model": active_model,
+                "messages": raw_messages,
+                "stream": False,
+            }
+            want_tools = tools and self.tools_supported
+            if want_tools:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = "auto"
+            try:
+                response = await self._client.chat.completions.create(**kwargs)
+            except Exception as e:
+                # If the model rejects tool schemas, remember and retry without them.
+                if want_tools and getattr(e, "status_code", None) == 400 and "does not support tools" in str(e):
+                    self.tools_supported = False
+                    kwargs.pop("tools", None)
+                    kwargs.pop("tool_choice", None)
+                    response = await self._client.chat.completions.create(**kwargs)
+                else:
+                    body = getattr(e, "body", None)
+                    if body:
+                        raise RuntimeError(f"{type(e).__name__}: {e} | body={body}") from e
+                    raise
+            msg = response.choices[0].message
+            if msg.tool_calls:
+                # Properly structured tool calls (model supports OpenAI tool format)
+                if msg.content:
+                    yield msg.content
+                specs = [
+                    ToolCallSpec(
+                        id=tc.id or f"local-{_uuid_mod.uuid4().hex[:8]}",
+                        name=tc.function.name,
+                        arguments=tc.function.arguments or "{}",
+                    )
+                    for tc in msg.tool_calls
+                ]
+                yield specs
+            elif msg.content:
+                # Model embedded tool calls as JSON text (qwen2.5-coder / Ollama pattern)
+                prose, specs = _extract_text_tool_calls(msg.content)
+                if prose:
+                    yield prose
+                if specs:
+                    yield specs
+                elif not prose:
+                    # Unparseable — yield raw content so the user sees something
+                    yield msg.content
+            return
+
+        kwargs = {
             "model": active_model,
             "messages": raw_messages,
             "stream": True,
         }
-        if tools:
+        if tools and self.tools_supported:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
@@ -38,13 +145,20 @@ class GabAIClient:
         text_buf = ""
 
         try:
-            stream = await self._client.chat.completions.create(**kwargs)
+            stream_obj = await self._client.chat.completions.create(**kwargs)
         except Exception as e:
-            body = getattr(e, "body", None)
-            if body:
-                raise type(e)(f"{e} | body={body}") from e
-            raise
-        async for chunk in stream:
+            # If the model rejects tool schemas, retry without them.
+            if tools and self.tools_supported and getattr(e, "status_code", None) == 400 and "does not support tools" in str(e):
+                self.tools_supported = False
+                kwargs.pop("tools", None)
+                kwargs.pop("tool_choice", None)
+                stream_obj = await self._client.chat.completions.create(**kwargs)
+            else:
+                body = getattr(e, "body", None)
+                if body:
+                    raise RuntimeError(f"{type(e).__name__}: {e} | body={body}") from e
+                raise
+        async for chunk in stream_obj:
             choice = chunk.choices[0] if chunk.choices else None
             if choice is None:
                 continue
