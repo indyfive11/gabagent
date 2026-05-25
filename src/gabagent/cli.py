@@ -235,3 +235,7 @@ def _register_tools() -> None:
         import gabagent.tools.postmortem_tool  # noqa: F401
     except ImportError:
         pass
+    try:
+        import gabagent.tools.claude_memory_tool  # noqa: F401
+    except ImportError:
+        pass
