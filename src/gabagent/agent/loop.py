@@ -69,7 +69,15 @@ async def _compact_context(ctx: AgentContext) -> None:
     messages = ctx.session.messages()
     user_assistant = [m for m in messages if m.role in ("user", "assistant")]
     if len(user_assistant) < 4:
+        console.print("[dim]Nothing to compact — conversation is too short.[/dim]", markup=True)
         return
+    tokens_before = _estimate_tokens(
+        [ChatMessage(role="system", content=ctx.system_prompt)]
+        + [m for m in messages if m.role != "system"]
+    )
+    console.print(
+        f"[dim]Compacting context ({tokens_before:,} tokens)…[/dim]", markup=True
+    )
     summary_messages = [
         ChatMessage(role="system", content=ctx.system_prompt),
         *user_assistant,
@@ -96,7 +104,12 @@ async def _compact_context(ctx: AgentContext) -> None:
     shutil.copy2(old_path, pre_path)
     ctx.session.replace_all(new_messages)
     ctx.token_estimate = _estimate_tokens(new_messages)
-    console.print("[gab.accent]◆[/gab.accent] [dim]Context compacted.[/dim]", markup=True)
+    console.print(
+        f"[gab.accent]◆[/gab.accent] [dim]Context compacted: "
+        f"{tokens_before:,} → {ctx.token_estimate:,} tokens "
+        f"({int((1 - ctx.token_estimate / tokens_before) * 100)}% reduction).[/dim]",
+        markup=True,
+    )
 
 
 async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None:
