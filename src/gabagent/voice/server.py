@@ -2,7 +2,8 @@
 
 Endpoints (bind 127.0.0.1 only):
   GET  /health   -> {"status":"ok","mode":"voice"}
-  POST /respond  -> SSE stream of VoiceEvents driving voice_turn
+  POST /respond  -> starts a turn; SSE streams VoiceEvents until confirm/done
+  POST /confirm  -> resolves a paused confirm; SSE streams the continuation
   POST /confirm  -> resolve a paused confirmation
   POST /cancel   -> abort the in-flight turn (barge-in)
 
@@ -11,7 +12,6 @@ base install never breaks. uvicorn runs embedded in the existing asyncio loop vi
 Server.serve() (never uvicorn.run()), with its signal handlers suppressed.
 """
 from __future__ import annotations
-import asyncio
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -32,10 +32,9 @@ def build_app(ctx: AgentContext):
     from starlette.responses import JSONResponse, StreamingResponse
 
     from gabagent.voice.session import VoiceSession
-    from gabagent.voice.turn import voice_turn
+    from gabagent.voice.turn import start_turn, drain
 
     sessions: dict[str, VoiceSession] = {}
-    turn_lock = asyncio.Lock()  # Phase 1: one active turn at a time (single shared ctx)
 
     def get_session(sid: str) -> VoiceSession:
         vs = sessions.get(sid)
@@ -43,6 +42,15 @@ def build_app(ctx: AgentContext):
             vs = VoiceSession(sid, ctx, ctx.voice_audit_path)
             sessions[sid] = vs
         return vs
+
+    def _busy(vs) -> bool:
+        return vs.turn_task is not None and not vs.turn_task.done()
+
+    def _sse(event_gen):
+        async def gen():
+            async for ev in event_gen:
+                yield ev.sse()
+        return StreamingResponse(gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     async def health(request):
         return JSONResponse({"status": "ok", "mode": "voice"})
@@ -52,31 +60,36 @@ def build_app(ctx: AgentContext):
         sid = body.get("session_id", "default")
         text = body.get("text", "")
         vs = get_session(sid)
-
-        async def gen():
-            async with turn_lock:
-                ctx.voice_session = vs
-                async for ev in voice_turn(ctx, text):
-                    yield ev.sse()
-
-        return StreamingResponse(gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
+        if _busy(vs):
+            return JSONResponse(
+                {"error": "a turn is already in progress for this session"}, status_code=409
+            )
+        ctx.voice_session = vs
+        start_turn(ctx, vs, text)
+        return _sse(drain(vs))
 
     async def confirm(request):
         body = await request.json()
         vs = sessions.get(body.get("session_id", ""))
         if vs is None:
             return JSONResponse({"ok": False, "error": "unknown session"}, status_code=404)
+        if not _busy(vs):
+            return JSONResponse({"ok": False, "error": "no turn awaiting confirmation"}, status_code=409)
+        ctx.voice_session = vs
         ok = vs.resolve(body.get("id", ""), bool(body.get("approved")), body.get("passphrase"))
-        return JSONResponse({"ok": ok})
+        if not ok:
+            return JSONResponse({"ok": False, "error": "no matching pending confirmation"}, status_code=409)
+        # The continuation streams back on THIS response (voice client's two-turn model).
+        return _sse(drain(vs))
 
     async def cancel(request):
         body = await request.json()
         vs = sessions.get(body.get("session_id", ""))
         if vs is None:
             return JSONResponse({"ok": False, "error": "unknown session"}, status_code=404)
+        if vs.turn_task is not None and not vs.turn_task.done():
+            vs.turn_task.cancel()
         vs.clear_pending(approved=False)
-        if vs.active_task is not None and not vs.active_task.done():
-            vs.active_task.cancel()
         return JSONResponse({"ok": True})
 
     app = Starlette(routes=[

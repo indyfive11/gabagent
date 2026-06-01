@@ -1,10 +1,15 @@
-"""TUI-free single-turn runner for voice mode.
+"""TUI-free turn runner for voice mode.
 
-`voice_turn(ctx, user_text)` is an async generator of VoiceEvent objects. It mirrors
-the per-turn bookkeeping of agent/loop.py::run_loop but emits structured events instead
-of rendering to a TUI, reusing `_execute_tool_calls` (via the shared ctx.approval_hook)
-rather than forking the tool loop. A background `drive` task runs the turn while the
-generator yields from a queue, so tool-time events can interleave with the token stream.
+A turn runs as a persistent background task (`start_turn`) that emits VoiceEvents into
+the session's queue. HTTP requests consume those events via `drain`, which stops at a
+`confirm` (the SSE ends; the turn task stays suspended awaiting the decision) or at
+`done` (turn complete). `POST /confirm` resolves the decision and a fresh `drain` streams
+the continuation. This matches the voice client's two-turn confirm model — the post-confirm
+continuation arrives on the /confirm response, not on the original /respond stream.
+
+The turn mirrors agent/loop.py::run_loop's per-turn bookkeeping but emits structured
+events instead of rendering a TUI, reusing `_execute_tool_calls` via ctx.approval_hook
+rather than forking the tool loop.
 """
 from __future__ import annotations
 import asyncio
@@ -96,121 +101,121 @@ async def _handle_meta(ctx: AgentContext, mc: commands.MetaCommand, emit) -> Non
     await emit(events.done())
 
 
-async def voice_turn(ctx: AgentContext, user_text: str) -> AsyncIterator[VoiceEvent]:
-    queue: asyncio.Queue = asyncio.Queue()
+async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
+    """Drive one turn, emitting VoiceEvents into vs.queue. Suspends naturally at a
+    confirm (inside voice_approve's await) and resumes when /confirm resolves it.
+    Always terminates the event stream with a `done`."""
+    emit = ctx.voice_emit
+    try:
+        mc = commands.detect_meta_command(user_text)
+        if mc is not None:
+            await _handle_meta(ctx, mc, emit)
+            return
+
+        ctx.session.append_message(ChatMessage(role="user", content=user_text))
+
+        router = None
+        if not ctx.force_model and not ctx.local_mode and ctx.config.router.enabled:
+            from gabagent.agent.router import ModelRouter
+            router = ModelRouter(ctx.config)
+
+        simple = ctx.config.router.simple_model
+        if router and ctx.active_model is None:
+            try:
+                ctx.active_model = await router.classify_intent(user_text, _active_client(ctx))
+            except Exception:
+                ctx.active_model = simple
+        prev_model = simple
+
+        from gabagent.permissions.engine import PermissionEngine
+        perm_engine = PermissionEngine(ctx.config)
+
+        while True:
+            cur = ctx.active_model or simple
+            if not ctx.local_mode and cur != simple and cur != prev_model:
+                await emit(events.status(commands.filler("escalate", ctx)))
+            prev_model = cur
+
+            all_messages = _build_voice_messages(ctx, ctx.session.messages())
+            tools = _voice_tool_schemas()
+            request_model = None if ctx.local_mode else ctx.active_model
+            sfilter = SpeakableFilter(code_notice=commands.filler("code", ctx))
+
+            text_buf = ""
+            tool_calls: list = []
+            stream = _active_client(ctx).stream_complete(
+                all_messages, tools or None, model=request_model
+            )
+            if ctx.local_mode:
+                async for chunk in stream:
+                    if isinstance(chunk, str):
+                        text_buf += chunk
+                    elif isinstance(chunk, list):
+                        tool_calls = [tc for tc in chunk if tc.name]
+                if not tool_calls and text_buf:
+                    from gabagent.api.client import _extract_text_tool_calls
+                    prose, parsed = _extract_text_tool_calls(text_buf)
+                    if parsed:
+                        tool_calls = parsed
+                        text_buf = prose
+                await _emit_filtered(sfilter, sfilter.feed(text_buf), emit)
+            else:
+                async for chunk in stream:
+                    if isinstance(chunk, str):
+                        text_buf += chunk
+                        await _emit_filtered(sfilter, sfilter.feed(chunk), emit)
+                    elif isinstance(chunk, list):
+                        tool_calls = [tc for tc in chunk if tc.name]
+            await _emit_filtered(sfilter, sfilter.flush(), emit)
+
+            if text_buf:
+                ctx.session.append_message(
+                    ChatMessage(role="assistant", content=text_buf, tool_calls=tool_calls or None)
+                )
+            if not tool_calls:
+                break
+            if not text_buf:
+                ctx.session.append_message(
+                    ChatMessage(role="assistant", content=None, tool_calls=tool_calls)
+                )
+
+            await emit(events.status(_status_phrase(tool_calls)))
+            results = await _execute_tool_calls(
+                tool_calls, ctx, perm_engine, None, NullToolDisplay(), router
+            )
+            for tc, result in zip(tool_calls, results):
+                ctx.session.append_message(
+                    ChatMessage(role="tool", content=result.to_content(), tool_call_id=tc.id)
+                )
+
+        await emit(events.done())
+    except asyncio.CancelledError:
+        if vs.queue is not None:
+            vs.queue.put_nowait(events.done())
+        raise
+    except Exception:
+        if vs.queue is not None:
+            vs.queue.put_nowait(events.status("Sorry, I hit an error and stopped."))
+            vs.queue.put_nowait(events.done())
+
+
+def start_turn(ctx: AgentContext, vs, user_text: str) -> "asyncio.Task":
+    """Begin a turn: fresh event queue + background task. Returns the task."""
+    vs.queue = asyncio.Queue()
 
     async def emit(ev: VoiceEvent) -> None:
-        await queue.put(ev)
+        await vs.queue.put(ev)
 
     ctx.voice_emit = emit
+    vs.turn_task = asyncio.create_task(_run_turn(ctx, vs, user_text))
+    return vs.turn_task
 
-    async def drive() -> None:
-        try:
-            mc = commands.detect_meta_command(user_text)
-            if mc is not None:
-                await _handle_meta(ctx, mc, emit)
-                return
 
-            ctx.session.append_message(ChatMessage(role="user", content=user_text))
-
-            router = None
-            if not ctx.force_model and not ctx.local_mode and ctx.config.router.enabled:
-                from gabagent.agent.router import ModelRouter
-                router = ModelRouter(ctx.config)
-
-            simple = ctx.config.router.simple_model
-            if router and ctx.active_model is None:
-                try:
-                    ctx.active_model = await router.classify_intent(user_text, _active_client(ctx))
-                except Exception:
-                    ctx.active_model = simple
-            prev_model = simple
-
-            from gabagent.permissions.engine import PermissionEngine
-            perm_engine = PermissionEngine(ctx.config)
-
-            while True:
-                cur = ctx.active_model or simple
-                if not ctx.local_mode and cur != simple and cur != prev_model:
-                    await emit(events.status(commands.filler("escalate", ctx)))
-                prev_model = cur
-
-                all_messages = _build_voice_messages(ctx, ctx.session.messages())
-                tools = _voice_tool_schemas()
-                request_model = None if ctx.local_mode else ctx.active_model
-                sfilter = SpeakableFilter(code_notice=commands.filler("code", ctx))
-
-                text_buf = ""
-                tool_calls: list = []
-                stream = _active_client(ctx).stream_complete(
-                    all_messages, tools or None, model=request_model
-                )
-                if ctx.local_mode:
-                    async for chunk in stream:
-                        if isinstance(chunk, str):
-                            text_buf += chunk
-                        elif isinstance(chunk, list):
-                            tool_calls = [tc for tc in chunk if tc.name]
-                    if not tool_calls and text_buf:
-                        from gabagent.api.client import _extract_text_tool_calls
-                        prose, parsed = _extract_text_tool_calls(text_buf)
-                        if parsed:
-                            tool_calls = parsed
-                            text_buf = prose
-                    await _emit_filtered(sfilter, sfilter.feed(text_buf), emit)
-                else:
-                    async for chunk in stream:
-                        if isinstance(chunk, str):
-                            text_buf += chunk
-                            await _emit_filtered(sfilter, sfilter.feed(chunk), emit)
-                        elif isinstance(chunk, list):
-                            tool_calls = [tc for tc in chunk if tc.name]
-                await _emit_filtered(sfilter, sfilter.flush(), emit)
-
-                if text_buf:
-                    ctx.session.append_message(
-                        ChatMessage(role="assistant", content=text_buf, tool_calls=tool_calls or None)
-                    )
-                if not tool_calls:
-                    break
-                if not text_buf:
-                    ctx.session.append_message(
-                        ChatMessage(role="assistant", content=None, tool_calls=tool_calls)
-                    )
-
-                await emit(events.status(_status_phrase(tool_calls)))
-                results = await _execute_tool_calls(
-                    tool_calls, ctx, perm_engine, None, NullToolDisplay(), router
-                )
-                for tc, result in zip(tool_calls, results):
-                    ctx.session.append_message(
-                        ChatMessage(role="tool", content=result.to_content(), tool_call_id=tc.id)
-                    )
-
-            await emit(events.done())
-        except asyncio.CancelledError:
-            try:
-                await emit(events.done())
-            except Exception:
-                pass
-        except Exception:
-            await emit(events.status("Sorry, I hit an error and stopped."))
-            await emit(events.done())
-        finally:
-            await queue.put(None)
-
-    task = asyncio.create_task(drive())
-    if ctx.voice_session is not None:
-        ctx.voice_session.active_task = task
-    try:
-        while True:
-            ev = await queue.get()
-            if ev is None:
-                break
-            yield ev
-    finally:
-        if not task.done():
-            task.cancel()
-        if ctx.voice_session is not None:
-            ctx.voice_session.active_task = None
-            ctx.voice_session.clear_pending()
+async def drain(vs) -> AsyncIterator[VoiceEvent]:
+    """Yield events from the current turn until it pauses at a confirm or ends at done."""
+    q = vs.queue
+    while True:
+        ev = await q.get()
+        yield ev
+        if ev.type in ("confirm", "done"):
+            return

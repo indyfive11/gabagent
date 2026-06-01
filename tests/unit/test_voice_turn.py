@@ -7,7 +7,7 @@ from gabagent.api.models import ChatMessage, ToolCallSpec
 from gabagent.config.models import GabAgentConfig
 from gabagent.agent.context import AgentContext
 from gabagent.voice.session import VoiceSession
-from gabagent.voice.turn import voice_turn
+from gabagent.voice.turn import start_turn, drain
 from gabagent.permissions.voice_approve import voice_approve
 import gabagent.tools.file_tools  # noqa: F401  (registers read_file/write_file/edit)
 
@@ -61,11 +61,17 @@ def make_ctx(tmp_path, responses, **cfg_kw):
 
 
 async def run_turn(ctx, text, answer=None):
+    """Drive a full turn across the two-phase confirm protocol: drain to the first
+    confirm/done, then for each confirm resolve it and drain the continuation."""
+    vs = ctx.voice_session
     evs = []
-    async for ev in voice_turn(ctx, text):
+    start_turn(ctx, vs, text)
+    async for ev in drain(vs):
         evs.append(ev)
-        if ev.type == "confirm" and answer is not None:
-            ctx.voice_session.resolve(ev.id, answer)
+    while evs and evs[-1].type == "confirm" and answer is not None:
+        vs.resolve(evs[-1].id, answer)
+        async for ev in drain(vs):
+            evs.append(ev)
     return evs
 
 
@@ -162,13 +168,14 @@ async def test_cancel_ends_turn(home):
         [[_spec("edit", path=str(target), old_string="keep me", new_string="changed")]],
         ["after"],
     ])
+    vs = ctx.voice_session
     evs = []
-    async for ev in voice_turn(ctx, "edit it"):
+    start_turn(ctx, vs, "edit it")
+    async for ev in drain(vs):                                # drains up to the confirm
         evs.append(ev)
-        if ev.type == "confirm":
-            ctx.voice_session.clear_pending(approved=False)
-            t = ctx.voice_session.active_task
-            if t is not None:
-                t.cancel()
+    assert evs[-1].type == "confirm"
+    vs.turn_task.cancel()                                     # barge-in instead of confirming
+    async for ev in drain(vs):                                # cancellation emits a final done
+        evs.append(ev)
     assert any(e.type == "done" for e in evs)
     assert target.read_text() == "keep me\n"                  # edit never applied

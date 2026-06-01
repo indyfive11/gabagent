@@ -12,7 +12,6 @@ from gabagent.config.models import GabAgentConfig
 from gabagent.agent.context import AgentContext
 from gabagent.permissions.voice_approve import voice_approve
 from gabagent.voice.server import build_app
-from gabagent.voice.session import VoiceSession
 import gabagent.tools.file_tools  # noqa: F401
 
 
@@ -67,8 +66,7 @@ def _client(app):
 
 
 async def _drain(resp):
-    """Collect SSE events. (ASGITransport buffers the body, so we must not depend
-    on resolving confirms from inside this loop — see _auto_resolve.)"""
+    """Collect SSE events until the stream ends at a confirm or done."""
     events = []
     async for line in resp.aiter_lines():
         line = line.strip()
@@ -76,20 +74,9 @@ async def _drain(resp):
             continue
         ev = json.loads(line[len("data:"):].strip())
         events.append(ev)
-        if ev["type"] == "done":
+        if ev["type"] in ("confirm", "done"):
             break
     return events
-
-
-async def _auto_resolve(app, sid, answer=True):
-    """Resolve the first pending confirm for a session, concurrently with the turn."""
-    for _ in range(500):
-        vs = app.state.sessions.get(sid)
-        if vs and vs.pending:
-            cid = next(iter(vs.pending))
-            vs.resolve(cid, answer)
-            return
-        await asyncio.sleep(0.01)
 
 
 async def test_health(tmp_path):
@@ -118,7 +105,7 @@ async def test_respond_streams_tokens(tmp_path, monkeypatch):
     assert dest.read_text() == "hello"
 
 
-async def test_respond_confirm_resumes(tmp_path, monkeypatch):
+async def test_respond_confirm_returns_continuation(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     proj = tmp_path / "proj"
     proj.mkdir()
@@ -129,25 +116,52 @@ async def test_respond_confirm_resumes(tmp_path, monkeypatch):
         ["Done."],
     ]))
     async with _client(app) as client:
-        resolver = asyncio.create_task(_auto_resolve(app, "s1", answer=True))
+        # Phase 1: /respond streams up to the confirm, then the SSE ends.
         async with client.stream("POST", "/respond", json={"session_id": "s1", "text": "edit it"}) as resp:
-            events = await _drain(resp)
-        await resolver
-    assert any(e["type"] == "confirm" and e["method"] == "spoken_yesno" for e in events)
-    assert any(e["type"] == "done" for e in events)
+            first = await _drain(resp)
+        confirm = next(e for e in first if e["type"] == "confirm")
+        assert confirm["method"] == "spoken_yesno" and confirm["tier"] == 2
+        assert target.read_text() == "old\n"  # not yet applied
+
+        # Phase 2: /confirm returns the continuation as a fresh SSE.
+        async with client.stream(
+            "POST", "/confirm",
+            json={"session_id": "s1", "id": confirm["id"], "approved": True},
+        ) as resp2:
+            second = await _drain(resp2)
+    assert any(e["type"] == "done" for e in second)
     assert target.read_text() == "new\n"
 
 
-async def test_confirm_endpoint_resolves_pending(tmp_path):
-    ctx = make_ctx(tmp_path, [])
-    app = build_app(ctx)
-    vs = VoiceSession("s1", ctx)
-    fut = vs.new_confirm("cid-1")
-    app.state.sessions["s1"] = vs
+async def test_respond_rejects_concurrent_turn(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    target = proj / "readme.txt"
+    target.write_text("old\n")
+    app = build_app(make_ctx(proj, [
+        [[_spec("edit", path=str(target), old_string="old", new_string="new")]],
+        ["Done."],
+    ]))
     async with _client(app) as client:
-        r = await client.post("/confirm", json={"session_id": "s1", "id": "cid-1", "approved": True})
-    assert r.json()["ok"] is True
-    assert fut.result() == (True, None)
+        # Leave a turn paused at its confirm, then start a second /respond.
+        async with client.stream("POST", "/respond", json={"session_id": "s1", "text": "edit it"}) as resp:
+            await _drain(resp)
+        r = await client.post("/respond", json={"session_id": "s1", "text": "again"})
+        assert r.status_code == 409
+
+
+async def test_confirm_after_turn_done_is_409(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    app = build_app(make_ctx(proj, [["All done."]]))  # no tools -> quick done
+    async with _client(app) as client:
+        async with client.stream("POST", "/respond", json={"session_id": "s1", "text": "hi"}) as resp:
+            await _drain(resp)
+        await asyncio.sleep(0.01)  # let the turn task finish
+        r = await client.post("/confirm", json={"session_id": "s1", "id": "x", "approved": True})
+    assert r.status_code == 409
 
 
 async def test_confirm_unknown_session(tmp_path):
@@ -155,7 +169,6 @@ async def test_confirm_unknown_session(tmp_path):
     async with _client(app) as client:
         r = await client.post("/confirm", json={"session_id": "nope", "id": "x", "approved": True})
     assert r.status_code == 404
-    assert r.json()["ok"] is False
 
 
 async def test_cancel_unknown_session(tmp_path):

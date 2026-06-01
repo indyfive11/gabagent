@@ -14,8 +14,12 @@ class VoiceSession:
         self.pending: dict[str, asyncio.Future] = {}
         # Serializes overlapping confirm round-trips (parallel gated tools).
         self.lock = asyncio.Lock()
-        # The in-flight `drive` task for the current turn (for /cancel).
-        self.active_task: asyncio.Task | None = None
+        # The persistent turn task. It outlives a single HTTP request: it stays
+        # alive (suspended at a confirm) between /respond and /confirm, and is
+        # cancelled by /cancel. Its events flow through `queue`, drained by
+        # whichever request is currently streaming.
+        self.turn_task: asyncio.Task | None = None
+        self.queue: asyncio.Queue | None = None
         # Undo stack for voice-made writes: (path, prior_bytes_or_None_if_new).
         self.undo_stack: list[tuple[str, bytes | None]] = []
         # Tier-3 arming windows: tool_family -> expires_at (epoch seconds).
