@@ -6,5 +6,6 @@ plugins instead, never as providers.
 """
 from __future__ import annotations
 from gabagent.commands.providers.base import CapabilityProvider
+from gabagent.commands.providers.jellyfin import PROVIDER as _jellyfin
 
-PROVIDERS: list[CapabilityProvider] = []
+PROVIDERS: list[CapabilityProvider] = [_jellyfin]
