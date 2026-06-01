@@ -73,3 +73,4 @@ class GabAgentConfig(BaseSettings):
     voice_passphrase: str = ""
     voice_persona: str = ""
     voice_arm_seconds: int = 120
+    voice_debug_log: bool = False  # opt-in per-turn brain-side debug log (keyed by session_id)

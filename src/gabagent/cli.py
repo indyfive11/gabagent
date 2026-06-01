@@ -211,6 +211,8 @@ def _start_voice(ctx, model: str, port: int) -> None:
     ctx.headless = True
     ctx.approval_hook = voice_approve
     ctx.voice_audit_path = data_dir() / "voice_audit.jsonl"
+    if ctx.config.voice_debug_log:
+        ctx.voice_debug_path = data_dir() / "voice_debug.jsonl"
 
     # Pin a single model when --model or config.voice_model is set; otherwise leave
     # the router enabled (default arya base, escalate to Claude).

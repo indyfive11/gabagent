@@ -76,6 +76,8 @@ async def unload_local(ctx: AgentContext) -> None:
             )
     except Exception:
         pass
+    from gabagent.voice.debuglog import dlog
+    dlog(ctx, "unload", model=model)
 
 
 def stop_ollama(ctx: AgentContext) -> None:

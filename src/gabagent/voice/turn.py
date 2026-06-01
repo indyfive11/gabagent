@@ -21,6 +21,7 @@ from gabagent.voice import events
 from gabagent.voice.events import VoiceEvent
 from gabagent.voice.speakable import SpeakableFilter
 from gabagent.voice import commands
+from gabagent.voice.debuglog import dlog
 
 if TYPE_CHECKING:
     from gabagent.agent.context import AgentContext
@@ -109,8 +110,10 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
     try:
         mc = commands.detect_meta_command(user_text)
         if mc is not None:
+            dlog(ctx, "meta", matched=f"{mc.kind}:{mc.value}".rstrip(":"))
             await _handle_meta(ctx, mc, emit)
             return
+        dlog(ctx, "meta", matched="none", routed="llm")
 
         ctx.session.append_message(ChatMessage(role="user", content=user_text))
 
@@ -125,6 +128,7 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
                 ctx.active_model = await router.classify_intent(user_text, _active_client(ctx))
             except Exception:
                 ctx.active_model = simple
+            dlog(ctx, "route", active=ctx.active_model, via="intent_classify")
         prev_model = simple
 
         from gabagent.permissions.engine import PermissionEngine
@@ -134,6 +138,7 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             cur = ctx.active_model or simple
             if not ctx.local_mode and cur != simple and cur != prev_model:
                 await emit(events.status(commands.filler("escalate", ctx)))
+                dlog(ctx, "switch", to=cur, via="escalation")
             prev_model = cur
 
             all_messages = _build_voice_messages(ctx, ctx.session.messages())
@@ -184,6 +189,7 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
                 tool_calls, ctx, perm_engine, None, NullToolDisplay(), router
             )
             for tc, result in zip(tool_calls, results):
+                dlog(ctx, "tool", name=tc.name, ok=result.success, error=result.error)
                 ctx.session.append_message(
                     ChatMessage(role="tool", content=result.to_content(), tool_call_id=tc.id)
                 )

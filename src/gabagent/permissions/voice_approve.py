@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from gabagent.permissions.tiers import tier_of
 from gabagent.voice import events
+from gabagent.voice.debuglog import dlog
 
 if TYPE_CHECKING:
     from gabagent.agent.context import AgentContext
@@ -31,6 +32,8 @@ async def voice_approve(tool_name: str, args: dict, ctx: AgentContext) -> bool:
     _snapshot_for_undo(tool_name, args, ctx)
 
     tier = tier_of(tool_name, args, ctx.cwd, ctx.config)
+    _method_label = {1: "auto", 2: "spoken_yesno", 3: "keyboard"}.get(tier, "blocked")
+    dlog(ctx, "tier", tool=tool_name, tier=tier, method=_method_label)
 
     if tier <= 1:
         return True
@@ -39,6 +42,7 @@ async def voice_approve(tool_name: str, args: dict, ctx: AgentContext) -> bool:
         if emit:
             await emit(events.blocked(tool_name, "That's not something I can do over voice yet."))
         _audit(ctx, tool_name, args, "blocked", tier, _summarize(tool_name, args, ctx))
+        dlog(ctx, "decision", tool=tool_name, tier=tier, decision="blocked")
         return False
 
     method = "spoken_yesno" if tier == 2 else "keyboard"
@@ -50,6 +54,7 @@ async def voice_approve(tool_name: str, args: dict, ctx: AgentContext) -> bool:
         if emit:
             await emit(events.status("Still within the confirmed window — going ahead."))
         _audit(ctx, tool_name, args, "armed", tier, summary)
+        dlog(ctx, "decision", tool=tool_name, tier=tier, decision="armed")
         return True
 
     if emit is None or vs is None:
@@ -67,17 +72,21 @@ async def voice_approve(tool_name: str, args: dict, ctx: AgentContext) -> bool:
         except asyncio.TimeoutError:
             vs.pending.pop(cid, None)
             _audit(ctx, tool_name, args, "timeout", tier, summary)
+            dlog(ctx, "decision", tool=tool_name, tier=tier, decision="timeout")
             return False
 
     if method == "keyboard":
         required = (getattr(ctx.config, "voice_passphrase", "") or "").strip()
         if required and (passphrase or "").strip() != required:
             _audit(ctx, tool_name, args, "denied-bad-passphrase", tier, summary)
+            dlog(ctx, "decision", tool=tool_name, tier=tier, decision="denied-bad-passphrase")
             return False
         if approved:
             vs.arm(family, getattr(ctx.config, "voice_arm_seconds", 0) or 0)
 
-    _audit(ctx, tool_name, args, "approved" if approved else "denied", tier, summary)
+    decision = "approved" if approved else "denied"
+    _audit(ctx, tool_name, args, decision, tier, summary)
+    dlog(ctx, "decision", tool=tool_name, tier=tier, decision=decision)
     return bool(approved)
 
 

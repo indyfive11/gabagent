@@ -37,4 +37,5 @@ class AgentContext:
     voice_emit: Any = field(default=None)     # async (VoiceEvent) -> None, set per-turn
     voice_session: Any = field(default=None)  # VoiceSession (confirm futures, undo, arming)
     voice_audit_path: Any = field(default=None)  # Path | None
+    voice_debug_path: Any = field(default=None)  # Path | None — opt-in per-turn debug log
     voice_process: Any = field(default=None)  # subprocess.Popen | None — TUI-spawned voice brain
