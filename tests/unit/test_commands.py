@@ -27,6 +27,28 @@ def test_detect_brain_switch():
     assert detect_meta_command("go back online").value == "cloud"
 
 
+def test_detect_cloud_by_persona_name_aria():
+    # Users say the persona name "Aria" (sounds like the model "arya").
+    assert detect_meta_command("let's stop this and go back to Aria").value == "cloud"
+    assert detect_meta_command("switch to ARIA model").value == "cloud"
+    assert detect_meta_command("use aria").value == "cloud"
+    assert detect_meta_command("switch to arya").value == "cloud"
+    # Not a switch — just mentioning the name.
+    assert detect_meta_command("tell me about aria") is None
+
+
+def test_detect_status_query_natural_variants():
+    for phrase in (
+        "are you running local",
+        "are you on a local model",
+        "verify your model",
+        "confirm which model you're on",
+        "where are you running",
+    ):
+        m = detect_meta_command(phrase)
+        assert m is not None and m.kind == "query" and m.value == "model", phrase
+
+
 def test_detect_no_false_positive():
     assert detect_meta_command("open the local file") is None
     assert detect_meta_command("read the local config and summarize") is None
@@ -75,7 +97,15 @@ def test_undo_nothing(tmp_path):
 
 def test_query_model_reports_brain(tmp_path):
     ctx = _ctx(tmp_path)
-    assert "arya" in answer_query(ctx, "model")
+    ans = answer_query(ctx, "model")
+    assert "arya" in ans and "cloud" in ans
+
+
+def test_query_model_local(tmp_path):
+    ctx = _ctx(tmp_path, local_mode=True)
+    ctx.config.local_model = "devstral:24b"
+    ans = answer_query(ctx, "model")
+    assert "local" in ans and "devstral:24b" in ans
 
 
 def test_current_brain_local(tmp_path):

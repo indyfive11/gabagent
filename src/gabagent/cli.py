@@ -259,6 +259,7 @@ async def _run_voice(ctx, host: str, port: int) -> None:
                 base_url=ctx.config.local_base_url,
                 model=ctx.config.local_model,
                 rate_limiter=ctx.rate_limiter,
+                keep_alive="1m",
             )
             ctx.local_mode = True
 
@@ -268,6 +269,9 @@ async def _run_voice(ctx, host: str, port: int) -> None:
     except RuntimeError as e:
         typer.echo(str(e), err=True)
     finally:
+        if ctx.config.local_model:
+            from gabagent.local.ollama import unload_local
+            await unload_local(ctx)  # free VRAM immediately on shutdown
         if ctx.shell_state:
             ctx.shell_state.close()
         if ctx.local_process is not None:

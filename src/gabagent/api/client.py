@@ -60,11 +60,24 @@ def _extract_text_tool_calls(content: str) -> tuple[str, list[ToolCallSpec]]:
 
 
 class GabAIClient:
-    def __init__(self, api_key: str, base_url: str, model: str, rate_limiter: UsageTracker):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        rate_limiter: UsageTracker,
+        keep_alive: str | None = None,
+    ):
         self.model = model
         self.rate_limiter = rate_limiter
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.tools_supported: bool = True  # set False if model rejects tool schemas
+        # Ollama-only: per-request VRAM keep-alive (e.g. "1m"). Sent via extra_body so it
+        # scopes to gabagent's requests without touching the global OLLAMA_KEEP_ALIVE default.
+        self.keep_alive = keep_alive
+
+    def _extra_body(self) -> dict | None:
+        return {"keep_alive": self.keep_alive} if self.keep_alive else None
 
     async def stream_complete(
         self,
@@ -86,6 +99,8 @@ class GabAIClient:
                 "messages": raw_messages,
                 "stream": False,
             }
+            if self.keep_alive:
+                kwargs["extra_body"] = self._extra_body()
             want_tools = tools and self.tools_supported
             if want_tools:
                 kwargs["tools"] = tools
@@ -135,6 +150,8 @@ class GabAIClient:
             "messages": raw_messages,
             "stream": True,
         }
+        if self.keep_alive:
+            kwargs["extra_body"] = self._extra_body()
         if tools and self.tools_supported:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
@@ -201,5 +218,6 @@ class GabAIClient:
             model=active_model,
             messages=raw_messages,
             stream=False,
+            extra_body=self._extra_body(),
         )
         return response.choices[0].message.content or ""

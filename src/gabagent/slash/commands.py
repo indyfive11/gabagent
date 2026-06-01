@@ -276,6 +276,7 @@ async def _local(arg: str, ctx: AgentContext) -> None:
                 base_url=ctx.config.local_base_url,
                 model=ctx.config.local_model,
                 rate_limiter=ctx.rate_limiter,
+                keep_alive="1m",  # short idle unload; gabagent-scoped
             )
         ctx.local_mode = True
 
@@ -317,6 +318,8 @@ async def _local(arg: str, ctx: AgentContext) -> None:
 
     elif sub == "off" and ctx.local_mode:
         ctx.local_mode = False
+        from gabagent.local.ollama import unload_local
+        await unload_local(ctx)  # free VRAM immediately on leaving local
         from gabagent.api.models import ChatMessage
         ctx.session.append_message(ChatMessage(
             role="system",

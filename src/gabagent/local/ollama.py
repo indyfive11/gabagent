@@ -57,6 +57,27 @@ async def ensure_ollama_running(ctx: AgentContext) -> str | None:
     return f"ollama did not respond within {_STARTUP_TIMEOUT}s — check /tmp/ollama.log"
 
 
+async def unload_local(ctx: AgentContext) -> None:
+    """Evict the local model from VRAM immediately (keep_alive: 0) without stopping the
+    Ollama server. Best-effort — used when leaving local mode or on shutdown so the GPU is
+    reclaimed without waiting out the idle timer. Safe to call even if Ollama isn't running."""
+    model = ctx.config.local_model
+    if not model:
+        return
+    import httpx
+
+    base = ctx.config.local_base_url.removesuffix("/v1").rstrip("/")
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                base + "/api/generate",
+                json={"model": model, "keep_alive": 0},
+                timeout=5.0,
+            )
+    except Exception:
+        pass
+
+
 def stop_ollama(ctx: AgentContext) -> None:
     if ctx.local_process is not None:
         ctx.local_process.terminate()

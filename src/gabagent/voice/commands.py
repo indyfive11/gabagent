@@ -23,13 +23,25 @@ class MetaCommand:
 # -- detection -------------------------------------------------------------
 
 _VERB = r"(?:switch(?:\s+to)?|go(?:\s+to)?|back\s+to|move\s+to|change\s+to|use|launch|run|load)"
-_TO_LOCAL = re.compile(rf"\b{_VERB}\s+(?:the\s+)?local\b", re.I)
-_TO_CLOUD = re.compile(rf"\b{_VERB}\s+(?:the\s+)?(?:cloud|online|claude|arya|remote|gab)\b", re.I)
+_TO_LOCAL = re.compile(rf"\b{_VERB}\s+(?:the\s+)?(?:local|devstral)\b", re.I)
+# Cloud aliases include the persona name "Aria" and model "arya" (they sound alike; users say "Aria").
+_TO_CLOUD = re.compile(
+    rf"\b{_VERB}\s+(?:the\s+)?(?:cloud|online|claude|arya|aria|remote|gab)\b", re.I
+)
 _GO_ONLINE = re.compile(r"\bgo\s+(?:back\s+)?online\b", re.I)
 
 _UNDO = re.compile(r"\b(?:undo|revert|roll\s*back|take\s+that\s+back)\b", re.I)
 
-_Q_MODEL = re.compile(r"\b(?:what|which)\b.*\b(?:model|brain)\b|\blocal\s+or\s+cloud\b", re.I)
+# Deterministic "which model am I on" — answered from brain state, never the LLM (the local
+# model can't reliably introspect its own runtime). Broadened to natural spoken variants.
+_Q_MODEL = re.compile(
+    r"\b(?:what|which)\b.*\b(?:model|brain)\b"
+    r"|\blocal\s+or\s+cloud\b"
+    r"|\bare\s+you\s+(?:running\s+|on\s+)?(?:a\s+|the\s+)?(?:local|cloud)\b"
+    r"|\b(?:verify|check|confirm)\s+(?:your\s+|the\s+|which\s+)?(?:model|brain)\b"
+    r"|\bwhere\s+are\s+you\s+running\b",
+    re.I,
+)
 _Q_WHERE = re.compile(
     r"\b(?:what|which)\b.*\b(?:folder|directory|dir)\b"
     r"|\bwhat\s+can\s+you\s+(?:touch|access|edit|write)\b"
@@ -115,6 +127,7 @@ async def switch_to_local(ctx: AgentContext) -> str | None:
             base_url=ctx.config.local_base_url,
             model=ctx.config.local_model,
             rate_limiter=ctx.rate_limiter,
+            keep_alive="1m",  # short idle unload — gabagent-scoped, not the global default
         )
     # Compact briefing so the local model has context without the full history.
     messages = ctx.session.messages()
@@ -140,11 +153,14 @@ async def switch_to_local(ctx: AgentContext) -> str | None:
 
 
 async def switch_to_cloud(ctx: AgentContext) -> str | None:
-    """Return to the cloud brain (router re-enabled). Ollama is left running."""
+    """Return to the cloud brain (router re-enabled). Ollama is left running, but the
+    local model is proactively unloaded so VRAM frees immediately."""
     ctx.local_mode = False
     ctx.active_model = None
     if ctx.voice_session is not None:
         ctx.voice_session.disarm_all()
+    from gabagent.local.ollama import unload_local
+    await unload_local(ctx)
     return None
 
 
@@ -178,7 +194,8 @@ def current_brain(ctx: AgentContext) -> str:
 
 def answer_query(ctx: AgentContext, which: str) -> str:
     if which == "model":
-        return f"I'm using {current_brain(ctx)} right now."
+        where = "the local model" if ctx.local_mode else "the cloud model"
+        return f"I'm running {where} {current_brain(ctx)} right now."
     if which == "where":
         from gabagent.permissions.tiers import _default_zones
         zones = ", ".join(z.name or str(z) for z in _default_zones(ctx.cwd, ctx.config))
