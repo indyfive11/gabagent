@@ -42,6 +42,23 @@ class RouterConfig(BaseModel):
     complex_model: str = "claude-sonnet-4-5"
 
 
+class AttestationConfig(BaseModel):
+    """How skill plugins are vetted before they may run."""
+    reviewer: str = "claude_api"          # claude_api | claude_code_bridge | off
+    model: str = ""                       # default: router.complex_model
+    require_keyboard_for_tier3: bool = True
+    auto_reject_obfuscation: bool = False  # True => bash -c / eval / inline-code rejected outright
+
+
+class JellyfinConfig(BaseModel):
+    """Jellyfin media-server integration (first-party provider)."""
+    enabled: bool = True
+    base_url: str = "http://localhost:8096"
+    api_key: str = ""                     # Dashboard → API Keys
+    user_id: str = ""                     # optional: enables played/unwatched filtering
+    rating_threshold: float = 7.0         # default minimum CommunityRating (IMDb 0–10)
+
+
 class GabAgentConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="GABAI_",
@@ -74,3 +91,6 @@ class GabAgentConfig(BaseSettings):
     voice_persona: str = ""
     voice_arm_seconds: int = 120
     voice_debug_log: bool = False  # opt-in per-turn brain-side debug log (keyed by session_id)
+    commands_enabled: bool = True  # voice command framework (capability discovery + run_command)
+    attestation: AttestationConfig = Field(default_factory=AttestationConfig)
+    jellyfin: JellyfinConfig = Field(default_factory=JellyfinConfig)

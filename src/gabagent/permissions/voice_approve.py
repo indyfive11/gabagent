@@ -31,7 +31,7 @@ async def voice_approve(tool_name: str, args: dict, ctx: AgentContext) -> bool:
     # Snapshot prior file content for undo (any tier, before the write runs).
     _snapshot_for_undo(tool_name, args, ctx)
 
-    tier = tier_of(tool_name, args, ctx.cwd, ctx.config)
+    tier = tier_of(tool_name, args, ctx.cwd, ctx.config, getattr(ctx, "command_catalog", None))
     _method_label = {1: "auto", 2: "spoken_yesno", 3: "keyboard"}.get(tier, "blocked")
     dlog(ctx, "tier", tool=tool_name, tier=tier, method=_method_label)
 

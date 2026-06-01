@@ -175,6 +175,13 @@ async def _run(ctx, prompt: str | None) -> None:
             rate_limiter=ctx.rate_limiter,
         )
 
+    if ctx.config.commands_enabled:
+        try:
+            from gabagent.commands.discovery import discover_capabilities
+            ctx.command_catalog = await discover_capabilities(ctx)
+        except Exception:
+            pass
+
     try:
         await run_loop(ctx, initial_prompt=prompt)
     except (BrokenPipeError, KeyboardInterrupt):
@@ -268,12 +275,22 @@ async def _run_voice(ctx, host: str, port: int) -> None:
             )
             ctx.local_mode = True
 
+    if ctx.config.commands_enabled:
+        try:
+            from gabagent.commands.discovery import discover_capabilities
+            ctx.command_catalog = await discover_capabilities(ctx)
+        except Exception:
+            pass
+
     from gabagent.voice.server import serve_voice
     try:
         await serve_voice(ctx, host=host, port=port)
     except RuntimeError as e:
         typer.echo(str(e), err=True)
     finally:
+        if ctx.persistent_browser is not None:
+            from gabagent.commands.browser import close_browser
+            await close_browser(ctx)
         if ctx.config.local_model:
             from gabagent.local.ollama import unload_local
             await unload_local(ctx)  # free VRAM immediately on shutdown
@@ -327,5 +344,9 @@ def _register_tools() -> None:
         pass
     try:
         import gabagent.tools.claude_memory_tool  # noqa: F401
+    except ImportError:
+        pass
+    try:
+        import gabagent.commands.tools  # noqa: F401
     except ImportError:
         pass

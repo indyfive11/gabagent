@@ -39,3 +39,6 @@ class AgentContext:
     voice_audit_path: Any = field(default=None)  # Path | None
     voice_debug_path: Any = field(default=None)  # Path | None — opt-in per-turn debug log
     voice_process: Any = field(default=None)  # subprocess.Popen | None — TUI-spawned voice brain
+    command_catalog: Any = field(default=None)  # CommandCatalog | None — discovered capabilities
+    persistent_browser: Any = field(default=None)  # Playwright BrowserContext | None
+    persistent_browser_pw: Any = field(default=None)  # Playwright instance handle | None

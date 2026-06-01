@@ -84,8 +84,21 @@ def _under(dest: Path, base: Path) -> bool:
         return False
 
 
-def tier_of(tool_name: str, args: dict, cwd: Path, config: GabAgentConfig | None = None) -> int:
+def tier_of(
+    tool_name: str,
+    args: dict,
+    cwd: Path,
+    config: GabAgentConfig | None = None,
+    catalog=None,
+) -> int:
     """Return the safety tier (1|2|3) for a resolved tool call. Fail-closed → 3."""
+    # Command framework: run_command's tier IS the catalog command's declared (effective) tier.
+    if tool_name == "run_command":
+        cmd = catalog.get(args.get("command_id", "")) if catalog is not None else None
+        return cmd.tier if cmd is not None else 3  # unknown id / no catalog → fail-closed
+    if tool_name in ("list_capabilities", "rescan_capabilities"):
+        return 1
+
     if tool_name in _TIER1_READS:
         return 1
 
