@@ -31,6 +31,8 @@ async def handle_slash(command: str, ctx: AgentContext) -> bool:
         "/inbox": _inbox,
         "/local": _local,
         "/voice": _voice,
+        "/skills": _skills,
+        "/attestation": _attestation,
         "/exit": _exit,
         "/quit": _exit,
     }
@@ -67,6 +69,8 @@ async def _help(arg: str, ctx: AgentContext) -> None:
         ("/inbox", "Check messages from Claude Code"),
         ("/local [on|off]", "Toggle local Ollama model (starts on demand)"),
         ("/voice [on|off]", "Start/stop the voice brain server (talk to it via voice-agent)"),
+        ("/skills [list|install <path>]", "Manage attested skill plugins (capabilities)"),
+        ("/attestation", "View/set how skill plugins are vetted"),
         ("/exit", "Exit Gab-Agent"),
     ]
     for cmd, desc in rows:
@@ -395,6 +399,205 @@ async def _voice(arg: str, ctx: AgentContext) -> None:
 
     else:
         console.print("[warning]Usage: /voice [on|off|status][/warning]", markup=True)
+
+
+_TIER_NAME = {1: "auto", 2: "spoken-yes", 3: "keyboard"}
+
+
+async def _skills(arg: str, ctx: AgentContext) -> None:
+    import json as _json
+    from pathlib import Path
+    from gabagent.commands.skills.loader import parse_manifest, SkillError, skills_root
+    from gabagent.commands.skills.qualify import (
+        qualify_skill, write_record, list_installed,
+    )
+
+    parts = arg.strip().split(None, 1)
+    sub = parts[0].lower() if parts else "list"
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    async def _rediscover() -> None:
+        from gabagent.commands.discovery import discover_capabilities
+        ctx.command_catalog = await discover_capabilities(ctx)
+
+    def _set_enabled(skill_id: str, enabled: bool) -> bool:
+        rf = skills_root() / skill_id / "attestation.json"
+        if not rf.exists():
+            return False
+        rec = _json.loads(rf.read_text(encoding="utf-8"))
+        rec["enabled"] = enabled
+        rf.write_text(_json.dumps(rec, indent=2), encoding="utf-8")
+        return True
+
+    if sub in ("list", ""):
+        installed = list_installed()
+        if not installed:
+            console.print("[dim]No skills installed. Use /skills install <path/to/skill.toml>[/dim]", markup=True)
+            return
+        from rich.table import Table
+        t = Table(title="Installed skills", show_header=True)
+        for col in ("Skill", "Enabled", "Risk", "Commands (tier)"):
+            t.add_column(col)
+        for r in installed:
+            tiers = ", ".join(f"{cid}={_TIER_NAME.get(tt, tt)}" for cid, tt in (r.get("effective_tiers") or {}).items())
+            t.add_row(
+                r.get("skill_id", "?"),
+                "[green]yes[/green]" if r.get("enabled") else "[dim]no[/dim]",
+                "[red]dangerous[/red]" if r.get("dangerous") else "ok",
+                tiers,
+            )
+        console.print(t)
+        return
+
+    if sub == "install":
+        if rest.startswith(("http://", "https://")):
+            try:
+                import httpx
+                raw = httpx.get(rest, timeout=15, follow_redirects=True).content
+            except Exception as e:
+                console.print(f"[error]Couldn't fetch {rest}: {e}[/error]", markup=True)
+                return
+        else:
+            path = Path(rest).expanduser()
+            if not rest or not path.exists():
+                console.print(f"[error]No such skill file: {rest}[/error]", markup=True)
+                return
+            raw = path.read_bytes()
+        try:
+            manifest = parse_manifest(raw)
+        except SkillError as e:
+            console.print(f"[error]Rejected (malformed/disallowed): {e}[/error]", markup=True)
+            return
+        console.print(f"[dim]Qualifying '{manifest.id}' (attesting commands)…[/dim]", markup=True)
+        qual = await qualify_skill(manifest, ctx)
+        if qual.rejected:
+            console.print(f"[error]REJECTED: {qual.reason}[/error]", markup=True)
+            return
+        _print_verdict(manifest, qual)
+        approved = await _confirm_install(qual)
+        write_record(manifest, qual, approved=approved, enabled=approved)
+        if approved:
+            await _rediscover()
+            console.print(
+                f"[gab.accent]◆[/gab.accent] [dim]Enabled '{manifest.id}' "
+                f"({len(manifest.commands)} commands).[/dim]", markup=True,
+            )
+        else:
+            console.print("[dim]Declined — installed but disabled.[/dim]", markup=True)
+        return
+
+    if sub in ("enable", "disable") and rest:
+        if _set_enabled(rest, sub == "enable"):
+            await _rediscover()
+            console.print(f"[dim]{rest} {sub}d.[/dim]", markup=True)
+        else:
+            console.print(f"[warning]No such skill: {rest}[/warning]", markup=True)
+        return
+
+    if sub == "remove" and rest:
+        import shutil
+        d = skills_root() / rest
+        if d.exists():
+            shutil.rmtree(d)
+            await _rediscover()
+            console.print(f"[dim]Removed {rest}.[/dim]", markup=True)
+        else:
+            console.print(f"[warning]No such skill: {rest}[/warning]", markup=True)
+        return
+
+    if sub == "reattest" and rest:
+        toml_f = skills_root() / rest / "skill.toml"
+        if not toml_f.exists():
+            console.print(f"[warning]No such skill: {rest}[/warning]", markup=True)
+            return
+        manifest = parse_manifest(toml_f.read_bytes())
+        qual = await qualify_skill(manifest, ctx)
+        if qual.rejected:
+            _set_enabled(rest, False)
+            console.print(f"[error]Now REJECTED: {qual.reason} — disabled.[/error]", markup=True)
+            return
+        _print_verdict(manifest, qual)
+        approved = await _confirm_install(qual)
+        write_record(manifest, qual, approved=approved, enabled=approved)
+        await _rediscover()
+        return
+
+    console.print(
+        "[warning]Usage: /skills [list | install <path> | enable <id> | disable <id> | "
+        "remove <id> | reattest <id>][/warning]", markup=True,
+    )
+
+
+def _print_verdict(manifest, qual) -> None:
+    from rich.panel import Panel
+    lines = [f"[bold]{manifest.name}[/bold]  [dim]({manifest.id} v{manifest.version})[/dim]"]
+    if manifest.description:
+        lines.append(f"[dim]{manifest.description}[/dim]")
+    lines.append("")
+    for cid, tier in qual.effective.items():
+        marker = "[red]" if tier >= 3 else ("[yellow]" if tier == 2 else "[green]")
+        lines.append(f"  {marker}{cid} → {_TIER_NAME.get(tier, tier)} (tier {tier})[/]")
+    if qual.flags:
+        lines.append("")
+        lines.append("[red]Flags:[/red] " + "; ".join(qual.flags))
+    if qual.explanation:
+        lines.append("")
+        lines.append(f"[dim]Review: {qual.explanation}[/dim]")
+    border = "red" if qual.dangerous else "yellow"
+    title = "[red]⚠ DANGEROUS SKILL[/red]" if qual.dangerous else "[yellow]Skill review[/yellow]"
+    console.print(Panel("\n".join(lines), title=title, border_style=border))
+
+
+async def _confirm_install(qual) -> bool:
+    if qual.dangerous:
+        console.print(
+            "[red]This skill contains actions that can change your system or are irreversible. "
+            "You are the final arbiter — enabling it is your call.[/red]", markup=True,
+        )
+        try:
+            ans = await _async_prompt("Type 'I accept the risk' to enable, anything else to decline: ")
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return ans.strip().lower() == "i accept the risk"
+    try:
+        ans = await _async_prompt("Enable this skill? [y/N]: ")
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return ans.strip().lower() in ("y", "yes")
+
+
+async def _async_prompt(message: str) -> str:
+    from prompt_toolkit import PromptSession
+    return await PromptSession().prompt_async(message)
+
+
+async def _attestation(arg: str, ctx: AgentContext) -> None:
+    cfg = ctx.config.attestation
+    parts = arg.strip().split()
+    if not parts:
+        console.print(
+            f"[dim]Attestation — reviewer=[cyan]{cfg.reviewer}[/cyan]  "
+            f"model={cfg.model or '(complex model)'}  "
+            f"reject_obfuscation={cfg.auto_reject_obfuscation}[/dim]", markup=True,
+        )
+        console.print(
+            "[dim]  /attestation reviewer <claude_api|claude_code_bridge|off> · "
+            "/attestation reject-obfuscation <on|off>[/dim]", markup=True,
+        )
+        return
+    key = parts[0].lower()
+    val = parts[1] if len(parts) > 1 else ""
+    if key == "reviewer" and val in ("claude_api", "claude_code_bridge", "off"):
+        cfg.reviewer = val
+        console.print(f"[dim]reviewer = {val}[/dim]", markup=True)
+    elif key in ("reject-obfuscation", "reject_obfuscation"):
+        cfg.auto_reject_obfuscation = val.lower() in ("on", "true", "1", "yes")
+        console.print(f"[dim]reject_obfuscation = {cfg.auto_reject_obfuscation}[/dim]", markup=True)
+    else:
+        console.print(
+            "[warning]Usage: /attestation [reviewer <claude_api|claude_code_bridge|off>] "
+            "[reject-obfuscation <on|off>][/warning]", markup=True,
+        )
 
 
 async def _exit(arg: str, ctx: AgentContext) -> None:
