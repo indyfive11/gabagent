@@ -384,12 +384,17 @@ async def _execute_tool_calls(
 
         if perm_engine:
             from gabagent.permissions.engine import Decision
-            from gabagent.permissions.prompts import interactive_approve
             decision = perm_engine.check(tc.name, args)
             if decision == Decision.DENY:
                 return ToolResult(output="", error=f"Blocked by permissions: {tc.name}")
             if decision == Decision.PROMPT:
-                approved = await interactive_approve(tc.name, args, ctx)
+                # Pluggable approval: voice mode supplies ctx.approval_hook
+                # (voice_approve); the TUI falls back to interactive_approve.
+                approve = getattr(ctx, "approval_hook", None)
+                if approve is None:
+                    from gabagent.permissions.prompts import interactive_approve
+                    approve = interactive_approve
+                approved = await approve(tc.name, args, ctx)
                 if not approved:
                     return ToolResult(output="", error=f"Denied by user: {tc.name}")
 
@@ -403,9 +408,10 @@ async def _execute_tool_calls(
             override = router.check_tool_complexity(tc.name, args)
             if override and override != (ctx.active_model or router.simple_model):
                 ctx.active_model = override
-                console.print(
-                    f"[gab.accent]▸[/gab.accent] [dim]escalating to {override} (complex tool)[/dim]", markup=True
-                )
+                if not getattr(ctx, "voice_mode", False):
+                    console.print(
+                        f"[gab.accent]▸[/gab.accent] [dim]escalating to {override} (complex tool)[/dim]", markup=True
+                    )
 
         start_time = time.time()
         tool_display.show_start(tc.name, tc.arguments)
@@ -427,9 +433,10 @@ async def _execute_tool_calls(
             override = router.check_reactive(tc.name, result.exit_code, ctx.active_model)
             if override:
                 ctx.active_model = override
-                console.print(
-                    f"[gab.accent]▸[/gab.accent] [dim]escalating to {override} (command failed)[/dim]", markup=True
-                )
+                if not getattr(ctx, "voice_mode", False):
+                    console.print(
+                        f"[gab.accent]▸[/gab.accent] [dim]escalating to {override} (command failed)[/dim]", markup=True
+                    )
 
         if hooks_runner:
             await hooks_runner.run_post_tool(tc.name, args, result)

@@ -31,3 +31,9 @@ class AgentContext:
     local_mode: bool = False
     local_process: Any = field(default=None)
     local_context_summary: str | None = None
+    # Voice mode (all inert for TUI sessions).
+    voice_mode: bool = False
+    approval_hook: Any = field(default=None)  # async (tool_name, args, ctx) -> bool
+    voice_emit: Any = field(default=None)     # async (VoiceEvent) -> None, set per-turn
+    voice_session: Any = field(default=None)  # VoiceSession (confirm futures, undo, arming)
+    voice_audit_path: Any = field(default=None)  # Path | None

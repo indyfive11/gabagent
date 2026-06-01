@@ -91,6 +91,8 @@ def main(
     fork: Optional[str] = typer.Option(None, "--fork", help="Fork session by UUID"),
     headless: bool = typer.Option(False, "--headless", hidden=True, help="No TUI (for sub-agents)"),
     cwd: Path = typer.Option(Path.cwd(), "--cwd", hidden=True, help="Working directory"),
+    voice_serve: bool = typer.Option(False, "--voice-serve", help="Run as a voice brain (HTTP+SSE server)"),
+    port: int = typer.Option(0, "--port", help="Voice server port (default: config voice_port)"),
     version: bool = typer.Option(False, "--version", "-v", help="Show version"),
 ) -> None:
     if version:
@@ -121,6 +123,10 @@ def main(
 
     # Force model flag: skip routing when --model was explicitly passed
     ctx.force_model = bool(model)
+
+    if voice_serve:
+        _start_voice(ctx, model=model, port=port)
+        raise typer.Exit()
 
     if not headless:
         from gabagent.session.postmortem import PostMortemManager
@@ -186,6 +192,81 @@ async def _run(ctx, prompt: str | None) -> None:
 
         raise
 
+    finally:
+        if ctx.shell_state:
+            ctx.shell_state.close()
+        if ctx.local_process is not None:
+            from gabagent.local.ollama import stop_ollama
+            stop_ollama(ctx)
+
+
+def _start_voice(ctx, model: str, port: int) -> None:
+    from gabagent.config.paths import data_dir
+    from gabagent.permissions.voice_approve import voice_approve
+
+    ctx.voice_mode = True
+    ctx.headless = True
+    ctx.approval_hook = voice_approve
+    ctx.voice_audit_path = data_dir() / "voice_audit.jsonl"
+
+    # Pin a single model when --model or config.voice_model is set; otherwise leave
+    # the router enabled (default arya base, escalate to Claude).
+    pinned = model or ctx.config.voice_model
+    if pinned:
+        ctx.force_model = True
+        ctx.config.model = pinned
+        ctx.client.model = pinned
+    else:
+        ctx.force_model = False
+
+    bind_port = port or ctx.config.voice_port
+    typer.echo(f"Voice brain listening on http://127.0.0.1:{bind_port}  (Ctrl-C to stop)")
+
+    import signal
+    try:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except AttributeError:
+        pass
+
+    try:
+        asyncio.run(_run_voice(ctx, host="127.0.0.1", port=bind_port))
+    except KeyboardInterrupt:
+        pass
+
+
+async def _run_voice(ctx, host: str, port: int) -> None:
+    if not ctx.config.api_key:
+        from gabagent.config.setup import run_first_time_setup
+        ctx.config = await run_first_time_setup(ctx.config)
+        from gabagent.api.client import GabAIClient
+        ctx.client = GabAIClient(
+            api_key=ctx.config.api_key,
+            base_url=ctx.config.base_url,
+            model=ctx.config.model,
+            rate_limiter=ctx.rate_limiter,
+        )
+
+    # If pinned to the local model, bring Ollama up before serving.
+    if ctx.config.voice_model and ctx.config.voice_model == ctx.config.local_model:
+        from gabagent.local.ollama import ensure_ollama_running
+        from gabagent.api.client import GabAIClient
+        err = await ensure_ollama_running(ctx)
+        if err:
+            typer.echo(f"Could not start local model: {err}", err=True)
+        else:
+            ctx.local_client = GabAIClient(
+                api_key="ollama",
+                base_url=ctx.config.local_base_url,
+                model=ctx.config.local_model,
+                rate_limiter=ctx.rate_limiter,
+            )
+            ctx.local_mode = True
+
+    from gabagent.voice.server import serve_voice
+    try:
+        await serve_voice(ctx, host=host, port=port)
+    except RuntimeError as e:
+        typer.echo(str(e), err=True)
     finally:
         if ctx.shell_state:
             ctx.shell_state.close()

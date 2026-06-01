@@ -65,3 +65,11 @@ class GabAgentConfig(BaseSettings):
     load_global_claude_md: bool = False
     local_base_url: str = "http://localhost:11434/v1"
     local_model: str = ""
+    # Voice mode (gab --voice-serve). Empty voice_model ⇒ normal router (arya base,
+    # escalate to Claude); a non-empty voice_model pins that single model.
+    voice_model: str = ""
+    voice_port: int = 8765
+    voice_safe_zones: list[str] = Field(default_factory=list)
+    voice_passphrase: str = ""
+    voice_persona: str = ""
+    voice_arm_seconds: int = 120

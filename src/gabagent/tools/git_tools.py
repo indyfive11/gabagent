@@ -107,20 +107,24 @@ class GitCommitTool(ToolBase):
         if not diff_out.strip():
             return ToolResult(output="", error="Nothing staged to commit")
 
-        from gabagent.tui.renderer import console, render_code
-        console.print(render_code(diff_out, "diff"))
+        # In voice mode the permission gate (voice_approve, Tier 2 spoken yes/no)
+        # already authorized this commit — skip the interactive stdin prompt,
+        # which would otherwise hang the headless voice server.
+        if not getattr(ctx, "voice_mode", False):
+            from gabagent.tui.renderer import console, render_code
+            console.print(render_code(diff_out, "diff"))
 
-        from prompt_toolkit import PromptSession
-        session = PromptSession()
-        try:
-            answer = await session.prompt_async(
-                f"Commit with message '{message}'? [y/N]: "
-            )
-        except (EOFError, KeyboardInterrupt):
-            return ToolResult(output="", error="Commit cancelled")
+            from prompt_toolkit import PromptSession
+            session = PromptSession()
+            try:
+                answer = await session.prompt_async(
+                    f"Commit with message '{message}'? [y/N]: "
+                )
+            except (EOFError, KeyboardInterrupt):
+                return ToolResult(output="", error="Commit cancelled")
 
-        if answer.strip().lower() not in ("y", "yes"):
-            return ToolResult(output="", error="Commit cancelled by user")
+            if answer.strip().lower() not in ("y", "yes"):
+                return ToolResult(output="", error="Commit cancelled by user")
 
         msg_escaped = message.replace("'", "'\\''")
         out, code = await _git(ctx, f"commit -m '{msg_escaped}'")
