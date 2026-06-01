@@ -7,5 +7,8 @@ plugins instead, never as providers.
 from __future__ import annotations
 from gabagent.commands.providers.base import CapabilityProvider
 from gabagent.commands.providers.jellyfin import PROVIDER as _jellyfin
+from gabagent.commands.providers.mpris import PROVIDER as _mpris
+from gabagent.commands.providers.system import PROVIDER as _system
+from gabagent.commands.providers.applaunch import PROVIDER as _applaunch
 
-PROVIDERS: list[CapabilityProvider] = [_jellyfin]
+PROVIDERS: list[CapabilityProvider] = [_jellyfin, _mpris, _system, _applaunch]
