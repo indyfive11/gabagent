@@ -198,6 +198,9 @@ async def _run(ctx, prompt: str | None) -> None:
         if ctx.local_process is not None:
             from gabagent.local.ollama import stop_ollama
             stop_ollama(ctx)
+        if ctx.voice_process is not None:
+            from gabagent.voice.launcher import stop_brain
+            stop_brain(ctx)
 
 
 def _start_voice(ctx, model: str, port: int) -> None:

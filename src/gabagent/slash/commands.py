@@ -30,6 +30,7 @@ async def handle_slash(command: str, ctx: AgentContext) -> bool:
         "/msg": _msg,
         "/inbox": _inbox,
         "/local": _local,
+        "/voice": _voice,
         "/exit": _exit,
         "/quit": _exit,
     }
@@ -65,6 +66,7 @@ async def _help(arg: str, ctx: AgentContext) -> None:
         ("/msg <text>", "Send a message to Claude Code"),
         ("/inbox", "Check messages from Claude Code"),
         ("/local [on|off]", "Toggle local Ollama model (starts on demand)"),
+        ("/voice [on|off]", "Start/stop the voice brain server (talk to it via voice-agent)"),
         ("/exit", "Exit Gab-Agent"),
     ]
     for cmd, desc in rows:
@@ -337,6 +339,62 @@ async def _local(arg: str, ctx: AgentContext) -> None:
         state = "[green]ON[/green]" if ctx.local_mode else "[dim]OFF[/dim]"
         model = ctx.config.local_model or "(not configured)"
         console.print(f"[dim]Local mode: {state}  model: {model}[/dim]", markup=True)
+
+
+async def _voice(arg: str, ctx: AgentContext) -> None:
+    from gabagent.voice.launcher import start_brain, stop_brain, brain_health
+
+    parts = arg.strip().split()
+    sub = parts[0].lower() if parts else "status"
+    port = ctx.config.voice_port
+    if len(parts) > 1 and parts[1].isdigit():
+        port = int(parts[1])
+    base = f"http://127.0.0.1:{port}"
+
+    if sub in ("status", ""):
+        up = await brain_health(base)
+        if up:
+            owner = "started here" if ctx.voice_process is not None else "external"
+            console.print(
+                f"[gab.accent]◆[/gab.accent] [dim]Voice brain: [green]ON[/green] — {base} ({owner})[/dim]",
+                markup=True,
+            )
+        else:
+            console.print("[dim]Voice brain: OFF. Use /voice on to start it.[/dim]", markup=True)
+
+    elif sub == "on":
+        console.print("[dim]Starting voice brain…[/dim]", markup=True)
+        running, spawned, msg = await start_brain(ctx, port)
+        if running:
+            tag = "started" if spawned else "already running — attached"
+            console.print(
+                f"[gab.accent]◆[/gab.accent] [dim]Voice brain {tag} on {base}[/dim]", markup=True
+            )
+            console.print(
+                "[dim]  Start voice-agent to talk. "
+                "Tip: avoid typing here while talking — you share this conversation.[/dim]",
+                markup=True,
+            )
+        else:
+            from gabagent.config.paths import data_dir
+            console.print(f"[error]Could not start voice brain: {msg}[/error]", markup=True)
+            console.print(f"[dim]  See {data_dir() / 'voice-serve.log'}[/dim]", markup=True)
+
+    elif sub == "off":
+        if ctx.voice_process is not None:
+            stop_brain(ctx)
+            console.print("[dim]Voice brain stopped.[/dim]", markup=True)
+        elif await brain_health(base):
+            console.print(
+                "[warning]A voice brain is running but wasn't started here — leaving it running. "
+                "Stop it where it was launched.[/warning]",
+                markup=True,
+            )
+        else:
+            console.print("[dim]No voice brain to stop.[/dim]", markup=True)
+
+    else:
+        console.print("[warning]Usage: /voice [on|off|status][/warning]", markup=True)
 
 
 async def _exit(arg: str, ctx: AgentContext) -> None:
