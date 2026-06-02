@@ -253,3 +253,39 @@ async def test_expand_playable_dispatches_by_prefix():
     assert td._container_noun("tidal:playlist:1") == "playlist"
     assert td._container_noun("tidal:mix:1") == "mix"
     assert td._container_noun("tidal:album:1") == "album"
+
+
+# -- timeouts: speakable errors + one retry -------------------------------
+
+import asyncio  # noqa: E402
+
+
+def test_human_err_is_always_speakable():
+    assert td._human_err(httpx.ReadTimeout("x")) == "it timed out"     # timeout type
+    assert td._human_err(asyncio.TimeoutError()) == "it timed out"
+    assert td._human_err(RuntimeError("")) == "it timed out"           # empty message → not a bare colon
+    assert td._human_err(RuntimeError("boom")) == "boom"               # real message passes through
+
+
+@respx.mock
+async def test_search_timeout_yields_speakable_error():
+    respx.post(RPC).mock(side_effect=httpx.ReadTimeout(""))
+    res = await td.search(_ctx(), query="x")
+    assert not res.success
+    assert res.error == "TIDAL search failed: it timed out"            # no dangling colon
+
+
+@respx.mock
+async def test_rpc_resilient_retries_once_on_timeout_then_succeeds():
+    calls = {"n": 0}
+
+    def _resp(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ReadTimeout("")
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": [{"tracks": [_TRACK]}]})
+
+    respx.post(RPC).mock(side_effect=_resp)
+    res = await td.search(_ctx(), query="miles")
+    assert res.success and json.loads(res.output)[0]["uri"] == "tidal:track:1"
+    assert calls["n"] == 2     # timed out once, retried, succeeded

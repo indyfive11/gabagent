@@ -9,6 +9,7 @@ Setup (one-time, user side): install Mopidy + Mopidy-Tidal, authorize TIDAL (OAu
 server. See SETUP_TIDAL.md.
 """
 from __future__ import annotations
+import asyncio
 import json
 from typing import TYPE_CHECKING
 
@@ -20,7 +21,7 @@ from gabagent.commands.model import Command, Slot, Detect, PyBackend
 if TYPE_CHECKING:
     from gabagent.agent.context import AgentContext
 
-_RPC_TIMEOUT = 15.0
+_RPC_TIMEOUT = 30.0   # search and mix/album expand hit TIDAL's live API, not the local cache
 
 
 class TidalProvider:
@@ -110,6 +111,29 @@ async def _rpc(tc, method: str, params: dict | None = None, timeout: float = _RP
     return data.get("result") if isinstance(data, dict) else None
 
 
+def _is_timeout(e: Exception) -> bool:
+    return isinstance(e, (httpx.TimeoutException, asyncio.TimeoutError)) or not str(e).strip()
+
+
+def _human_err(e: Exception) -> str:
+    """A non-empty, speakable error string — a timeout (or an exception with no message) becomes words,
+    never a bare dangling colon in Aria's reply."""
+    if _is_timeout(e):
+        return "it timed out"
+    return str(e).strip() or "it didn't respond"
+
+
+async def _rpc_resilient(tc, method: str, params: dict | None = None, timeout: float = _RPC_TIMEOUT):
+    """_rpc, but retry once on a timeout — TIDAL's first live-API call often warms a cache and the
+    second succeeds (a direct browse then returns in ~0.5s)."""
+    try:
+        return await _rpc(tc, method, params, timeout)
+    except Exception as e:
+        if not _is_timeout(e):
+            raise
+        return await _rpc(tc, method, params, timeout)
+
+
 def _artist_names(track: dict) -> str:
     return ", ".join(a.get("name", "") for a in (track.get("artists") or []) if a.get("name"))
 
@@ -159,7 +183,7 @@ def _container_noun(uri: str) -> str:
 
 async def _expand_album(tc, album_uri: str) -> list[str]:
     """Resolve a tidal:album: URI to its track URIs via core.library.lookup."""
-    res = await _rpc(tc, "core.library.lookup", {"uris": [album_uri]})
+    res = await _rpc_resilient(tc, "core.library.lookup", {"uris": [album_uri]})
     tracks: list = []
     if isinstance(res, dict):
         for v in res.values():
@@ -176,9 +200,9 @@ async def _expand_playable(tc, uri: str) -> list[str]:
     if uri.startswith("tidal:album:"):
         return await _expand_album(tc, uri)
     if uri.startswith("tidal:playlist:"):
-        items = await _rpc(tc, "core.playlists.get_items", {"uri": uri})
+        items = await _rpc_resilient(tc, "core.playlists.get_items", {"uri": uri})
         return [t["uri"] for t in (items or []) if isinstance(t, dict) and t.get("uri")]
-    refs = await _rpc(tc, "core.library.browse", {"uri": uri})
+    refs = await _rpc_resilient(tc, "core.library.browse", {"uri": uri})
     return [r["uri"] for r in (refs or [])
             if isinstance(r, dict) and (r.get("uri") or "").startswith("tidal:track:")]
 
@@ -196,9 +220,9 @@ async def search(ctx, query="", limit=8) -> ToolResult:
     if not query:
         return ToolResult(output="", error="nothing to search for")
     try:
-        results = await _rpc(tc, "core.library.search", {"query": {"any": [query]}})
+        results = await _rpc_resilient(tc, "core.library.search", {"query": {"any": [query]}})
     except Exception as e:
-        return ToolResult(output="", error=f"TIDAL search failed: {e}")
+        return ToolResult(output="", error=f"TIDAL search failed: {_human_err(e)}")
     tracks = [t for t in _flatten_tracks(results) if t["uri"]][:limit]
     albums = [a for a in _flatten_albums(results) if a["uri"]][:4]
     return ToolResult(output=json.dumps(tracks + albums))
@@ -213,9 +237,9 @@ async def play(ctx, query="", uri="", album=False) -> ToolResult:
     label = ""
     if not uri and query:
         try:
-            results = await _rpc(tc, "core.library.search", {"query": {"any": [query]}})
+            results = await _rpc_resilient(tc, "core.library.search", {"query": {"any": [query]}})
         except Exception as e:
-            return ToolResult(output="", error=f"TIDAL search failed: {e}")
+            return ToolResult(output="", error=f"TIDAL search failed: {_human_err(e)}")
         tracks = [t for t in _flatten_tracks(results) if t["uri"]]
         if not tracks:
             return ToolResult(output="", error=f"I couldn't find '{query}' on TIDAL.")
@@ -227,11 +251,11 @@ async def play(ctx, query="", uri="", album=False) -> ToolResult:
             await _rpc(tc, "core.playback.resume")
             return ToolResult(output="Resuming.")
         except Exception as e:
-            return ToolResult(output="", error=f"couldn't resume: {e}")
+            return ToolResult(output="", error=f"couldn't resume: {_human_err(e)}")
     try:
         await _play_uris(tc, [uri])
     except Exception as e:
-        return ToolResult(output="", error=f"couldn't play that: {e}")
+        return ToolResult(output="", error=f"couldn't play that: {_human_err(e)}")
     return ToolResult(output=f"Playing {label} on TIDAL." if label else "Playing on TIDAL.")
 
 
@@ -242,9 +266,9 @@ async def _play_container(ctx, tc, query="", uri="", album=False) -> ToolResult:
     container_uri = uri if _is_container_uri(uri) else ""
     if not container_uri and album and query:
         try:
-            results = await _rpc(tc, "core.library.search", {"query": {"any": [query]}})
+            results = await _rpc_resilient(tc, "core.library.search", {"query": {"any": [query]}})
         except Exception as e:
-            return ToolResult(output="", error=f"TIDAL search failed: {e}")
+            return ToolResult(output="", error=f"TIDAL search failed: {_human_err(e)}")
         albums = [a for a in _flatten_albums(results) if a["uri"]]
         if not albums:
             return ToolResult(output="", error=f"I couldn't find the album '{query}' on TIDAL.")
@@ -259,7 +283,7 @@ async def _play_container(ctx, tc, query="", uri="", album=False) -> ToolResult:
             return ToolResult(output="", error=f"that {noun} has no playable tracks")
         await _play_uris(tc, uris)
     except Exception as e:
-        return ToolResult(output="", error=f"couldn't play that {noun}: {e}")
+        return ToolResult(output="", error=f"couldn't play that {noun}: {_human_err(e)}")
     return ToolResult(output=f"Playing the {noun} {label} on TIDAL." if label
                       else f"Playing that {noun} on TIDAL.")
 
@@ -268,7 +292,7 @@ async def _transport(ctx, method: str, said: str) -> ToolResult:
     try:
         await _rpc(ctx.config.tidal, method)
     except Exception as e:
-        return ToolResult(output="", error=f"couldn't do that: {e}")
+        return ToolResult(output="", error=f"couldn't do that: {_human_err(e)}")
     return ToolResult(output=said)
 
 
@@ -296,7 +320,7 @@ async def now_playing(ctx) -> ToolResult:
     try:
         track = await _rpc(ctx.config.tidal, "core.playback.get_current_track")
     except Exception as e:
-        return ToolResult(output="", error=f"couldn't check: {e}")
+        return ToolResult(output="", error=f"couldn't check: {_human_err(e)}")
     if not track:
         return ToolResult(output=json.dumps({"playing": False}))
     artist = _artist_names(track)
@@ -312,7 +336,7 @@ async def playlists(ctx) -> ToolResult:
     try:
         refs = await _rpc(tc, "core.playlists.as_list")
     except Exception as e:
-        return ToolResult(output="", error=f"couldn't load your playlists: {e}")
+        return ToolResult(output="", error=f"couldn't load your playlists: {_human_err(e)}")
     out = [{"kind": "playlist", "uri": p.get("uri"), "title": (p.get("name") or "").strip()}
            for p in (refs or []) if isinstance(p, dict) and p.get("uri")]
     return ToolResult(output=json.dumps(out))
