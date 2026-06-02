@@ -187,12 +187,14 @@ class _FakeKbd:
 
 
 class _FakePlayPage:
-    """Models the HTML5 <video> we introspect via page.evaluate (paused + volume)."""
+    """Models the HTML5 <video> we introspect via page.evaluate (paused + volume) and can close."""
     def __init__(self, paused=False, volume=1.0):
         self.paused = paused; self.volume = volume
         self.keyboard = _FakeKbd(self); self._closed = False
     def is_closed(self): return self._closed
+    async def close(self): self._closed = True
     async def evaluate(self, expr, arg=None):
+        if "v.pause()" in expr: self.paused = True; return None   # reliable pause (no gesture)
         if "v.volume = vol" in expr:          # setter
             self.volume = arg; return None
         if "v.paused" in expr: return self.paused
@@ -207,8 +209,38 @@ async def test_browser_control_pause_resume_stop():
     assert r.success and page.keyboard.keys == ["Space"] and ctx.jellyfin_paused is True
     r = await jf.control(ctx, action="resume")
     assert r.success and page.keyboard.keys == ["Space", "Space"] and ctx.jellyfin_paused is False
+    # stop now reliably pauses (video.pause()) + exits fullscreen (Escape), and KEEPS the window.
     r = await jf.control(ctx, action="stop")
-    assert r.success and page.keyboard.keys[-1] == "Escape" and ctx.jellyfin_playing_page is None
+    assert r.success and page.paused is True and page.keyboard.keys[-1] == "Escape"
+    assert ctx.jellyfin_playing_page is page and ctx.jellyfin_paused is True
+
+
+async def test_browser_control_close_closes_owned_page():
+    page = _FakePlayPage()
+    ctx = _ctx(); ctx.jellyfin_playing_page = page
+    r = await jf.control(ctx, action="close")
+    assert r.success and page._closed is True and ctx.jellyfin_playing_page is None
+
+
+async def test_browser_control_movie_volume_adjusts_video_and_duck_prior():
+    from gabagent.voice.ducking import _state
+    page = _FakePlayPage(volume=0.5)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page
+    r = await jf.control(ctx, action="volume_up")
+    assert r.success and abs(page.volume - 0.6) < 1e-9       # drives <video>.volume, not system
+    await jf.control(ctx, action="volume_down")
+    assert abs(page.volume - 0.5) < 1e-9
+    # While ducked, a manual change updates the saved restore level so it survives speech-end.
+    st = _state(ctx); st["jellyfin_video_volume"] = 1.0
+    page.volume = 0.2
+    await jf.control(ctx, action="volume_up")
+    assert abs(page.volume - 0.3) < 1e-9 and abs(st["jellyfin_video_volume"] - 0.3) < 1e-9
+
+
+async def test_browser_only_actions_need_owned_page():
+    ctx = _ctx()  # no jellyfin_playing_page, no live REST session
+    r = await jf.control(ctx, action="close")
+    assert not r.success and "browser" in r.error.lower()
 
 
 async def test_browser_control_idempotent_reads_real_state():

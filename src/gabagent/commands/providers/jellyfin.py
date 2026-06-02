@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     from gabagent.agent.context import AgentContext
 
 _CONTROL = {"pause": "Pause", "resume": "Unpause", "stop": "Stop", "next": "NextTrack"}
+_BROWSER_ONLY = {"close", "volume_up", "volume_down"}   # only meaningful on the page we own
+_ACTIONS = set(_CONTROL) | _BROWSER_ONLY
 _PLAY_POLL_TRIES = 24   # ~12s waiting for the opened web client to register a session
 
 
@@ -63,10 +65,13 @@ class JellyfinProvider:
             ),
             Command(
                 id="jellyfin.control", domain="media", tier=1, featured=True,
-                summary="Control playback: pause, resume, stop, or skip to next",
+                summary="Control the movie — pause, resume, stop, close the window, or turn the movie volume up/down",
                 backend=PyBackend(ref="gabagent.commands.providers.jellyfin:control"),
-                params=[Slot("action", "enum", True, enum=("pause", "resume", "stop", "next"))],
-                examples=["pause", "resume", "stop the movie"],
+                params=[Slot("action", "enum", True,
+                             enum=("pause", "resume", "stop", "next", "close", "volume_up", "volume_down"),
+                             description="required — one of pause/resume/stop/next/close/volume_up/volume_down")],
+                examples=["pause", "resume", "stop the movie", "close the movie window",
+                          "turn up the movie", "louder on the movie", "movie volume down"],
             ),
         ]
 
@@ -131,7 +136,7 @@ async def search(ctx, genre=None, min_rating=None, query=None, unwatched=False) 
 
 async def control(ctx, action="") -> ToolResult:
     jc = ctx.config.jellyfin
-    if action not in _CONTROL:
+    if action not in _ACTIONS:
         return ToolResult(output="", error=f"unknown action: {action}")
     # The Jellyfin web client ignores remote-control API commands (returns 204, does nothing — a
     # known upstream issue), so when WE launched the movie in our own browser, control it through
@@ -139,6 +144,8 @@ async def control(ctx, action="") -> ToolResult:
     page = _live_jellyfin_page(ctx)
     if page is not None:
         return await _browser_control(ctx, page, action)
+    if action in _BROWSER_ONLY:
+        return ToolResult(output="", error="I can only do that to a movie I opened in the browser.")
     sessions = await _sessions(jc)
     target = next((s for s in sessions if s.get("NowPlayingItem")), None) \
         or next((s for s in sessions if s.get("SupportsRemoteControl")), None)
@@ -242,6 +249,9 @@ async def _play_in_browser(ctx, jc, item_id) -> ToolResult:
         # the remote-control API).
         ctx.jellyfin_playing_page = page
         ctx.jellyfin_paused = False
+        # Start at full volume — the persistent browser reuses the same <video> element, so a duck
+        # that got stranded low in a prior session shouldn't leave a freshly-played movie quiet.
+        await _set_video_volume(page, 1.0)
     return result
 
 
@@ -332,10 +342,34 @@ async def _set_video_volume(page, vol: float) -> bool:
 async def _browser_control(ctx, page, action) -> ToolResult:
     try:
         if action == "stop":
+            # Reliably pause (video.pause() needs no user gesture, unlike resume) and drop the player
+            # out of fullscreen — but keep the window open. Escape alone (the old behavior) didn't
+            # actually halt playback.
+            await page.evaluate("() => { const v = document.querySelector('video'); if (v) v.pause(); }")
             await page.keyboard.press("Escape")
+            ctx.jellyfin_paused = True
+            return ToolResult(output="Paused the movie and came out of fullscreen.")
+        if action == "close":
+            try:
+                await page.close()
+            except Exception:
+                pass
             ctx.jellyfin_playing_page = None
             ctx.jellyfin_paused = False
-            return ToolResult(output="Stopped the movie.")
+            return ToolResult(output="Closed the movie window.")
+        if action in ("volume_up", "volume_down"):
+            cur = await _video_volume(page)
+            if cur is None:
+                return ToolResult(output="", error="I couldn't read the movie volume.")
+            new = min(1.0, cur + 0.1) if action == "volume_up" else max(0.0, cur - 0.1)
+            await _set_video_volume(page, new)
+            # If we're mid-duck, update the saved restore level so the manual change survives the
+            # speech-end restore instead of being clobbered back to the pre-duck level.
+            from gabagent.voice.ducking import _state
+            st = _state(ctx)
+            if st.get("jellyfin_video_volume") is not None:
+                st["jellyfin_video_volume"] = new
+            return ToolResult(output="Turned the movie up." if action == "volume_up" else "Turned the movie down.")
         if action == "next":
             return ToolResult(output="", error="There's nothing to skip to in a movie.")
         # Idempotent: read the REAL play state, then press Space (a toggle — but a *trusted* user
