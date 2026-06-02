@@ -166,3 +166,90 @@ async def test_search_includes_albums():
     data = json.loads((await td.search(_ctx(), query="kind of blue")).output)
     kinds = {d["kind"] for d in data}
     assert kinds == {"track", "album"}
+
+
+# -- playlists + recommendations + container playback ----------------------
+
+def test_new_commands_registered_and_featured():
+    cmds = {c.id: c for c in td.PROVIDER.commands(_ctx())}
+    assert {"tidal.playlists", "tidal.recommendations"} <= set(cmds)
+    assert cmds["tidal.playlists"].featured and cmds["tidal.recommendations"].featured
+    assert cmds["tidal.playlists"].structured and cmds["tidal.recommendations"].structured
+
+
+@respx.mock
+async def test_playlists_lists_saved_playlists():
+    respx.post(RPC).mock(side_effect=_rpc_router({"core.playlists.as_list": [
+        {"uri": "tidal:playlist:a", "name": "Metallica", "type": "playlist"},
+        {"uri": "tidal:playlist:b", "name": "Folk ", "type": "playlist"},
+    ]}))
+    data = json.loads((await td.playlists(_ctx())).output)
+    assert data == [{"kind": "playlist", "uri": "tidal:playlist:a", "title": "Metallica"},
+                    {"kind": "playlist", "uri": "tidal:playlist:b", "title": "Folk"}]
+
+
+@respx.mock
+async def test_recommendations_prefers_personal_mixes():
+    respx.post(RPC).mock(side_effect=_rpc_router({"core.library.browse": [
+        {"uri": "tidal:mix:1", "name": "My Mix 3", "type": "playlist"},
+        {"uri": "tidal:mix:2", "name": "My New Arrivals", "type": "playlist"},
+    ]}))
+    data = json.loads((await td.recommendations(_ctx())).output)
+    assert [d["title"] for d in data] == ["My Mix 3", "My New Arrivals"]
+    assert all(d["kind"] == "mix" for d in data)
+
+
+@respx.mock
+async def test_recommendations_empty_when_nothing_exposed():
+    # browse returns nothing for every node → graceful "[]" (not an error)
+    respx.post(RPC).mock(side_effect=_rpc_router({"core.library.browse": []}))
+    res = await td.recommendations(_ctx())
+    assert res.success and res.output == "[]"
+
+
+@respx.mock
+async def test_play_playlist_uri_expands_via_get_items():
+    seen = []
+
+    def resp(request):
+        body = json.loads(request.content); m = body["method"]; seen.append((m, body.get("params")))
+        result = {"core.playlists.get_items": [{"uri": "tidal:track:1"}, {"uri": "tidal:track:2"}]}.get(m)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), uri="tidal:playlist:a")
+    assert res.success and "playlist" in res.output.lower()
+    methods = [m for m, _ in seen]
+    assert methods == ["core.playlists.get_items", "core.tracklist.clear",
+                       "core.tracklist.add", "core.playback.play"]
+    assert ("core.tracklist.add", {"uris": ["tidal:track:1", "tidal:track:2"]}) in seen
+
+
+@respx.mock
+async def test_play_mix_uri_expands_via_browse():
+    seen = []
+
+    def resp(request):
+        body = json.loads(request.content); m = body["method"]; seen.append(m)
+        result = {"core.library.browse": [
+            {"uri": "tidal:track:7", "type": "track"},
+            {"uri": "tidal:track:8", "type": "track"},
+            {"uri": "tidal:directory:x", "type": "directory"},  # non-track refs are dropped
+        ]}.get(m)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), uri="tidal:mix:1")
+    assert res.success and "mix" in res.output.lower()
+    assert seen == ["core.library.browse", "core.tracklist.clear",
+                    "core.tracklist.add", "core.playback.play"]
+
+
+async def test_expand_playable_dispatches_by_prefix():
+    assert td._is_container_uri("tidal:album:1")
+    assert td._is_container_uri("tidal:playlist:1")
+    assert td._is_container_uri("tidal:mix:1")
+    assert not td._is_container_uri("tidal:track:1")
+    assert td._container_noun("tidal:playlist:1") == "playlist"
+    assert td._container_noun("tidal:mix:1") == "mix"
+    assert td._container_noun("tidal:album:1") == "album"

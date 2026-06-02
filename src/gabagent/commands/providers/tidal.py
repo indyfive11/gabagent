@@ -57,7 +57,23 @@ class TidalProvider:
                          description="true to queue the whole album instead of a single track"),
                 ],
                 examples=["play some Miles Davis on tidal", "play the album Dizzy Up the Girl",
-                          "play kind of blue", "play music"],
+                          "play kind of blue", "play music",
+                          "play my Metallica playlist (uri from tidal.playlists)",
+                          "play my New Arrivals mix (uri from tidal.recommendations)"],
+            ),
+            Command(
+                id="tidal.playlists", domain="media", tier=1, structured=True, featured=True,
+                summary="List your saved TIDAL playlists (play one by passing its uri to tidal.play)",
+                backend=PyBackend(ref=ref + "playlists"),
+                examples=["what playlists do I have", "show my tidal playlists", "list my playlists"],
+            ),
+            Command(
+                id="tidal.recommendations", domain="media", tier=1, structured=True, featured=True,
+                summary="Personalized TIDAL mixes & recommendations from your listening history "
+                        "(play one by passing its uri to tidal.play)",
+                backend=PyBackend(ref=ref + "recommendations"),
+                examples=["what should I listen to", "play my recommendations", "my mixes",
+                          "recommend something based on what I listen to"],
             ),
             Command(id="tidal.pause", domain="media", tier=1, featured=True, summary="Pause TIDAL playback",
                     backend=PyBackend(ref=ref + "pause"), examples=["pause the music", "pause tidal"]),
@@ -125,6 +141,22 @@ def _flatten_albums(search_results) -> list[dict]:
     return out
 
 
+_CONTAINER_PREFIXES = ("tidal:album:", "tidal:playlist:", "tidal:mix:")
+
+
+def _is_container_uri(uri: str) -> bool:
+    """An album / playlist / mix URI — something that expands to many tracks."""
+    return uri.startswith(_CONTAINER_PREFIXES)
+
+
+def _container_noun(uri: str) -> str:
+    if uri.startswith("tidal:playlist:"):
+        return "playlist"
+    if uri.startswith("tidal:mix:"):
+        return "mix"
+    return "album"
+
+
 async def _expand_album(tc, album_uri: str) -> list[str]:
     """Resolve a tidal:album: URI to its track URIs via core.library.lookup."""
     res = await _rpc(tc, "core.library.lookup", {"uris": [album_uri]})
@@ -135,6 +167,26 @@ async def _expand_album(tc, album_uri: str) -> list[str]:
     elif isinstance(res, list):
         tracks = res
     return [t["uri"] for t in tracks if isinstance(t, dict) and t.get("uri")]
+
+
+async def _expand_playable(tc, uri: str) -> list[str]:
+    """Resolve any container URI (album / playlist / mix) to its track URIs. Albums go through
+    core.library.lookup; playlists through core.playlists.get_items; mixes (and any other browsable
+    node) through one level of core.library.browse, keeping only track refs."""
+    if uri.startswith("tidal:album:"):
+        return await _expand_album(tc, uri)
+    if uri.startswith("tidal:playlist:"):
+        items = await _rpc(tc, "core.playlists.get_items", {"uri": uri})
+        return [t["uri"] for t in (items or []) if isinstance(t, dict) and t.get("uri")]
+    refs = await _rpc(tc, "core.library.browse", {"uri": uri})
+    return [r["uri"] for r in (refs or [])
+            if isinstance(r, dict) and (r.get("uri") or "").startswith("tidal:track:")]
+
+
+async def _play_uris(tc, uris: list[str]) -> None:
+    await _rpc(tc, "core.tracklist.clear")
+    await _rpc(tc, "core.tracklist.add", {"uris": uris})
+    await _rpc(tc, "core.playback.play")
 
 
 # -- backend callables -----------------------------------------------------
@@ -154,9 +206,10 @@ async def search(ctx, query="", limit=8) -> ToolResult:
 
 async def play(ctx, query="", uri="", album=False) -> ToolResult:
     tc = ctx.config.tidal
-    # Album intent: play the whole record, not a single track.
-    if bool(album) or uri.startswith("tidal:album:"):
-        return await _play_album(ctx, tc, query, uri)
+    # Container intent: a whole album/playlist/mix, not a single track. `album=true` with a query
+    # searches for the album; a tidal:album/playlist/mix URI plays that exact container.
+    if bool(album) or _is_container_uri(uri):
+        return await _play_container(ctx, tc, query, uri, album=bool(album))
     label = ""
     if not uri and query:
         try:
@@ -176,18 +229,18 @@ async def play(ctx, query="", uri="", album=False) -> ToolResult:
         except Exception as e:
             return ToolResult(output="", error=f"couldn't resume: {e}")
     try:
-        await _rpc(tc, "core.tracklist.clear")
-        await _rpc(tc, "core.tracklist.add", {"uris": [uri]})
-        await _rpc(tc, "core.playback.play")
+        await _play_uris(tc, [uri])
     except Exception as e:
         return ToolResult(output="", error=f"couldn't play that: {e}")
     return ToolResult(output=f"Playing {label} on TIDAL." if label else "Playing on TIDAL.")
 
 
-async def _play_album(ctx, tc, query="", uri="") -> ToolResult:
+async def _play_container(ctx, tc, query="", uri="", album=False) -> ToolResult:
+    """Play a whole album / playlist / mix. A container URI plays exactly; `album=true` with a
+    query searches the album catalog first."""
     label = ""
-    album_uri = uri if uri.startswith("tidal:album:") else ""
-    if not album_uri and query:
+    container_uri = uri if _is_container_uri(uri) else ""
+    if not container_uri and album and query:
         try:
             results = await _rpc(tc, "core.library.search", {"query": {"any": [query]}})
         except Exception as e:
@@ -195,20 +248,20 @@ async def _play_album(ctx, tc, query="", uri="") -> ToolResult:
         albums = [a for a in _flatten_albums(results) if a["uri"]]
         if not albums:
             return ToolResult(output="", error=f"I couldn't find the album '{query}' on TIDAL.")
-        album_uri = albums[0]["uri"]
+        container_uri = albums[0]["uri"]
         label = albums[0]["title"] + (f" by {albums[0]['artist']}" if albums[0]["artist"] else "")
-    if not album_uri:
-        return ToolResult(output="", error="no album to play")
+    if not container_uri:
+        return ToolResult(output="", error="no album, playlist, or mix to play")
+    noun = _container_noun(container_uri)
     try:
-        uris = await _expand_album(tc, album_uri)
+        uris = await _expand_playable(tc, container_uri)
         if not uris:
-            return ToolResult(output="", error="that album has no playable tracks")
-        await _rpc(tc, "core.tracklist.clear")
-        await _rpc(tc, "core.tracklist.add", {"uris": uris})
-        await _rpc(tc, "core.playback.play")
+            return ToolResult(output="", error=f"that {noun} has no playable tracks")
+        await _play_uris(tc, uris)
     except Exception as e:
-        return ToolResult(output="", error=f"couldn't play that album: {e}")
-    return ToolResult(output=f"Playing the album {label} on TIDAL." if label else "Playing that album on TIDAL.")
+        return ToolResult(output="", error=f"couldn't play that {noun}: {e}")
+    return ToolResult(output=f"Playing the {noun} {label} on TIDAL." if label
+                      else f"Playing that {noun} on TIDAL.")
 
 
 async def _transport(ctx, method: str, said: str) -> ToolResult:
@@ -251,3 +304,39 @@ async def now_playing(ctx) -> ToolResult:
         "playing": True, "title": track.get("name"), "artist": artist,
         "album": (track.get("album") or {}).get("name", ""),
     }))
+
+
+async def playlists(ctx) -> ToolResult:
+    """The user's saved TIDAL playlists. Play one by passing its uri to tidal.play."""
+    tc = ctx.config.tidal
+    try:
+        refs = await _rpc(tc, "core.playlists.as_list")
+    except Exception as e:
+        return ToolResult(output="", error=f"couldn't load your playlists: {e}")
+    out = [{"kind": "playlist", "uri": p.get("uri"), "title": (p.get("name") or "").strip()}
+           for p in (refs or []) if isinstance(p, dict) and p.get("uri")]
+    return ToolResult(output=json.dumps(out))
+
+
+# Personalized first (mixes built from listening history), then editorial fallbacks. mopidy-tidal's
+# root browse ("tidal:") is empty on some versions, so target the known nodes directly and keep only
+# directly-playable refs (mixes/playlists), not category directories.
+_RECO_NODES = ("tidal:my_mixes", "tidal:for_you", "tidal:home")
+
+
+async def recommendations(ctx) -> ToolResult:
+    """Personalized mixes / recommendations. Play one by passing its uri to tidal.play."""
+    tc = ctx.config.tidal
+    for node in _RECO_NODES:
+        try:
+            refs = await _rpc(tc, "core.library.browse", {"uri": node})
+        except Exception:
+            continue
+        items = [
+            {"kind": _container_noun(r["uri"]), "uri": r["uri"], "title": (r.get("name") or "").strip()}
+            for r in (refs or [])
+            if isinstance(r, dict) and (r.get("uri") or "").startswith(("tidal:mix:", "tidal:playlist:"))
+        ]
+        if items:
+            return ToolResult(output=json.dumps(items))
+    return ToolResult(output="[]")
