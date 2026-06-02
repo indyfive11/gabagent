@@ -59,6 +59,16 @@ class JellyfinConfig(BaseModel):
     rating_threshold: float = 7.0         # default minimum CommunityRating (IMDb 0–10)
 
 
+class TidalConfig(BaseModel):
+    """TIDAL via a local Mopidy + mopidy-tidal server (first-party provider).
+
+    Mopidy exposes an HTTP JSON-RPC API; this skill drives search → queue → play and
+    transport over it. See the setup note for installing/authorizing mopidy-tidal.
+    """
+    enabled: bool = True
+    rpc_url: str = "http://localhost:6680/mopidy/rpc"
+
+
 class GabAgentConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="GABAI_",
@@ -94,3 +104,4 @@ class GabAgentConfig(BaseSettings):
     commands_enabled: bool = True  # voice command framework (capability discovery + run_command)
     attestation: AttestationConfig = Field(default_factory=AttestationConfig)
     jellyfin: JellyfinConfig = Field(default_factory=JellyfinConfig)
+    tidal: TidalConfig = Field(default_factory=TidalConfig)
