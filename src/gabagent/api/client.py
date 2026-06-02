@@ -11,7 +11,8 @@ from .rate_limit import UsageTracker
 
 # Transient "model failed to generate" hiccups: retry the same request a bounded number of times,
 # with a short backoff. Streaming retries are gated on "nothing yielded yet" (see stream_complete).
-_MAX_GEN_ATTEMPTS = 2
+# On the final attempt, an escalated turn falls back to the simpler model (fallback_model).
+_MAX_GEN_ATTEMPTS = 3
 _GEN_BACKOFF = 0.6
 
 # Matches ```json ... ``` or ``` ... ``` blocks containing a JSON tool call object
@@ -22,22 +23,33 @@ _TC_BLOCK = re.compile(
 
 
 def _is_toolcall_parse_error(e: Exception) -> bool:
-    """A 400 from the server because the model emitted tool calls it couldn't parse / that
-    didn't match the supplied tools (seen with local Ollama models). Transient → retry once."""
-    if getattr(e, "status_code", None) != 400:
-        return False
+    """The server rejected the model's tool calls — it couldn't parse them, or the model named a tool
+    that wasn't supplied (e.g. it called a catalog command-id like 'jellyfin.search' as if it were a
+    function). Arrives as a 400 OR wrapped as a RuntimeError, so match on the message text, not status."""
     s = str(e).lower()
-    return ("could not be parsed" in s
-            or "did not match the supplied tools" in s
-            or ("tool_calls" in s and "parse" in s))
+    return ("did not match the supplied tools" in s
+            or "invalid_tool_calls" in s
+            or "unknown_tool" in s
+            or ("tool_calls" in s and "could not be parsed" in s)
+            or ("tool" in s and "could not be parsed" in s))
+
+
+# Appended on a parse-error retry: the model called a command-id as a function; remind it to wrap in
+# run_command. Paired with escalating the retry to a stronger model (arya is unreliable at this).
+_TOOLCALL_NUDGE = (
+    "Only run_command, list_capabilities, and rescan_capabilities are callable tools. To use a "
+    "capability such as jellyfin.search or tidal.recommendations, call run_command with command_id set "
+    "to that id and the parameters in args — never call the capability name as a function or tool."
+)
 
 
 def _is_transient_generation_error(e: Exception) -> bool:
     """An upstream hiccup where the model simply didn't produce a response (e.g. gab.ai's
-    'The model failed to generate a response. Please try again.'). Not our request's fault →
-    retry the same request once."""
+    'The model failed to generate a response. Please try again.', code 'inference_failed'). Not our
+    request's fault → retry, and if the escalated model keeps failing, fall back to the simpler one."""
     s = str(e).lower()
-    return "failed to generate a response" in s or "please try again" in s
+    return ("failed to generate a response" in s or "please try again" in s
+            or "inference_failed" in s)
 
 
 def _extract_text_tool_calls(content: str) -> tuple[str, list[ToolCallSpec]]:
@@ -110,11 +122,24 @@ class GabAIClient:
         tools: list[dict] | None = None,
         model: str | None = None,
         stream: bool = True,
+        retry_model: str | None = None,
+        fallback_model: str | None = None,
     ) -> AsyncIterator[str | list[ToolCallSpec]]:
         active_model = model or self.model
         self.rate_limiter.record(active_model)
 
         raw_messages = [m.to_dict() for m in messages]
+
+        async def _nudge_retry(kw: dict):
+            """Recover from the model calling a command-id as a function: retry WITH tools, nudging it
+            to use run_command, on the stronger retry_model if given. Caller falls back to no-tools if
+            this still parse-errors."""
+            nudged = dict(kw)
+            nudged["messages"] = raw_messages + [{"role": "system", "content": _TOOLCALL_NUDGE}]
+            if retry_model and retry_model != (kw.get("model") or active_model):
+                nudged["model"] = retry_model
+                self.rate_limiter.record(retry_model)
+            return await self._client.chat.completions.create(**nudged)
 
         if not stream:
             # Non-streaming path: used for local models where streaming tool calls
@@ -140,12 +165,17 @@ class GabAIClient:
                     kwargs.pop("tool_choice", None)
                     response = await self._client.chat.completions.create(**kwargs)
                 elif want_tools and _is_toolcall_parse_error(e):
-                    # Local models (qwen/devstral via Ollama) sometimes emit malformed tool calls.
-                    # Retry this one turn WITHOUT tools so it yields a usable text answer instead of
-                    # erroring — transient, so don't disable tools permanently.
-                    kwargs.pop("tools", None)
-                    kwargs.pop("tool_choice", None)
-                    response = await self._client.chat.completions.create(**kwargs)
+                    # The model emitted bad tool calls (e.g. called a command-id as a function). Retry
+                    # with tools + a nudge (escalated if retry_model is set); if it STILL parse-errors,
+                    # drop tools so it yields a usable text answer instead of erroring.
+                    try:
+                        response = await _nudge_retry(kwargs)
+                    except Exception as e2:
+                        if not _is_toolcall_parse_error(e2):
+                            raise
+                        kwargs.pop("tools", None)
+                        kwargs.pop("tool_choice", None)
+                        response = await self._client.chat.completions.create(**kwargs)
                 elif _is_transient_generation_error(e):
                     # Upstream didn't generate anything — back off briefly and retry the same request.
                     await asyncio.sleep(_GEN_BACKOFF)
@@ -212,10 +242,17 @@ class GabAIClient:
                         kwargs.pop("tool_choice", None)
                         stream_obj = await self._client.chat.completions.create(**kwargs)
                     elif tools and self.tools_supported and _is_toolcall_parse_error(e):
-                        # Malformed tool calls this turn → retry without tools (same attempt).
-                        kwargs.pop("tools", None)
-                        kwargs.pop("tool_choice", None)
-                        stream_obj = await self._client.chat.completions.create(**kwargs)
+                        # The model called a command-id as a function → retry with tools + a nudge
+                        # (escalated to retry_model). If it STILL parse-errors, drop tools for a
+                        # graceful text answer.
+                        try:
+                            stream_obj = await _nudge_retry(kwargs)
+                        except Exception as e2:
+                            if not _is_toolcall_parse_error(e2):
+                                raise
+                            kwargs.pop("tools", None)
+                            kwargs.pop("tool_choice", None)
+                            stream_obj = await self._client.chat.completions.create(**kwargs)
                     else:
                         raise  # transient / other → handled by the outer except below
 
@@ -259,6 +296,12 @@ class GabAIClient:
                 if (not yielded_any and attempt + 1 < _MAX_GEN_ATTEMPTS
                         and _is_transient_generation_error(e)):
                     await asyncio.sleep(_GEN_BACKOFF)
+                    # Going into the FINAL attempt: if the escalated model keeps failing to generate,
+                    # fall back to the simpler model for this turn — a simpler answer beats an error.
+                    if (attempt == _MAX_GEN_ATTEMPTS - 2 and fallback_model
+                            and fallback_model != (kwargs.get("model") or active_model)):
+                        kwargs["model"] = fallback_model
+                        self.rate_limiter.record(fallback_model)
                     continue
                 body = getattr(e, "body", None)
                 if body:

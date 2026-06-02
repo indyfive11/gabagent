@@ -182,7 +182,7 @@ def test_status_phrase_varies_by_family():
 class _RaisingClient:
     model = "arya"
 
-    async def stream_complete(self, messages, tools=None, model=None):
+    async def stream_complete(self, messages, tools=None, model=None, retry_model=None, **kw):
         raise RuntimeError("kaboom")
         yield  # noqa: unreachable — makes this an async generator
 

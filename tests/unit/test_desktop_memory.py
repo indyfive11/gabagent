@@ -65,6 +65,23 @@ async def test_desktop_detect_false_when_nothing(monkeypatch):
     assert await DesktopProvider().detect(ctx=None) is False
 
 
+async def test_close_named_builds_injection_safe_kwin_js(monkeypatch):
+    from gabagent.commands.providers import desktop as d
+    captured = {}
+    async def fake_run(js): captured["js"] = js; return True
+    monkeypatch.setattr(d, "_run_kwin_script", fake_run)
+    r = await d.close_named(None, name='Vivaldi "X"')
+    assert r.success
+    assert '"vivaldi \\"x\\""' in captured["js"]            # lowercased + JSON-encoded (quotes escaped)
+    assert "windowList()" in captured["js"] and "closeWindow()" in captured["js"]
+
+
+async def test_close_named_requires_a_name():
+    from gabagent.commands.providers import desktop as d
+    r = await d.close_named(None, name="  ")
+    assert not r.success and "which window" in r.error.lower()
+
+
 # -- #1 capability grounding ----------------------------------------------
 
 def test_capability_brief_is_a_domain_index_plus_hot_set(tmp_path):
@@ -88,9 +105,14 @@ def test_hot_set_renders_exact_ids_and_params(tmp_path):
                     featured=True, backend=ShellBackend(argv=["true"]),
                     params=[Slot("action", "enum", True, enum=("pause", "resume", "stop"))]))
     brief = _capability_brief(_ctx(tmp_path, command_catalog=cat))
-    assert "tidal.play(query?, uri?)" in brief                      # optional params marked ?
-    assert "jellyfin.control(action=pause|resume|stop)" in brief    # required enum, no ?
-    assert "run_command(command_id, args)" in brief
+    # Ids are rendered standalone with args LABELED — never as `id(params)`, which the model misreads
+    # as a callable function and tries to invoke directly.
+    assert "tidal.play — Play music on TIDAL" in brief
+    assert "args: query?, uri?" in brief                            # optional params marked ?
+    assert "jellyfin.control — Control playback" in brief
+    assert "args: action=pause|resume|stop" in brief               # required enum, no ?
+    assert "tidal.play(" not in brief and "jellyfin.control(" not in brief   # NOT function signatures
+    assert "run_command" in brief and "NOT callable functions" in brief      # framed as run_command args
 
 
 def test_voice_system_injects_caps_and_memory(home):

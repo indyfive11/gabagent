@@ -21,7 +21,9 @@ class RunCommandTool(ToolBase):
     name = "run_command"
     description = (
         "Run a detected device/media capability by its command_id (e.g. media playback, "
-        "launching an app). Call list_capabilities first if you're unsure which ids exist. "
+        "launching an app). command_id is a STRING parameter — e.g. 'jellyfin.search', "
+        "'tidal.recommendations'; NEVER call a capability name as a tool/function directly, always "
+        "invoke it through run_command. Call list_capabilities first if you're unsure which ids exist. "
         "Risky commands will ask the user to confirm."
     )
     parameters = {

@@ -40,7 +40,8 @@ VOICE_ADDENDUM = (
     "rather than promising. You can also say 'switch to local' or 'back to cloud' to change models. "
     "When you report what you did, describe only what the action actually guarantees — say 'I opened "
     "it in your browser', not that you changed a specific tab you can't target; never claim an outcome "
-    "you can't verify. You keep a growing personal memory of this project: save lasting facts with "
+    "you can't verify. If a tool returns an error or says it couldn't do something, tell the user it "
+    "didn't work — never say you did it. You keep a growing personal memory of this project: save lasting facts with "
     "memory_write, and the user can ask what you remember or tell you to forget something. "
     "To stop or pause you, the user speaks to the voice layer directly (you never see these): "
     "'shut down voice mode' (or 'exit/quit voice mode') closes you completely, and 'go to sleep' "
@@ -123,17 +124,23 @@ def _capability_brief(ctx: AgentContext) -> str:
         if s["id"] in hot_ids:
             sig = ", ".join(_param_sig(p) for p in s["params"])
             summ = s["summary"][:60]
-            hot_lines.append(f"  - {s['id']}({sig}) — {summ}")
+            # Render the id standalone with args labeled — NOT as `id(params)`, which the model misreads
+            # as a callable function and tries to invoke directly (a real failure mode: it emitted
+            # `jellyfin.search` as a tool name and the API rejected every turn).
+            hot_lines.append(f"  - {s['id']} — {summ}" + (f"  · args: {sig}" if sig else ""))
 
     parts = [
-        "Things you can do on this machine, by domain (act with run_command(command_id, args)). For "
-        "the exact id and parameters of anything not under \"Common\", call "
-        "list_capabilities(domain=… or query=…) FIRST — do NOT deny a capability that fits a listed "
-        "domain; look it up:",
+        "Things you can do on this machine, by domain. These are NOT callable functions — invoke any of "
+        "them with the run_command tool, passing the command_id and args. For the exact id and "
+        "parameters of anything not under \"Common\", call list_capabilities(domain=… or query=…) FIRST "
+        "— do NOT deny a capability that fits a listed domain; look it up:",
         *dom_lines,
     ]
     if hot_lines:
-        parts += ["Common (call these directly):", *hot_lines]
+        parts += [
+            "Common command_ids (pass one as run_command's command_id — do NOT call them as functions):",
+            *hot_lines,
+        ]
     return "\n".join(parts)
 
 
@@ -290,12 +297,19 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             all_messages = _build_voice_messages(ctx, ctx.session.messages())
             tools = _voice_tool_schemas()
             request_model = None if ctx.local_mode else ctx.active_model
+            # If the model bungles a tool call (e.g. calls a command-id as a function), the client
+            # retries on the stronger model — but only for that failed turn, so simple turns stay cheap.
+            retry_model = None if ctx.local_mode else ctx.config.router.complex_model
+            # If an escalated turn keeps failing to generate (gab.ai 'inference_failed'), fall back to
+            # the simple model rather than erroring — a simpler answer beats a dead turn.
+            fallback_model = None if ctx.local_mode else ctx.config.router.simple_model
             sfilter = SpeakableFilter(code_notice=commands.filler("code", ctx))
 
             text_buf = ""
             tool_calls: list = []
             stream = _active_client(ctx).stream_complete(
-                all_messages, tools or None, model=request_model
+                all_messages, tools or None, model=request_model,
+                retry_model=retry_model, fallback_model=fallback_model,
             )
             if ctx.local_mode:
                 async for chunk in stream:

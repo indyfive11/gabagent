@@ -31,7 +31,7 @@ class FakeClient:
         self.responses = list(responses)
         self.model = "arya"
 
-    async def stream_complete(self, messages, tools=None, model=None):
+    async def stream_complete(self, messages, tools=None, model=None, retry_model=None, **kw):
         for c in self.responses.pop(0):
             yield c
 

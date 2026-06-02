@@ -74,8 +74,8 @@ class _Client:
     def __init__(self): self.chat = types.SimpleNamespace(completions=_Completions())
 
 
-async def test_malformed_toolcalls_retry_without_tools():
-    from gabagent.api.client import GabAIClient
+async def test_malformed_toolcalls_nudge_then_without_tools():
+    from gabagent.api.client import GabAIClient, _TOOLCALL_NUDGE
     from gabagent.api.models import ChatMessage
     c = GabAIClient("k", "http://localhost:11434/v1", "devstral:24b", _rl())
     c._client = _Client()
@@ -83,10 +83,12 @@ async def test_malformed_toolcalls_retry_without_tools():
     out = []
     async for chunk in c.stream_complete([ChatMessage(role="user", content="hi")], tools, stream=False):
         out.append(chunk)
-    # It retried once without tools and produced a usable text answer instead of erroring.
+    # call0 (tools) parse-errors → nudge-retry WITH tools (call1) parse-errors → drop tools (call2) → text.
     assert any(isinstance(x, str) and "plain text answer" in x for x in out)
     calls = c._client.chat.completions.calls
-    assert len(calls) == 2 and "tools" in calls[0] and "tools" not in calls[1]
+    assert len(calls) == 3
+    assert "tools" in calls[0] and "tools" in calls[1] and "tools" not in calls[2]
+    assert _TOOLCALL_NUDGE in calls[1]["messages"][-1]["content"]   # the nudge was injected
     assert c.tools_supported is True   # transient — tools NOT disabled permanently
 
 
@@ -100,6 +102,67 @@ class _Stream:
                 delta=types.SimpleNamespace(content=self._content, tool_calls=None),
                 finish_reason="stop")])
         return _gen()
+
+
+class _ToolResp:
+    """A non-streaming response carrying a single run_command tool call."""
+    def __init__(self):
+        tc = types.SimpleNamespace(id="t1", function=types.SimpleNamespace(
+            name="run_command", arguments='{"command_id":"jellyfin.search"}'))
+        self.choices = [types.SimpleNamespace(message=types.SimpleNamespace(content=None, tool_calls=[tc]))]
+
+
+class _EscalateCompletions:
+    """arya fumbles the tool call; the stronger retry_model gets it right."""
+    def __init__(self): self.calls = []
+    async def create(self, **kw):
+        self.calls.append(kw)
+        if (kw.get("model") or "arya") == "arya" and "tools" in kw:
+            raise _ParseErr("api_error invalid_tool_calls: unknown_tool 'jellyfin.search'")
+        return _ToolResp()
+
+
+class _FallbackCompletions:
+    """The escalated model keeps failing to generate; the simple model succeeds."""
+    def __init__(self): self.calls = []
+    async def create(self, **kw):
+        self.calls.append(kw.get("model"))
+        if kw.get("model") == "claude-sonnet-4-5":
+            raise RuntimeError("APIError: The model failed to generate a response. code: 'inference_failed'")
+        return _Stream("Recovered on arya.")
+
+
+async def test_escalated_inference_failure_falls_back_to_simple_model():
+    from gabagent.api.models import ChatMessage
+    c = GabAIClient("k", "https://gab.ai/v1", "arya", _rl())
+    comp = _FallbackCompletions()
+    c._client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=comp))
+    out = [x async for x in c.stream_complete([ChatMessage(role="user", content="hi")], None,
+                                              model="claude-sonnet-4-5", stream=True,
+                                              fallback_model="arya") if isinstance(x, str)]
+    assert "".join(out) == "Recovered on arya."
+    # sonnet (fail) → sonnet retry (fail) → final attempt falls back to arya (succeeds)
+    assert comp.calls == ["claude-sonnet-4-5", "claude-sonnet-4-5", "arya"]
+
+
+async def test_parse_error_retries_on_stronger_model_with_nudge():
+    from gabagent.api.client import GabAIClient, _TOOLCALL_NUDGE
+    from gabagent.api.models import ChatMessage
+    c = GabAIClient("k", "https://gab.ai/v1", "arya", _rl())
+    comp = _EscalateCompletions()
+    c._client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=comp))
+    tools = [{"type": "function", "function": {"name": "run_command", "parameters": {}}}]
+    specs = None
+    async for chunk in c.stream_complete([ChatMessage(role="user", content="play movie")],
+                                         tools, model="arya", stream=False,
+                                         retry_model="claude-sonnet-4-5"):
+        if isinstance(chunk, list):
+            specs = chunk
+    assert specs and specs[0].name == "run_command"        # recovered a valid tool call
+    assert len(comp.calls) == 2
+    assert comp.calls[0].get("model") == "arya"
+    assert comp.calls[1].get("model") == "claude-sonnet-4-5"           # escalated for the retry
+    assert _TOOLCALL_NUDGE in comp.calls[1]["messages"][-1]["content"]  # nudged
 
 
 class _StreamCompletions:
