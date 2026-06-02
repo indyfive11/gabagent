@@ -84,3 +84,69 @@ async def test_duck_jellyfin_pauses_then_resumes():
 async def test_duck_noop_when_nothing_configured():
     ctx = _ctx(tidal=False, jellyfin=False)
     assert await duck_media(ctx, True) == {"ok": True, "ducked": []}
+
+
+# -- browser-played movie: duck VOLUME, never pause (no REST, no Space toggle to fight) ----------
+
+class _FakeVideoPage:
+    """Models the HTML5 <video> we drive via page.evaluate."""
+    def __init__(self, volume=0.9, paused=False):
+        self.volume = volume; self.paused = paused; self._closed = False
+    def is_closed(self): return self._closed
+    async def evaluate(self, expr, arg=None):
+        if "v.volume = vol" in expr: self.volume = arg; return None
+        if "v.paused" in expr: return self.paused
+        if "v.volume" in expr: return self.volume
+        return None
+
+
+@respx.mock
+async def test_duck_jellyfin_browser_lowers_volume_not_pause():
+    # respx with NO Sessions/Pause routes: if it tried REST it would raise → proves it didn't.
+    ctx = _ctx(tidal=False, jellyfin=True)
+    page = _FakeVideoPage(volume=0.9)
+    ctx.jellyfin_playing_page = page
+    assert (await duck_media(ctx, True))["ducked"] == ["jellyfin"]
+    assert page.volume == 0.2                       # ducked the element volume
+    assert (await duck_media(ctx, False))["ducked"] == ["jellyfin"]
+    assert page.volume == 0.9                       # restored the EXACT prior level
+
+
+@respx.mock
+async def test_duck_jellyfin_browser_idempotent():
+    ctx = _ctx(tidal=False, jellyfin=True)
+    page = _FakeVideoPage(volume=0.7); ctx.jellyfin_playing_page = page
+    await duck_media(ctx, True)
+    out = await duck_media(ctx, True)               # second duck while already ducked
+    assert out["ducked"] == [] and page.volume == 0.2   # prior (0.7) preserved, not clobbered with 0.2
+    await duck_media(ctx, False)
+    assert page.volume == 0.7
+
+
+# -- GET /media/state snapshot ---------------------------------------------
+
+@respx.mock
+async def test_media_state_browser_playing_and_music():
+    from gabagent.voice.ducking import media_state
+    ctx = _ctx(tidal=True, jellyfin=True)
+    respx.post(RPC).mock(side_effect=_mopidy([], state="playing"))
+    ctx.jellyfin_playing_page = _FakeVideoPage(paused=False)
+    assert await media_state(ctx) == {"tidal": "playing", "jellyfin": "playing"}
+
+
+@respx.mock
+async def test_media_state_paused_video_stopped_music():
+    from gabagent.voice.ducking import media_state
+    ctx = _ctx(tidal=True, jellyfin=True)
+    respx.post(RPC).mock(side_effect=_mopidy([], state="stopped"))
+    ctx.jellyfin_playing_page = _FakeVideoPage(paused=True)
+    assert await media_state(ctx) == {"tidal": "stopped", "jellyfin": "paused"}
+
+
+@respx.mock
+async def test_media_state_nothing_playing():
+    from gabagent.voice.ducking import media_state
+    ctx = _ctx(tidal=False, jellyfin=True)
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[]))
+    st = await media_state(ctx)
+    assert st == {"tidal": "stopped", "jellyfin": "none"}

@@ -300,6 +300,35 @@ def _live_jellyfin_page(ctx):
     return page
 
 
+# -- HTML5 <video> introspection on the page we own (idempotent control + volume-duck) ----------
+# Reading the real element state is what stops a manual "pause" and the speech-ducking from fighting:
+# both reconcile to the actual video, instead of guessing via a bool and a blind Space toggle.
+
+async def _video_paused(page) -> bool | None:
+    try:
+        return await page.evaluate(
+            "() => { const v = document.querySelector('video'); return v ? v.paused : null; }")
+    except Exception:
+        return None
+
+
+async def _video_volume(page) -> float | None:
+    try:
+        return await page.evaluate(
+            "() => { const v = document.querySelector('video'); return v ? v.volume : null; }")
+    except Exception:
+        return None
+
+
+async def _set_video_volume(page, vol: float) -> bool:
+    try:
+        await page.evaluate(
+            "(vol) => { const v = document.querySelector('video'); if (v) v.volume = vol; }", vol)
+        return True
+    except Exception:
+        return False
+
+
 async def _browser_control(ctx, page, action) -> ToolResult:
     try:
         if action == "stop":
@@ -309,14 +338,25 @@ async def _browser_control(ctx, page, action) -> ToolResult:
             return ToolResult(output="Stopped the movie.")
         if action == "next":
             return ToolResult(output="", error="There's nothing to skip to in a movie.")
-        paused = getattr(ctx, "jellyfin_paused", False)
-        if action == "pause" and paused:
-            return ToolResult(output="It's already paused.")
-        if action == "resume" and not paused:
-            return ToolResult(output="It's already playing.")
-        await page.keyboard.press("Space")  # Space toggles play/pause in the Jellyfin web player
-        ctx.jellyfin_paused = (action == "pause")
-        return ToolResult(output="Paused the movie." if action == "pause" else "Resumed the movie.")
+        # Idempotent: read the REAL play state, then press Space (a toggle — but a *trusted* user
+        # gesture, unlike video.play() via evaluate which can be autoplay-blocked) only if the state
+        # actually needs to change. cur is None when we can't read it → best-effort single press.
+        cur = await _video_paused(page)
+        if action == "pause":
+            if cur is True:
+                ctx.jellyfin_paused = True
+                return ToolResult(output="It's already paused.")
+            await page.keyboard.press("Space")
+            ctx.jellyfin_paused = True
+            return ToolResult(output="Paused the movie.")
+        if action == "resume":
+            if cur is False:
+                ctx.jellyfin_paused = False
+                return ToolResult(output="It's already playing.")
+            await page.keyboard.press("Space")
+            ctx.jellyfin_paused = False
+            return ToolResult(output="Resumed the movie.")
+        return ToolResult(output="", error=f"unknown action: {action}")
     except Exception as e:
         return ToolResult(output="", error=f"couldn't control the player: {e}")
 

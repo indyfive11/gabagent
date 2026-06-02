@@ -179,17 +179,29 @@ async def test_play_signed_in_browser_path_does_not_crash(monkeypatch):
 # -- browser-path control via Playwright (web client ignores remote-control API) ----
 
 class _FakeKbd:
-    def __init__(self): self.keys = []
-    async def press(self, k): self.keys.append(k)
+    def __init__(self, page): self.keys = []; self._page = page
+    async def press(self, k):
+        self.keys.append(k)
+        if k == "Space":           # the real web player toggles play/pause on Space
+            self._page.paused = not self._page.paused
 
 
 class _FakePlayPage:
-    def __init__(self): self.keyboard = _FakeKbd(); self._closed = False
+    """Models the HTML5 <video> we introspect via page.evaluate (paused + volume)."""
+    def __init__(self, paused=False, volume=1.0):
+        self.paused = paused; self.volume = volume
+        self.keyboard = _FakeKbd(self); self._closed = False
     def is_closed(self): return self._closed
+    async def evaluate(self, expr, arg=None):
+        if "v.volume = vol" in expr:          # setter
+            self.volume = arg; return None
+        if "v.paused" in expr: return self.paused
+        if "v.volume" in expr: return self.volume
+        return None
 
 
 async def test_browser_control_pause_resume_stop():
-    page = _FakePlayPage()
+    page = _FakePlayPage(paused=False)
     ctx = _ctx(); ctx.jellyfin_playing_page = page; ctx.jellyfin_paused = False
     r = await jf.control(ctx, action="pause")
     assert r.success and page.keyboard.keys == ["Space"] and ctx.jellyfin_paused is True
@@ -199,11 +211,17 @@ async def test_browser_control_pause_resume_stop():
     assert r.success and page.keyboard.keys[-1] == "Escape" and ctx.jellyfin_playing_page is None
 
 
-async def test_browser_control_idempotent_pause():
-    page = _FakePlayPage()
-    ctx = _ctx(); ctx.jellyfin_playing_page = page; ctx.jellyfin_paused = True
+async def test_browser_control_idempotent_reads_real_state():
+    # Already paused → "pause" is a no-op (reads real video.paused, doesn't blind-toggle).
+    page = _FakePlayPage(paused=True)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page
     r = await jf.control(ctx, action="pause")
-    assert "already paused" in r.output and page.keyboard.keys == []   # no double toggle
+    assert "already paused" in r.output and page.keyboard.keys == []
+    # Already playing → "resume" is a no-op too.
+    page2 = _FakePlayPage(paused=False)
+    ctx2 = _ctx(); ctx2.jellyfin_playing_page = page2
+    r2 = await jf.control(ctx2, action="resume")
+    assert "already playing" in r2.output and page2.keyboard.keys == []
 
 
 @respx.mock
