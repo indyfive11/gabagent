@@ -5,9 +5,9 @@ which is the reliable Wayland path — no X11-only tools (wmctrl/xdotool) needed
 spectacle, quitting an app uses kquitapp6, and a couple of keyboard-driven actions use wtype.
 Each command is published only if its specific binary is present, so the catalog adapts to the host.
 
-Deliberately scoped (not "overdone"): the active window is the target for window ops (KWin shortcuts
-act on the active window); there is no arbitrary keystroke injector and no window enumeration —
-listing every open window reliably on Wayland needs a KWin script, left for a later pass.
+Most window ops target the active window (KWin shortcuts act on it); there is no arbitrary keystroke
+injector. Targeting a specific window by name uses a one-shot KWin script (workspace.windowList() +
+window.closeWindow()) — see window.close_named.
 """
 from __future__ import annotations
 import asyncio
@@ -51,6 +51,13 @@ _JS_TO_SCREEN = (
     "(function(){var w=workspace.activeWindow;if(!w)return;var tn=%TNAME%;var ti=%TI%;"
     "var s=workspace.screens;for(var i=0;i<s.length;i++){"
     "if(s[i].name===tn||(i+1)===ti){workspace.sendClientToScreen(w,s[i]);return;}}})();"
+)
+# Close the first window whose caption OR app class contains %NAME% (lowercased substring). Plasma 6
+# KWin scripting: workspace.windowList() + window.closeWindow() (verified on the host).
+_JS_CLOSE_NAMED = (
+    "(function(){var n=%NAME%;var ws=workspace.windowList();for(var i=0;i<ws.length;i++){"
+    "var w=ws[i];var c=(w.caption||'').toLowerCase();var k=(w.resourceClass||'').toLowerCase();"
+    "if(c.indexOf(n)>=0||k.indexOf(n)>=0){w.closeWindow();return;}}})();"
 )
 
 
@@ -143,6 +150,18 @@ async def to_screen(ctx, screen="") -> ToolResult:
         else ToolResult(output="", error="couldn't move the window")
 
 
+async def close_named(ctx, name="") -> ToolResult:
+    name = str(name).strip()
+    if not name:
+        return ToolResult(output="", error="which window?")
+    # The KWin script only reports that it ran, not whether a window matched — so phrase the result
+    # conditionally rather than claiming a window was definitely closed.
+    js = _JS_CLOSE_NAMED.replace("%NAME%", json.dumps(name.lower()))
+    ok = await _run_kwin_script(js)
+    return ToolResult(output=f"If a {name} window was open, I've closed it.") if ok \
+        else ToolResult(output="", error="couldn't run the window command")
+
+
 class DesktopProvider:
     id = "desktop"
 
@@ -185,6 +204,14 @@ class DesktopProvider:
                 Command(id="window.close", domain="window", tier=2,
                         summary="Close the active window", confirm_template="Close the active window?",
                         backend=_kwin("Window Close"), examples=["close this window", "close this"]),
+                Command(id="window.close_named", domain="window", tier=2,
+                        summary="Close a specific window by name (its title or app), not just the active one",
+                        confirm_template="Close the {name} window?",
+                        backend=PyBackend(ref="gabagent.commands.providers.desktop:close_named"),
+                        params=[Slot("name", "string", True,
+                                     description="part of the window title or app, e.g. 'dolphin', 'vivaldi', 'jellyfin'")],
+                        examples=["close the Dolphin window", "close the Vivaldi window",
+                                  "close the window called Steam"]),
             ]
 
         if shutil.which("kscreen-doctor"):
