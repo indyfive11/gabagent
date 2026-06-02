@@ -16,8 +16,8 @@ if TYPE_CHECKING:
 
 @dataclass
 class MetaCommand:
-    kind: str          # "brain" | "undo" | "query"
-    value: str = ""    # brain: local|cloud  ·  query: model|where|recap
+    kind: str          # "brain" | "undo" | "query" | "forget"
+    value: str = ""    # brain: local|cloud · query: model|where|recap|error|caps|memory · forget: last|all
 
 
 # -- detection -------------------------------------------------------------
@@ -62,6 +62,30 @@ _Q_ERROR = re.compile(
 )
 
 
+# "what can you do" — list real capabilities from the catalog, not the model's guess.
+_Q_CAPS = re.compile(
+    r"\bwhat\s+can\s+you\s+(?:do|help|control)\b"
+    r"|\bwhat\s+are\s+you\s+able\s+to\b"
+    r"|\b(?:list|tell\s+me)\s+(?:your\s+)?capabilit",
+    re.I,
+)
+# "what do you remember" — read from saved memory.
+_Q_MEMORY = re.compile(
+    r"\bwhat\s+do\s+you\s+(?:remember|know\s+about)\b"
+    r"|\bwhat\s+have\s+you\s+saved\b"
+    r"|\bwhat'?s?\s+in\s+your\s+memory\b",
+    re.I,
+)
+# "forget …" — drop the last note, or wipe all on an explicit everything/all. Kept strict so
+# casual speech ("forget about it, move on" / "clear the screen") doesn't wipe memory.
+_FORGET = re.compile(
+    r"\bforget\s+(?:that|it|everything|all(?:\s+of\s+it)?|the\s+last(?:\s+\w+)?|your\s+memory)\b"
+    r"|\bclear\s+(?:your\s+)?memory\b",
+    re.I,
+)
+_FORGET_ALL = re.compile(r"\b(?:everything|all(?:\s+of\s+it)?|your\s+memory|memory)\b", re.I)
+
+
 def detect_meta_command(text: str) -> MetaCommand | None:
     t = text.strip()
     if _TO_LOCAL.search(t):
@@ -76,6 +100,12 @@ def detect_meta_command(text: str) -> MetaCommand | None:
         return MetaCommand("query", "where")
     if _Q_ERROR.search(t):
         return MetaCommand("query", "error")
+    if _Q_CAPS.search(t):
+        return MetaCommand("query", "caps")
+    if _Q_MEMORY.search(t):
+        return MetaCommand("query", "memory")
+    if _FORGET.search(t):
+        return MetaCommand("forget", "all" if _FORGET_ALL.search(t) else "last")
     if _Q_RECAP.search(t):
         return MetaCommand("query", "recap")
     return None
@@ -217,9 +247,64 @@ def answer_query(ctx: AgentContext, which: str) -> str:
         vs = getattr(ctx, "voice_session", None)
         err = getattr(vs, "last_error", None) if vs is not None else None
         return f"The last error was: {err}." if err else "Nothing's gone wrong recently."
+    if which == "caps":
+        return capabilities_brief(ctx)
+    if which == "memory":
+        return _memory_summary(ctx)
     if which == "recap":
         return _recap(ctx)
     return "I'm not sure what you're asking."
+
+
+_DOMAIN_PHRASE = {
+    "media": "play and search your Jellyfin movies",
+    "apps": "open apps and websites",
+    "window": "manage windows — maximize, minimize, move them between monitors, or close them",
+    "desktop": "take screenshots, close tabs, and quit apps",
+    "system": "adjust the volume and power",
+}
+
+
+def _join(items: list[str]) -> str:
+    items = [i for i in items if i]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + ", and " + items[-1]
+
+
+def capabilities_brief(ctx: AgentContext) -> str:
+    cat = getattr(ctx, "command_catalog", None)
+    domains = sorted({c.domain for c in cat.all()}) if cat is not None else []
+    if not domains:
+        return "Right now I can read and edit files, search the web, and run shell tasks for you."
+    phrases = [_DOMAIN_PHRASE.get(d, d) for d in domains]
+    return ("Besides reading and editing files and searching the web, I can " + _join(phrases)
+            + ". Just ask.")
+
+
+def _memory_summary(ctx: AgentContext) -> str:
+    from gabagent.session.memory import MemoryManager
+    text = MemoryManager(ctx.cwd).load().strip()
+    if not text:
+        return "I haven't saved anything about this project yet."
+    blocks = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("## ")]
+    n = text.count("\n## ") + (1 if text.startswith("## ") else 0)
+    last = blocks[-1].strip() if blocks else ""
+    if last:
+        return f"I've got {n} note{'s' if n != 1 else ''} saved. The most recent: {last}"
+    return f"I've got {n} note{'s' if n != 1 else ''} saved about this project."
+
+
+def forget(ctx: AgentContext, scope: str) -> str:
+    from gabagent.session.memory import MemoryManager
+    mgr = MemoryManager(ctx.cwd)
+    if scope == "all":
+        mgr.clear()
+        return "Okay, I've cleared everything I'd saved about this project."
+    return ("Okay, I've forgotten the last thing I noted." if mgr.pop_last()
+            else "There's nothing saved to forget.")
 
 
 def _recap(ctx: AgentContext, n: int = 5) -> str:

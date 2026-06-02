@@ -35,6 +35,17 @@ class MemoryManager:
     def clear(self) -> None:
         self._path.write_text("")
 
+    def pop_last(self) -> bool:
+        """Remove the most recent '## <timestamp>' note block. Returns False if none."""
+        if not self._path.exists():
+            return False
+        lines = self._path.read_text(encoding="utf-8").splitlines()
+        idx = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].startswith("## ")), None)
+        if idx is None:
+            return False
+        self._path.write_text("\n".join(lines[:idx]).rstrip() + "\n", encoding="utf-8")
+        return True
+
     def health_check(self) -> None:
         """Archiving logic: if memory file > 200 lines, archive oldest and keep newest."""
         if not self._path.exists():

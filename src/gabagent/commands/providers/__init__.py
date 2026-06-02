@@ -10,5 +10,6 @@ from gabagent.commands.providers.jellyfin import PROVIDER as _jellyfin
 from gabagent.commands.providers.mpris import PROVIDER as _mpris
 from gabagent.commands.providers.system import PROVIDER as _system
 from gabagent.commands.providers.applaunch import PROVIDER as _applaunch
+from gabagent.commands.providers.desktop import PROVIDER as _desktop
 
-PROVIDERS: list[CapabilityProvider] = [_jellyfin, _mpris, _system, _applaunch]
+PROVIDERS: list[CapabilityProvider] = [_jellyfin, _mpris, _system, _applaunch, _desktop]

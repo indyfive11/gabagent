@@ -37,7 +37,11 @@ VOICE_ADDENDUM = (
     "risky actions like deleting files or running shell commands, say you need keyboard "
     "confirmation. You can control media and device functions when they're available — but only "
     "offer what's actually available: if unsure what you can control, check your capabilities first "
-    "rather than promising. You can also say 'switch to local' or 'back to cloud' to change models."
+    "rather than promising. You can also say 'switch to local' or 'back to cloud' to change models. "
+    "When you report what you did, describe only what the action actually guarantees — say 'I opened "
+    "it in your browser', not that you changed a specific tab you can't target; never claim an outcome "
+    "you can't verify. You keep a growing personal memory of this project: save lasting facts with "
+    "memory_write, and the user can ask what you remember or tell you to forget something."
 )
 
 
@@ -48,12 +52,49 @@ class NullToolDisplay:
 
 def _voice_system(ctx: AgentContext) -> str:
     s = VOICE_ADDENDUM + f"\n\nWorking directory: {ctx.cwd}"
+    caps = _capability_brief(ctx)
+    if caps:
+        s += f"\n\n{caps}"
+    mem = _memory_brief(ctx)
+    if mem:
+        s += f"\n\n{mem}"
     persona = (getattr(ctx.config, "voice_persona", "") or "").strip()
     if persona:
         s += f"\n\nStyle: speak as a {persona}."
     if ctx.local_mode and ctx.local_context_summary:
         s += f"\n\n{ctx.local_context_summary}"
     return s
+
+
+def _capability_brief(ctx: AgentContext) -> str:
+    """Ground the model in what it can actually do on THIS host, so it never denies a real
+    capability (run via run_command; list_capabilities gives ids/params)."""
+    cat = getattr(ctx, "command_catalog", None)
+    if cat is None:
+        return ""
+    by_domain: dict[str, list[str]] = {}
+    for c in cat.all():
+        by_domain.setdefault(c.domain, []).append(c.summary)
+    if not by_domain:
+        return ""
+    lines = [f"- {dom}: {'; '.join(sorted(set(s)))}" for dom, s in sorted(by_domain.items())]
+    return ("Things you can do on this machine right now (via run_command with the matching command "
+            "id — call list_capabilities for ids and parameters). Do NOT deny a capability listed "
+            "here:\n" + "\n".join(lines))
+
+
+def _memory_brief(ctx: AgentContext, limit: int = 1500) -> str:
+    """Your own saved notes about this project, so memory carries across sessions."""
+    try:
+        from gabagent.session.memory import MemoryManager
+        mem = MemoryManager(ctx.cwd).load().strip()
+    except Exception:
+        mem = ""
+    if not mem:
+        return ""
+    if len(mem) > limit:
+        mem = "…" + mem[-limit:]
+    return f"What you remember about this project (your own saved notes):\n{mem}"
 
 
 def _build_voice_messages(ctx: AgentContext, messages: list[ChatMessage]) -> list[ChatMessage]:
@@ -125,6 +166,8 @@ async def _handle_meta(ctx: AgentContext, mc: commands.MetaCommand, emit) -> Non
             await emit(events.token("Okay, back on the cloud brain."))
     elif mc.kind == "undo":
         await emit(events.token(commands.undo_last(ctx)))
+    elif mc.kind == "forget":
+        await emit(events.token(commands.forget(ctx, mc.value)))
     elif mc.kind == "query":
         await emit(events.token(commands.answer_query(ctx, mc.value)))
     await emit(events.done())
