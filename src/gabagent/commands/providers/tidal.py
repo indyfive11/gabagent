@@ -48,13 +48,16 @@ class TidalProvider:
             ),
             Command(
                 id="tidal.play", domain="media", tier=1,
-                summary="Play music on TIDAL — searches and plays, or resumes if no query is given",
+                summary="Play music on TIDAL — a track, or a whole album (album=true), or resume",
                 backend=PyBackend(ref=ref + "play"),
                 params=[
                     Slot("query", "string", False, description="what to play, e.g. 'Kind of Blue'"),
                     Slot("uri", "string", False, description="a tidal: URI from tidal.search to play exactly"),
+                    Slot("album", "boolean", False,
+                         description="true to queue the whole album instead of a single track"),
                 ],
-                examples=["play some Miles Davis on tidal", "play kind of blue", "play music"],
+                examples=["play some Miles Davis on tidal", "play the album Dizzy Up the Girl",
+                          "play kind of blue", "play music"],
             ),
             Command(id="tidal.pause", domain="media", tier=1, summary="Pause TIDAL playback",
                     backend=PyBackend(ref=ref + "pause"), examples=["pause the music", "pause tidal"]),
@@ -100,12 +103,38 @@ def _flatten_tracks(search_results) -> list[dict]:
     for res in search_results or []:
         for t in res.get("tracks") or []:
             out.append({
+                "kind": "track",
                 "uri": t.get("uri"),
                 "title": t.get("name"),
                 "artist": _artist_names(t),
                 "album": (t.get("album") or {}).get("name", ""),
             })
     return out
+
+
+def _flatten_albums(search_results) -> list[dict]:
+    out: list[dict] = []
+    for res in search_results or []:
+        for a in res.get("albums") or []:
+            out.append({
+                "kind": "album",
+                "uri": a.get("uri"),
+                "title": a.get("name"),
+                "artist": _artist_names(a),
+            })
+    return out
+
+
+async def _expand_album(tc, album_uri: str) -> list[str]:
+    """Resolve a tidal:album: URI to its track URIs via core.library.lookup."""
+    res = await _rpc(tc, "core.library.lookup", {"uris": [album_uri]})
+    tracks: list = []
+    if isinstance(res, dict):
+        for v in res.values():
+            tracks += v or []
+    elif isinstance(res, list):
+        tracks = res
+    return [t["uri"] for t in tracks if isinstance(t, dict) and t.get("uri")]
 
 
 # -- backend callables -----------------------------------------------------
@@ -119,11 +148,15 @@ async def search(ctx, query="", limit=8) -> ToolResult:
     except Exception as e:
         return ToolResult(output="", error=f"TIDAL search failed: {e}")
     tracks = [t for t in _flatten_tracks(results) if t["uri"]][:limit]
-    return ToolResult(output=json.dumps(tracks))
+    albums = [a for a in _flatten_albums(results) if a["uri"]][:4]
+    return ToolResult(output=json.dumps(tracks + albums))
 
 
-async def play(ctx, query="", uri="") -> ToolResult:
+async def play(ctx, query="", uri="", album=False) -> ToolResult:
     tc = ctx.config.tidal
+    # Album intent: play the whole record, not a single track.
+    if bool(album) or uri.startswith("tidal:album:"):
+        return await _play_album(ctx, tc, query, uri)
     label = ""
     if not uri and query:
         try:
@@ -149,6 +182,33 @@ async def play(ctx, query="", uri="") -> ToolResult:
     except Exception as e:
         return ToolResult(output="", error=f"couldn't play that: {e}")
     return ToolResult(output=f"Playing {label} on TIDAL." if label else "Playing on TIDAL.")
+
+
+async def _play_album(ctx, tc, query="", uri="") -> ToolResult:
+    label = ""
+    album_uri = uri if uri.startswith("tidal:album:") else ""
+    if not album_uri and query:
+        try:
+            results = await _rpc(tc, "core.library.search", {"query": {"any": [query]}})
+        except Exception as e:
+            return ToolResult(output="", error=f"TIDAL search failed: {e}")
+        albums = [a for a in _flatten_albums(results) if a["uri"]]
+        if not albums:
+            return ToolResult(output="", error=f"I couldn't find the album '{query}' on TIDAL.")
+        album_uri = albums[0]["uri"]
+        label = albums[0]["title"] + (f" by {albums[0]['artist']}" if albums[0]["artist"] else "")
+    if not album_uri:
+        return ToolResult(output="", error="no album to play")
+    try:
+        uris = await _expand_album(tc, album_uri)
+        if not uris:
+            return ToolResult(output="", error="that album has no playable tracks")
+        await _rpc(tc, "core.tracklist.clear")
+        await _rpc(tc, "core.tracklist.add", {"uris": uris})
+        await _rpc(tc, "core.playback.play")
+    except Exception as e:
+        return ToolResult(output="", error=f"couldn't play that album: {e}")
+    return ToolResult(output=f"Playing the album {label} on TIDAL." if label else "Playing that album on TIDAL.")
 
 
 async def _transport(ctx, method: str, said: str) -> ToolResult:

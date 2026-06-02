@@ -119,3 +119,50 @@ async def test_rpc_error_surfaces():
         200, json={"jsonrpc": "2.0", "id": 1, "error": {"message": "boom"}}))
     res = await td.search(_ctx(), query="x")
     assert not res.success and "boom" in res.error
+
+
+@respx.mock
+async def test_play_album_searches_expands_and_queues_all():
+    seen = []
+
+    def resp(request):
+        body = json.loads(request.content); m = body["method"]; seen.append((m, body.get("params")))
+        result = {
+            "core.library.search": [{"albums": [
+                {"uri": "tidal:album:1", "name": "Dizzy Up the Girl", "artists": [{"name": "Goo Goo Dolls"}]}]}],
+            "core.library.lookup": {"tidal:album:1": [{"uri": "tidal:track:1"}, {"uri": "tidal:track:2"}]},
+        }.get(m)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), query="Dizzy Up the Girl", album=True)
+    assert res.success and "album" in res.output.lower() and "Dizzy Up the Girl" in res.output
+    methods = [m for m, _ in seen]
+    assert methods == ["core.library.search", "core.library.lookup",
+                       "core.tracklist.clear", "core.tracklist.add", "core.playback.play"]
+    assert ("core.tracklist.add", {"uris": ["tidal:track:1", "tidal:track:2"]}) in seen
+
+
+@respx.mock
+async def test_play_album_uri_skips_search():
+    seen = []
+
+    def resp(request):
+        m = json.loads(request.content)["method"]; seen.append(m)
+        result = {"core.library.lookup": {"tidal:album:9": [{"uri": "tidal:track:9"}]}}.get(m)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), uri="tidal:album:9")     # album uri → album path, no flag needed
+    assert res.success
+    assert "core.library.search" not in seen and "core.library.lookup" in seen
+
+
+@respx.mock
+async def test_search_includes_albums():
+    respx.post(RPC).mock(side_effect=_rpc_router({"core.library.search": [
+        {"tracks": [_TRACK], "albums": [{"uri": "tidal:album:1", "name": "Kind of Blue",
+                                         "artists": [{"name": "Miles Davis"}]}]}]}))
+    data = json.loads((await td.search(_ctx(), query="kind of blue")).output)
+    kinds = {d["kind"] for d in data}
+    assert kinds == {"track", "album"}
