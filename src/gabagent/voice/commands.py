@@ -52,6 +52,14 @@ _Q_WHERE = re.compile(
 _Q_RECAP = re.compile(
     r"\b(?:recap|what\s+have\s+you\s+done|what\s+did\s+you\s+do)\b", re.I
 )
+# "what went wrong" — answered from the stored last_error, NOT by re-running the failed action.
+_Q_ERROR = re.compile(
+    r"\bwhat(?:'?s| was| is)?\s+(?:the\s+|that\s+)?error\b"
+    r"|\bwhat\s+went\s+wrong\b"
+    r"|\bwhat\s+happened\b"
+    r"|\bwhy\s+did\s+(?:that|it)\s+(?:fail|break|error|stop)\b",
+    re.I,
+)
 
 
 def detect_meta_command(text: str) -> MetaCommand | None:
@@ -66,6 +74,8 @@ def detect_meta_command(text: str) -> MetaCommand | None:
         return MetaCommand("query", "model")
     if _Q_WHERE.search(t):
         return MetaCommand("query", "where")
+    if _Q_ERROR.search(t):
+        return MetaCommand("query", "error")
     if _Q_RECAP.search(t):
         return MetaCommand("query", "recap")
     return None
@@ -203,6 +213,10 @@ def answer_query(ctx: AgentContext, which: str) -> str:
             f"I'm working in {ctx.cwd.name}. I can edit freely in {zones}; "
             f"changes to this project need a spoken okay, and risky actions need keyboard confirmation."
         )
+    if which == "error":
+        vs = getattr(ctx, "voice_session", None)
+        err = getattr(vs, "last_error", None) if vs is not None else None
+        return f"The last error was: {err}." if err else "Nothing's gone wrong recently."
     if which == "recap":
         return _recap(ctx)
     return "I'm not sure what you're asking."

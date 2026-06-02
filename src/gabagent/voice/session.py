@@ -24,6 +24,13 @@ class VoiceSession:
         self.undo_stack: list[tuple[str, bytes | None]] = []
         # Tier-3 arming windows: tool_family -> expires_at (epoch seconds).
         self.armed: dict[str, float] = {}
+        # Last turn-level failure, for the "what went wrong?" query.
+        self.last_error: str | None = None
+        self.last_error_time: float | None = None
+
+    def set_error(self, msg: str) -> None:
+        self.last_error = msg
+        self.last_error_time = time.time()
 
     # -- confirm round-trip --------------------------------------------------
     def new_confirm(self, cid: str) -> asyncio.Future:

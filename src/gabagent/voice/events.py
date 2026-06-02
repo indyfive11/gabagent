@@ -6,7 +6,7 @@ from dataclasses import dataclass, asdict
 
 @dataclass
 class VoiceEvent:
-    type: str            # token | status | confirm | blocked | done
+    type: str            # token | status | confirm | blocked | error | done
     text: str = ""
     id: str = ""
     tier: int = 0
@@ -14,6 +14,7 @@ class VoiceEvent:
     summary: str = ""
     reason: str = ""
     action: str = ""
+    prompt_is_complete: bool = False   # confirm: summary is the full spoken line (incl. its own yes/no)
 
     def to_dict(self) -> dict:
         d = {k: v for k, v in asdict(self).items() if v not in ("", 0)}
@@ -35,12 +36,23 @@ def status(text: str) -> VoiceEvent:
     return VoiceEvent(type="status", text=text)
 
 
-def confirm(cid: str, tier: int, method: str, summary: str, reason: str = "") -> VoiceEvent:
-    return VoiceEvent(type="confirm", id=cid, tier=tier, method=method, summary=summary, reason=reason)
+def confirm(cid: str, tier: int, method: str, summary: str, reason: str = "",
+            prompt_complete: bool = False) -> VoiceEvent:
+    """A gate confirm. By convention `summary` is a bare action/question and the voice
+    client appends the yes/no instruction (Option A). Set `prompt_complete` when the
+    summary already contains its own choice (e.g. a 'use it / open a new window' surface)
+    so the client speaks it verbatim and appends nothing."""
+    return VoiceEvent(type="confirm", id=cid, tier=tier, method=method, summary=summary,
+                      reason=reason, prompt_is_complete=prompt_complete)
 
 
 def blocked(action: str, reason: str) -> VoiceEvent:
     return VoiceEvent(type="blocked", action=action, reason=reason)
+
+
+def error(cause: str, text: str = "") -> VoiceEvent:
+    """A turn-level failure. `text` is speakable; `summary` carries the structured cause."""
+    return VoiceEvent(type="error", text=text or "Sorry, I hit a problem.", summary=cause)
 
 
 def done() -> VoiceEvent:

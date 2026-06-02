@@ -52,8 +52,13 @@ class JellyfinProvider:
             Command(
                 id="jellyfin.play", domain="media", tier=2, requires_confirm_surface=True,
                 summary="Play a movie — on your open client if you have one, or in a new window",
+                confirm_template="Play {title} in Jellyfin?",
                 backend=BrowserBackend(ref="gabagent.commands.providers.jellyfin:play"),
-                params=[Slot("item_id", "string", True, description="Jellyfin item id from jellyfin.search")],
+                params=[
+                    Slot("item_id", "string", True, description="Jellyfin item id from jellyfin.search"),
+                    Slot("title", "string", False,
+                         description="human movie title from jellyfin.search, for the spoken confirmation"),
+                ],
                 examples=["play that one", "play the first movie"],
             ),
             Command(
@@ -138,7 +143,8 @@ async def control(ctx, action="") -> ToolResult:
     return ToolResult(output=f"{action} sent.") if r.is_success else ToolResult(output="", error=f"control failed: HTTP {r.status_code}")
 
 
-async def play(ctx, item_id="") -> ToolResult:
+async def play(ctx, item_id="", title="") -> ToolResult:
+    # `title` is carried for the spoken confirmation only; playback uses item_id.
     jc = ctx.config.jellyfin
     if not item_id:
         return ToolResult(output="", error="no item to play")
@@ -152,10 +158,15 @@ async def play(ctx, item_id="") -> ToolResult:
     if controllable and vs is not None and emit is not None:
         from gabagent.voice import events
         names = " or ".join(s.get("DeviceName", "a device") for s in controllable[:2])
+        what = f"{title} " if title else ""
         cid = uuid4().hex
         fut = vs.new_confirm(cid)
-        await emit(events.confirm(cid, 2, "spoken_yesno",
-                                  f"Play on your open {names}? Yes to use it, no to open a new window.", ""))
+        # This confirm carries its own choice (yes=use it / no=new window), so it's a
+        # complete spoken line — the client must not append the standard yes/no tail.
+        await emit(events.confirm(
+            cid, 2, "spoken_yesno",
+            f"Play {what}on your open {names}? Say yes to play there, or no to open a new window.",
+            "", prompt_complete=True))
         try:
             approved, _ = await asyncio.wait_for(fut, timeout=60)
         except Exception:

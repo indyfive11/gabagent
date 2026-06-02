@@ -84,3 +84,4 @@ class Command:
     examples: list[str] = field(default_factory=list)
     structured: bool = False               # True => result is JSON the model parses
     requires_confirm_surface: bool = False
+    confirm_template: str = ""             # speakable confirm summary, e.g. "Play {title} in Jellyfin?"

@@ -73,7 +73,33 @@ def _status_phrase(tool_calls) -> str:
     names = {tc.name for tc in tool_calls}
     if names & {"write_file", "edit", "git_commit"}:
         return "Making that change."
+    if "run_command" in names:
+        domain = _run_command_domain(tool_calls)
+        return f"Trying {domain}…" if domain else "Setting that up."
+    if names & {"list_capabilities", "rescan_capabilities"}:
+        return "Checking what I can control."
+    if names & {"web_search", "web_fetch"}:
+        return "Looking that up."
+    if names & {"grep", "read_file", "glob"}:
+        return "Reading through things."
     return "Looking into it."
+
+
+def _run_command_domain(tool_calls) -> str:
+    """Best-effort human domain for the first run_command (e.g. 'Jellyfin'). Empty if unknown."""
+    import json
+    for tc in tool_calls:
+        if tc.name != "run_command":
+            continue
+        try:
+            cid = (json.loads(tc.arguments) if tc.arguments else {}).get("command_id", "")
+        except Exception:
+            cid = ""
+        if cid.startswith("jellyfin."):
+            return "Jellyfin"
+        if "." in cid:
+            return cid.split(".", 1)[0]
+    return ""
 
 
 async def _emit_filtered(sfilter: SpeakableFilter, parts, emit) -> None:
@@ -201,9 +227,25 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
         if vs.queue is not None:
             vs.queue.put_nowait(events.done())
         raise
-    except Exception:
+    except Exception as e:
+        cause = f"{type(e).__name__}: {e}".strip()
+        # Persist a full traceback for diagnosis (mirrors the TUI crash path in cli.py).
+        try:
+            import traceback
+            from gabagent.session.postmortem import PostMortemManager
+            PostMortemManager(cwd=ctx.cwd).log_crash(
+                f"Voice turn failed for: {user_text!r}\n\n{traceback.format_exc()}"
+            )
+        except Exception:
+            pass
+        dlog(ctx, "error", cause=cause, stage="turn")
+        if vs is not None:
+            vs.set_error(cause)
         if vs.queue is not None:
-            vs.queue.put_nowait(events.status("Sorry, I hit an error and stopped."))
+            # voice-agent speaks `error.text` and logs `summary`; the trailing `done`
+            # closes the SSE. (It also suppresses any status right after an error.)
+            vs.queue.put_nowait(events.error(
+                cause, "Sorry, I hit a problem — ask me what went wrong for details."))
             vs.queue.put_nowait(events.done())
 
 

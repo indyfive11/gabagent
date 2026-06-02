@@ -156,8 +156,32 @@ def _summarize(tool_name: str, args: dict, ctx: AgentContext) -> str:
         return f"Run the command: {cmd}.{tail}"
     if tool_name == "git_commit":
         return f"Commit with the message: {args.get('message', '')}."
+    if tool_name == "run_command":
+        return _summarize_command(args, ctx)
     arg_bits = ", ".join(f"{k}={v}" for k, v in list(args.items())[:3])
     return f"{tool_name} ({arg_bits})" if arg_bits else tool_name
+
+
+def _summarize_command(args: dict, ctx: AgentContext) -> str:
+    """Speakable summary for a catalog command — never reads the raw dict/id aloud.
+    Prefers the command's confirm_template (when all its fields are present), then its
+    static human summary, then a bare 'Run <id>.'"""
+    import string
+    cid = args.get("command_id", "")
+    inner = args.get("args", {}) or {}
+    cat = getattr(ctx, "command_catalog", None)
+    cmd = cat.get(cid) if cat is not None else None
+    if cmd is None:
+        return f"Run {cid}." if cid else "Run a command."
+    tmpl = getattr(cmd, "confirm_template", "")
+    if tmpl:
+        fields = [f for _, f, _, _ in string.Formatter().parse(tmpl) if f]
+        if fields and all(str(inner.get(f, "")).strip() for f in fields):
+            try:
+                return tmpl.format(**inner)
+            except Exception:
+                pass
+    return cmd.summary or f"Run {cid}."
 
 
 def _reason(tool_name: str, args: dict, tier: int, ctx: AgentContext) -> str:
