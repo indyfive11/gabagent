@@ -30,20 +30,36 @@ def _state(ctx) -> dict:
     return s
 
 
-async def duck_media(ctx, on: bool) -> dict:
+async def duck_media(ctx, on: bool, session_id: str | None = None) -> dict:
     """Duck (on=True) or restore (on=False) any active media. Fire-and-forget; never raises."""
     ducked = []
     if await _duck_tidal(ctx, on):
         ducked.append("tidal")
     if await _duck_jellyfin(ctx, on):
         ducked.append("jellyfin")
+    # Make the duck/restore visible in voice_debug.jsonl so the on/off timing and whether restore
+    # actually fired can be joined with the voice-agent's DUCK log. On an `off`, "jellyfin" in `ducked`
+    # means the restore succeeded; its absence means nothing was restored (the bug signature).
+    try:
+        from gabagent.voice.debuglog import dlog
+        st = _state(ctx)
+        dlog(ctx, "duck", session=session_id, on=bool(on), ducked=ducked,
+             jellyfin_saved=st.get("jellyfin_video_volume"), tidal_prior=st.get("tidal_prior"))
+    except Exception:
+        pass
     return {"ok": True, "ducked": ducked}
 
 
 async def media_state(ctx) -> dict:
-    """Read-only snapshot for the voice client's duck-timing: {tidal, jellyfin}. Lets it skip
-    ducking when nothing is actually playing. Never raises."""
-    return {"tidal": await _tidal_state(ctx), "jellyfin": await _jellyfin_state(ctx)}
+    """Provider-NEUTRAL playback snapshot for the voice client's duck-timing. The shape is generic by
+    design — NO brain-specific provider names (jellyfin/tidal/…) cross the brain↔voice protocol, so any
+    brain can serve it and the voice side never learns what media the brain controls (see
+    [[feedback-gabagent-brain-agnostic-protocol]]). Returns {"playing": bool, "state":
+    "playing"|"paused"|"idle"}. Never raises."""
+    sources = [await _tidal_state(ctx), await _jellyfin_state(ctx)]
+    playing = any(s == "playing" for s in sources)
+    state = "playing" if playing else ("paused" if any(s == "paused" for s in sources) else "idle")
+    return {"playing": playing, "state": state}
 
 
 async def _tidal_state(ctx) -> str:
@@ -125,12 +141,20 @@ async def _duck_jellyfin_video(ctx, page, on: bool) -> bool:
             prior = await _video_volume(page)
             if prior is None:
                 return False
-            st["jellyfin_video_volume"] = float(prior)
+            # If the video is already AT or below the duck level, it was almost certainly stranded
+            # there by a brain restart mid-duck (the saved prior is in-memory, lost on restart).
+            # Saving that as the restore target would keep the movie quiet forever — restore to full.
+            st["jellyfin_video_volume"] = 1.0 if float(prior) <= _DUCK_VIDEO_VOLUME else float(prior)
             await _set_video_volume(page, _DUCK_VIDEO_VOLUME)
             return True
         if st["jellyfin_video_volume"] is None:
             return False
-        await _set_video_volume(page, float(st["jellyfin_video_volume"]))
+        ok = await _set_video_volume(page, float(st["jellyfin_video_volume"]))
+        if not ok:
+            # The page-eval restore silently failed — KEEP the saved level so the next on:false can
+            # retry. Clearing it here (the old behavior) let the next duck read the still-0.2 video and
+            # save 0.2 as the "prior", which is how the movie got stuck quiet.
+            return False
         st["jellyfin_video_volume"] = None
         return True
     except Exception:

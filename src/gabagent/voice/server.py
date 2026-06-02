@@ -96,10 +96,13 @@ def build_app(ctx: AgentContext):
         # Called on VAD speech-onset/end: duck music + movie volume so Aria can hear over playback.
         from gabagent.voice.ducking import duck_media
         body = await request.json()
-        return JSONResponse(await duck_media(ctx, bool(body.get("on"))))
+        return JSONResponse(await duck_media(ctx, bool(body.get("on")), session_id=body.get("session_id")))
 
     async def media_state(request):
         # Read-only: lets the voice client's duck-timing skip ducking when nothing's playing.
+        # PROTOCOL INVARIANT: this response (like every event/endpoint here) stays brain-agnostic —
+        # provider-NEUTRAL, no jellyfin/tidal/etc. names cross to the voice side. Keep it generic so
+        # any brain is pluggable. (Enforced by test_media_state_is_provider_neutral.)
         from gabagent.voice.ducking import media_state as _media_state
         return JSONResponse(await _media_state(ctx))
 

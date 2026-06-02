@@ -16,11 +16,13 @@ if TYPE_CHECKING:
     from gabagent.agent.context import AgentContext
 
 
-def dlog(ctx: AgentContext, event: str, **fields) -> None:
+def dlog(ctx: AgentContext, event: str, session: str | None = None, **fields) -> None:
     path = getattr(ctx, "voice_debug_path", None)
     if not path:
         return
-    sid = getattr(getattr(ctx, "voice_session", None), "session_id", "")
+    # Most events run inside a turn (ctx.voice_session is set); out-of-turn callers like /media/duck
+    # pass the session_id explicitly.
+    sid = session or getattr(getattr(ctx, "voice_session", None), "session_id", "")
     entry = {
         "ts": datetime.now().isoformat(timespec="milliseconds"),
         "session": sid,

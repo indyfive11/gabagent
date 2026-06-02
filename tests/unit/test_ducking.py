@@ -123,6 +123,42 @@ async def test_duck_jellyfin_browser_idempotent():
     assert page.volume == 0.7
 
 
+@respx.mock
+async def test_duck_jellyfin_stranded_low_restores_to_full():
+    # The movie was left at the duck level (0.2) by a prior restart. Ducking must NOT save 0.2 as the
+    # restore target (that strands it quiet forever) — it saves full so restore un-stutters it.
+    from gabagent.voice.ducking import _state
+    ctx = _ctx(tidal=False, jellyfin=True)
+    page = _FakeVideoPage(volume=0.2); ctx.jellyfin_playing_page = page
+    await duck_media(ctx, True)
+    assert _state(ctx)["jellyfin_video_volume"] == 1.0     # saved FULL, not the stranded 0.2
+    await duck_media(ctx, False)
+    assert page.volume == 1.0                              # restored to full
+
+
+class _FailingSetPage(_FakeVideoPage):
+    """The volume SETTER silently fails (page-eval error), like a dead/navigated page."""
+    async def evaluate(self, expr, arg=None):
+        if "v.volume = vol" in expr:
+            raise RuntimeError("eval failed")
+        return await super().evaluate(expr, arg)
+
+
+@respx.mock
+async def test_duck_restore_failure_keeps_saved_level_for_retry():
+    # The bug that stranded the movie quiet: a failed restore used to wipe the saved level, so the
+    # NEXT duck read the still-low video and saved 0.2 as "prior". Now a failed restore keeps it.
+    from gabagent.voice.ducking import _state
+    ctx = _ctx(tidal=False, jellyfin=True)
+    page = _FailingSetPage(volume=0.9); ctx.jellyfin_playing_page = page
+    await duck_media(ctx, True)
+    st = _state(ctx)
+    assert st["jellyfin_video_volume"] == 0.9          # prior saved
+    out = await duck_media(ctx, False)                 # restore set() fails
+    assert out["ducked"] == []                         # not reported as restored
+    assert st["jellyfin_video_volume"] == 0.9          # KEPT (not wiped) so a later off can retry
+
+
 # -- GET /media/state snapshot ---------------------------------------------
 
 @respx.mock
@@ -131,7 +167,7 @@ async def test_media_state_browser_playing_and_music():
     ctx = _ctx(tidal=True, jellyfin=True)
     respx.post(RPC).mock(side_effect=_mopidy([], state="playing"))
     ctx.jellyfin_playing_page = _FakeVideoPage(paused=False)
-    assert await media_state(ctx) == {"tidal": "playing", "jellyfin": "playing"}
+    assert await media_state(ctx) == {"playing": True, "state": "playing"}
 
 
 @respx.mock
@@ -140,7 +176,7 @@ async def test_media_state_paused_video_stopped_music():
     ctx = _ctx(tidal=True, jellyfin=True)
     respx.post(RPC).mock(side_effect=_mopidy([], state="stopped"))
     ctx.jellyfin_playing_page = _FakeVideoPage(paused=True)
-    assert await media_state(ctx) == {"tidal": "stopped", "jellyfin": "paused"}
+    assert await media_state(ctx) == {"playing": False, "state": "paused"}
 
 
 @respx.mock
@@ -149,4 +185,18 @@ async def test_media_state_nothing_playing():
     ctx = _ctx(tidal=False, jellyfin=True)
     respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[]))
     st = await media_state(ctx)
-    assert st == {"tidal": "stopped", "jellyfin": "none"}
+    assert st == {"playing": False, "state": "idle"}
+
+
+@respx.mock
+async def test_media_state_is_provider_neutral():
+    # PHILOSOPHY GUARD: the brain↔voice protocol must not leak brain-specific provider names. If a new
+    # provider is added, the /media/state shape must stay generic (aggregate), never grow per-provider
+    # keys — otherwise a different brain stops being pluggable.
+    from gabagent.voice.ducking import media_state
+    ctx = _ctx(tidal=True, jellyfin=True)
+    respx.post(RPC).mock(side_effect=_mopidy([], state="playing"))
+    ctx.jellyfin_playing_page = _FakeVideoPage(paused=False)
+    st = await media_state(ctx)
+    assert set(st.keys()) <= {"playing", "state"}              # neutral keys only
+    assert not any(k in str(st).lower() for k in ("jellyfin", "tidal", "mopidy", "video"))
