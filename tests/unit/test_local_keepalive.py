@@ -1,6 +1,7 @@
 import json
 import types
 import httpx
+import pytest
 import respx
 
 from gabagent.api.client import GabAIClient
@@ -121,3 +122,67 @@ async def test_transient_generation_error_retries_once():
             out.append(chunk)
     assert "".join(out) == "Recovered answer."
     assert c._client.chat.completions.calls == 2   # failed once, retried, succeeded
+
+
+# --- transient raised DURING stream iteration (the real gap: error fires inside `async for`) -----
+
+def _chunk(text):
+    return types.SimpleNamespace(choices=[types.SimpleNamespace(
+        delta=types.SimpleNamespace(content=text, tool_calls=None), finish_reason=None)])
+
+
+class _RaisingStream:
+    """Opens fine, then raises the transient before yielding anything."""
+    def __aiter__(self):
+        async def _gen():
+            raise RuntimeError("The model failed to generate a response. Please try again.")
+            yield  # pragma: no cover - makes this a generator
+        return _gen()
+
+
+class _MidIterCompletions:
+    def __init__(self): self.calls = 0
+    async def create(self, **kw):
+        self.calls += 1
+        return _RaisingStream() if self.calls == 1 else _Stream("Recovered answer.")
+
+
+async def test_transient_during_iteration_retries():
+    from gabagent.api.models import ChatMessage
+    c = GabAIClient("k", "https://gab.ai/v1", "arya", _rl())
+    comp = _MidIterCompletions()
+    c._client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=comp))
+    out = [x async for x in c.stream_complete([ChatMessage(role="user", content="hi")], None, stream=True)
+           if isinstance(x, str)]
+    assert "".join(out) == "Recovered answer."
+    assert comp.calls == 2   # the mid-iteration failure is now retried (was the bug: it wasn't)
+
+
+class _PartialThenFailStream:
+    """Emits a token, THEN fails — replaying would double-emit, so we must NOT retry."""
+    def __aiter__(self):
+        async def _gen():
+            yield _chunk("Partial ")
+            raise RuntimeError("The model failed to generate a response. Please try again.")
+        return _gen()
+
+
+class _PartialCompletions:
+    def __init__(self): self.calls = 0
+    async def create(self, **kw):
+        self.calls += 1
+        return _PartialThenFailStream()
+
+
+async def test_transient_after_emission_does_not_retry():
+    from gabagent.api.models import ChatMessage
+    c = GabAIClient("k", "https://gab.ai/v1", "arya", _rl())
+    comp = _PartialCompletions()
+    c._client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=comp))
+    out = []
+    with pytest.raises(Exception):
+        async for chunk in c.stream_complete([ChatMessage(role="user", content="hi")], None, stream=True):
+            if isinstance(chunk, str):
+                out.append(chunk)
+    assert out == ["Partial "]   # the partial reached the caller...
+    assert comp.calls == 1       # ...so we did NOT replay it (no double-speak)

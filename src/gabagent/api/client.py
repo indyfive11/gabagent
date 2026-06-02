@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import json
 import re
 import uuid as _uuid_mod
@@ -7,6 +8,11 @@ from typing import AsyncIterator
 from openai import AsyncOpenAI
 from .models import ChatMessage, ToolCallSpec
 from .rate_limit import UsageTracker
+
+# Transient "model failed to generate" hiccups: retry the same request a bounded number of times,
+# with a short backoff. Streaming retries are gated on "nothing yielded yet" (see stream_complete).
+_MAX_GEN_ATTEMPTS = 2
+_GEN_BACKOFF = 0.6
 
 # Matches ```json ... ``` or ``` ... ``` blocks containing a JSON tool call object
 _TC_BLOCK = re.compile(
@@ -141,7 +147,8 @@ class GabAIClient:
                     kwargs.pop("tool_choice", None)
                     response = await self._client.chat.completions.create(**kwargs)
                 elif _is_transient_generation_error(e):
-                    # Upstream didn't generate anything — retry the same request once.
+                    # Upstream didn't generate anything — back off briefly and retry the same request.
+                    await asyncio.sleep(_GEN_BACKOFF)
                     response = await self._client.chat.completions.create(**kwargs)
                 else:
                     body = getattr(e, "body", None)
@@ -185,67 +192,78 @@ class GabAIClient:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
-        tc_names: dict[int, str] = defaultdict(str)
-        tc_ids: dict[int, str] = defaultdict(str)
-        tc_args: dict[int, str] = defaultdict(str)
-        text_buf = ""
+        # Retry the WHOLE open+iterate on a transient "failed to generate" — but only while nothing
+        # has been yielded yet. Callers (agent loop / voice turn) emit text deltas immediately, so
+        # replaying after partial output would double-emit; "failed to generate" yields zero tokens,
+        # so the common case is safely retryable.
+        for attempt in range(_MAX_GEN_ATTEMPTS):
+            tc_names: dict[int, str] = defaultdict(str)
+            tc_ids: dict[int, str] = defaultdict(str)
+            tc_args: dict[int, str] = defaultdict(str)
+            yielded_any = False
+            try:
+                try:
+                    stream_obj = await self._client.chat.completions.create(**kwargs)
+                except Exception as e:
+                    # If the model rejects tool schemas, retry without them (same attempt).
+                    if tools and self.tools_supported and getattr(e, "status_code", None) == 400 and "does not support tools" in str(e):
+                        self.tools_supported = False
+                        kwargs.pop("tools", None)
+                        kwargs.pop("tool_choice", None)
+                        stream_obj = await self._client.chat.completions.create(**kwargs)
+                    elif tools and self.tools_supported and _is_toolcall_parse_error(e):
+                        # Malformed tool calls this turn → retry without tools (same attempt).
+                        kwargs.pop("tools", None)
+                        kwargs.pop("tool_choice", None)
+                        stream_obj = await self._client.chat.completions.create(**kwargs)
+                    else:
+                        raise  # transient / other → handled by the outer except below
 
-        try:
-            stream_obj = await self._client.chat.completions.create(**kwargs)
-        except Exception as e:
-            # If the model rejects tool schemas, retry without them.
-            if tools and self.tools_supported and getattr(e, "status_code", None) == 400 and "does not support tools" in str(e):
-                self.tools_supported = False
-                kwargs.pop("tools", None)
-                kwargs.pop("tool_choice", None)
-                stream_obj = await self._client.chat.completions.create(**kwargs)
-            elif tools and self.tools_supported and _is_toolcall_parse_error(e):
-                # Malformed tool calls this turn → retry once without tools (transient).
-                kwargs.pop("tools", None)
-                kwargs.pop("tool_choice", None)
-                stream_obj = await self._client.chat.completions.create(**kwargs)
-            elif _is_transient_generation_error(e):
-                # Upstream didn't generate anything — retry the same request once.
-                stream_obj = await self._client.chat.completions.create(**kwargs)
-            else:
+                async for chunk in stream_obj:
+                    choice = chunk.choices[0] if chunk.choices else None
+                    if choice is None:
+                        continue
+                    delta = choice.delta
+
+                    if delta.content:
+                        yield delta.content
+                        yielded_any = True
+
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if tc_delta.id:
+                                tc_ids[idx] = tc_delta.id
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    tc_names[idx] += tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    tc_args[idx] += tc_delta.function.arguments
+
+                    if choice.finish_reason in ("tool_calls", "stop") and tc_names:
+                        specs = [
+                            ToolCallSpec(
+                                id=tc_ids[i],
+                                name=tc_names[i],
+                                arguments=tc_args[i],
+                            )
+                            for i in sorted(tc_names.keys())
+                        ]
+                        yield specs
+                        yielded_any = True
+                        tc_names.clear()
+                        tc_ids.clear()
+                        tc_args.clear()
+                return
+            except Exception as e:
+                if (not yielded_any and attempt + 1 < _MAX_GEN_ATTEMPTS
+                        and _is_transient_generation_error(e)):
+                    await asyncio.sleep(_GEN_BACKOFF)
+                    continue
                 body = getattr(e, "body", None)
                 if body:
                     raise RuntimeError(f"{type(e).__name__}: {e} | body={body}") from e
                 raise
-        async for chunk in stream_obj:
-            choice = chunk.choices[0] if chunk.choices else None
-            if choice is None:
-                continue
-            delta = choice.delta
-
-            if delta.content:
-                text_buf += delta.content
-                yield delta.content
-
-            if delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if tc_delta.id:
-                        tc_ids[idx] = tc_delta.id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            tc_names[idx] += tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            tc_args[idx] += tc_delta.function.arguments
-
-            if choice.finish_reason in ("tool_calls", "stop") and tc_names:
-                specs = [
-                    ToolCallSpec(
-                        id=tc_ids[i],
-                        name=tc_names[i],
-                        arguments=tc_args[i],
-                    )
-                    for i in sorted(tc_names.keys())
-                ]
-                yield specs
-                tc_names.clear()
-                tc_ids.clear()
-                tc_args.clear()
 
     async def complete_simple(self, messages: list[ChatMessage], model: str | None = None) -> str:
         active_model = model or self.model
