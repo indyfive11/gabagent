@@ -26,6 +26,14 @@ def _is_toolcall_parse_error(e: Exception) -> bool:
             or ("tool_calls" in s and "parse" in s))
 
 
+def _is_transient_generation_error(e: Exception) -> bool:
+    """An upstream hiccup where the model simply didn't produce a response (e.g. gab.ai's
+    'The model failed to generate a response. Please try again.'). Not our request's fault →
+    retry the same request once."""
+    s = str(e).lower()
+    return "failed to generate a response" in s or "please try again" in s
+
+
 def _extract_text_tool_calls(content: str) -> tuple[str, list[ToolCallSpec]]:
     """Split model text that embeds tool calls as JSON into prose and ToolCallSpecs.
 
@@ -132,6 +140,9 @@ class GabAIClient:
                     kwargs.pop("tools", None)
                     kwargs.pop("tool_choice", None)
                     response = await self._client.chat.completions.create(**kwargs)
+                elif _is_transient_generation_error(e):
+                    # Upstream didn't generate anything — retry the same request once.
+                    response = await self._client.chat.completions.create(**kwargs)
                 else:
                     body = getattr(e, "body", None)
                     if body:
@@ -192,6 +203,9 @@ class GabAIClient:
                 # Malformed tool calls this turn → retry once without tools (transient).
                 kwargs.pop("tools", None)
                 kwargs.pop("tool_choice", None)
+                stream_obj = await self._client.chat.completions.create(**kwargs)
+            elif _is_transient_generation_error(e):
+                # Upstream didn't generate anything — retry the same request once.
                 stream_obj = await self._client.chat.completions.create(**kwargs)
             else:
                 body = getattr(e, "body", None)

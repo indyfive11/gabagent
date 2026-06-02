@@ -87,3 +87,37 @@ async def test_malformed_toolcalls_retry_without_tools():
     calls = c._client.chat.completions.calls
     assert len(calls) == 2 and "tools" in calls[0] and "tools" not in calls[1]
     assert c.tools_supported is True   # transient — tools NOT disabled permanently
+
+
+# --- transient "failed to generate" retry (streaming / premium path) ------
+
+class _Stream:
+    def __init__(self, content): self._content = content
+    def __aiter__(self):
+        async def _gen():
+            yield types.SimpleNamespace(choices=[types.SimpleNamespace(
+                delta=types.SimpleNamespace(content=self._content, tool_calls=None),
+                finish_reason="stop")])
+        return _gen()
+
+
+class _StreamCompletions:
+    def __init__(self): self.calls = 0
+    async def create(self, **kw):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("The model failed to generate a response. Please try again.")
+        return _Stream("Recovered answer.")
+
+
+async def test_transient_generation_error_retries_once():
+    from gabagent.api.client import GabAIClient
+    from gabagent.api.models import ChatMessage
+    c = GabAIClient("k", "https://gab.ai/v1", "arya", _rl())
+    c._client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=_StreamCompletions()))
+    out = []
+    async for chunk in c.stream_complete([ChatMessage(role="user", content="hi")], None, stream=True):
+        if isinstance(chunk, str):
+            out.append(chunk)
+    assert "".join(out) == "Recovered answer."
+    assert c._client.chat.completions.calls == 2   # failed once, retried, succeeded
