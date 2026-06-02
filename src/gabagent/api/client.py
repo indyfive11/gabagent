@@ -15,6 +15,17 @@ _TC_BLOCK = re.compile(
 )
 
 
+def _is_toolcall_parse_error(e: Exception) -> bool:
+    """A 400 from the server because the model emitted tool calls it couldn't parse / that
+    didn't match the supplied tools (seen with local Ollama models). Transient → retry once."""
+    if getattr(e, "status_code", None) != 400:
+        return False
+    s = str(e).lower()
+    return ("could not be parsed" in s
+            or "did not match the supplied tools" in s
+            or ("tool_calls" in s and "parse" in s))
+
+
 def _extract_text_tool_calls(content: str) -> tuple[str, list[ToolCallSpec]]:
     """Split model text that embeds tool calls as JSON into prose and ToolCallSpecs.
 
@@ -114,6 +125,13 @@ class GabAIClient:
                     kwargs.pop("tools", None)
                     kwargs.pop("tool_choice", None)
                     response = await self._client.chat.completions.create(**kwargs)
+                elif want_tools and _is_toolcall_parse_error(e):
+                    # Local models (qwen/devstral via Ollama) sometimes emit malformed tool calls.
+                    # Retry this one turn WITHOUT tools so it yields a usable text answer instead of
+                    # erroring — transient, so don't disable tools permanently.
+                    kwargs.pop("tools", None)
+                    kwargs.pop("tool_choice", None)
+                    response = await self._client.chat.completions.create(**kwargs)
                 else:
                     body = getattr(e, "body", None)
                     if body:
@@ -167,6 +185,11 @@ class GabAIClient:
             # If the model rejects tool schemas, retry without them.
             if tools and self.tools_supported and getattr(e, "status_code", None) == 400 and "does not support tools" in str(e):
                 self.tools_supported = False
+                kwargs.pop("tools", None)
+                kwargs.pop("tool_choice", None)
+                stream_obj = await self._client.chat.completions.create(**kwargs)
+            elif tools and self.tools_supported and _is_toolcall_parse_error(e):
+                # Malformed tool calls this turn → retry once without tools (transient).
                 kwargs.pop("tools", None)
                 kwargs.pop("tool_choice", None)
                 stream_obj = await self._client.chat.completions.create(**kwargs)
