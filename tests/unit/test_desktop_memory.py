@@ -33,9 +33,9 @@ def _ctx(tmp_path, **kw):
 def _media_catalog():
     cat = CommandCatalog()
     cat.add(Command(id="jellyfin.play", domain="media", tier=2, summary="Play a movie",
-                    backend=ShellBackend(argv=["true"])))
+                    featured=True, backend=ShellBackend(argv=["true"])))   # hot-set
     cat.add(Command(id="window.close", domain="window", tier=2, summary="Close the active window",
-                    backend=ShellBackend(argv=["true"])))
+                    backend=ShellBackend(argv=["true"])))                  # long tail (index only)
     return cat
 
 
@@ -67,26 +67,29 @@ async def test_desktop_detect_false_when_nothing(monkeypatch):
 
 # -- #1 capability grounding ----------------------------------------------
 
-def test_capability_brief_lists_real_catalog(tmp_path):
+def test_capability_brief_is_a_domain_index_plus_hot_set(tmp_path):
     ctx = _ctx(tmp_path, command_catalog=_media_catalog())
     brief = _capability_brief(ctx)
-    assert "Do NOT deny" in brief and "Play a movie" in brief and "media" in brief
+    assert "NOT deny" in brief                          # anti-denial instruction kept
+    assert "media (1)" in brief and "window (1)" in brief  # domain index with counts
+    assert "Play a movie" in brief                       # featured → in the hot set
+    # the long tail is NOT dumped — only reachable via list_capabilities
+    assert "Close the active window" not in brief
+    assert "list_capabilities" in brief                  # told to look up the rest
 
 
-def test_capability_brief_includes_exact_ids_and_params(tmp_path):
+def test_hot_set_renders_exact_ids_and_params(tmp_path):
     from gabagent.commands.model import Slot
     cat = CommandCatalog()
     cat.add(Command(id="tidal.play", domain="media", tier=1, summary="Play music on TIDAL",
-                    backend=ShellBackend(argv=["true"]),
+                    featured=True, backend=ShellBackend(argv=["true"]),
                     params=[Slot("query", "string", False), Slot("uri", "string", False)]))
     cat.add(Command(id="jellyfin.control", domain="media", tier=1, summary="Control playback",
-                    backend=ShellBackend(argv=["true"]),
+                    featured=True, backend=ShellBackend(argv=["true"]),
                     params=[Slot("action", "enum", True, enum=("pause", "resume", "stop"))]))
     brief = _capability_brief(_ctx(tmp_path, command_catalog=cat))
-    # exact id + optional params marked with ?, so the model can call run_command directly
-    assert "tidal.play(query?, uri?)" in brief
-    # required enum slot shows its allowed values and no ?
-    assert "jellyfin.control(action=pause|resume|stop)" in brief
+    assert "tidal.play(query?, uri?)" in brief                      # optional params marked ?
+    assert "jellyfin.control(action=pause|resume|stop)" in brief    # required enum, no ?
     assert "run_command(command_id, args)" in brief
 
 

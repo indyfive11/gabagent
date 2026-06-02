@@ -154,7 +154,7 @@ class DesktopProvider:
 
         if shutil.which("qdbus6"):
             cmds += [
-                Command(id="window.maximize", domain="window", tier=1,
+                Command(id="window.maximize", domain="window", tier=1, featured=True,
                         summary="Maximize the active window", backend=_kwin("Window Maximize"),
                         examples=["maximize this", "make this window full size"]),
                 Command(id="window.minimize", domain="window", tier=1,
@@ -169,7 +169,7 @@ class DesktopProvider:
                         summary="Move the active window to the next monitor (cycles)",
                         backend=_kwin("Window One Screen to the Right"),
                         examples=["move this to the next screen", "cycle it to another monitor"]),
-                Command(id="window.to_largest_screen", domain="window", tier=1,
+                Command(id="window.to_largest_screen", domain="window", tier=1, featured=True,
                         summary="Move the active window to the largest monitor",
                         backend=PyBackend(ref="gabagent.commands.providers.desktop:to_largest_screen"),
                         examples=["move it to the biggest screen", "put the movie on my largest monitor"]),
@@ -189,7 +189,7 @@ class DesktopProvider:
 
         if shutil.which("kscreen-doctor"):
             cmds.append(Command(
-                id="window.list_screens", domain="window", tier=1, structured=True,
+                id="window.list_screens", domain="window", tier=1, structured=True, featured=True,
                 summary="List the monitors and their sizes (and which is largest)",
                 backend=PyBackend(ref="gabagent.commands.providers.desktop:list_screens"),
                 examples=["how many monitors do I have", "list my screens"]))

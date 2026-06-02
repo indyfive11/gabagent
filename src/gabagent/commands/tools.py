@@ -42,24 +42,45 @@ class RunCommandTool(ToolBase):
         if cmd is None:
             return ToolResult(output="", error=f"Unknown command: {command_id}. Try list_capabilities.")
         from gabagent.commands.backends import run_backend
-        return await run_backend(cmd, args or {}, ctx)
+        result = await run_backend(cmd, args or {}, ctx)
+        if result.success:
+            from gabagent.commands import usage
+            usage.record(command_id)   # promote frequently-used commands into the hot set
+        return result
 
 
 @registry.register
 class ListCapabilitiesTool(ToolBase):
     name = "list_capabilities"
-    description = "List the device/media capabilities available on this machine (optionally filter by domain)."
+    description = (
+        "Look up device/media/desktop capabilities. With no arguments, returns a compact index of "
+        "domains. Pass domain='media' to list that domain's commands with their exact ids and "
+        "parameters, or query='play music' to search across all capabilities. Call this to get the "
+        "exact command_id and args before run_command."
+    )
     parameters = {
         "type": "object",
-        "properties": {"domain": {"type": "string", "description": "Optional domain filter, e.g. 'media'"}},
+        "properties": {
+            "domain": {"type": "string", "description": "List a domain's full commands, e.g. 'media'"},
+            "query": {"type": "string", "description": "Keyword search across all capabilities, e.g. 'play music'"},
+        },
         "required": [],
     }
 
-    async def execute(self, ctx: AgentContext, domain: str | None = None, **kwargs: Any) -> ToolResult:
+    async def execute(self, ctx: AgentContext, domain: str | None = None,
+                      query: str | None = None, **kwargs: Any) -> ToolResult:
         catalog = getattr(ctx, "command_catalog", None)
         if catalog is None or not catalog.all():
             return ToolResult(output="No device/media capabilities are available on this machine.")
-        return ToolResult(output=json.dumps(catalog.summaries(domain)))
+        if query:
+            matches = catalog.search(query)
+            ids = [c.id for c in matches]
+            return ToolResult(output=json.dumps(
+                [s for s in catalog.summaries() if s["id"] in ids]))
+        if domain:
+            return ToolResult(output=json.dumps(catalog.summaries(domain)))
+        # No filter → the index (domains + counts), not every command — keeps it tight.
+        return ToolResult(output=json.dumps(catalog.index()))
 
 
 @registry.register

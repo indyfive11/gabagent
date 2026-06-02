@@ -31,7 +31,7 @@ class AppLaunchProvider:
         ))
         if shutil.which("xdg-open"):
             cmds.append(Command(
-                id="app.open_url", domain="apps", tier=1,
+                id="app.open_url", domain="apps", tier=1, featured=True,
                 summary="Open a URL in the default browser",
                 confirm_template="Open {url} in your browser?",
                 backend=ShellBackend(argv=["xdg-open", "{url}"]),

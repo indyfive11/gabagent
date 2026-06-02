@@ -28,9 +28,9 @@ class SystemProvider:
         if shutil.which("pactl"):
             s = "@DEFAULT_SINK@"
             cmds += [
-                Command(id="system.volume_up", domain="system", tier=1, summary="Turn the system volume up",
+                Command(id="system.volume_up", domain="system", tier=1, featured=True, summary="Turn the system volume up",
                         backend=_sh("pactl", "set-sink-volume", s, "+10%"), examples=["turn it up", "louder"]),
-                Command(id="system.volume_down", domain="system", tier=1, summary="Turn the system volume down",
+                Command(id="system.volume_down", domain="system", tier=1, featured=True, summary="Turn the system volume down",
                         backend=_sh("pactl", "set-sink-volume", s, "-10%"), examples=["turn it down", "quieter"]),
                 Command(id="system.mute", domain="system", tier=1, summary="Toggle system mute",
                         backend=_sh("pactl", "set-sink-mute", s, "toggle")),
@@ -38,9 +38,9 @@ class SystemProvider:
         elif shutil.which("wpctl"):
             s = "@DEFAULT_AUDIO_SINK@"
             cmds += [
-                Command(id="system.volume_up", domain="system", tier=1, summary="Turn the system volume up",
+                Command(id="system.volume_up", domain="system", tier=1, featured=True, summary="Turn the system volume up",
                         backend=_sh("wpctl", "set-volume", s, "0.1+")),
-                Command(id="system.volume_down", domain="system", tier=1, summary="Turn the system volume down",
+                Command(id="system.volume_down", domain="system", tier=1, featured=True, summary="Turn the system volume down",
                         backend=_sh("wpctl", "set-volume", s, "0.1-")),
                 Command(id="system.mute", domain="system", tier=1, summary="Toggle system mute",
                         backend=_sh("wpctl", "set-mute", s, "toggle")),

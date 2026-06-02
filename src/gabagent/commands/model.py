@@ -85,3 +85,4 @@ class Command:
     structured: bool = False               # True => result is JSON the model parses
     requires_confirm_surface: bool = False
     confirm_template: str = ""             # speakable confirm summary, e.g. "Play {title} in Jellyfin?"
+    featured: bool = False                 # core command — seeds the in-context "hot set" (vs lookup)

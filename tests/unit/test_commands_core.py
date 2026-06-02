@@ -132,3 +132,65 @@ async def test_list_capabilities_tool(tmp_path):
     empty = types.SimpleNamespace(command_catalog=None)
     res2 = await ListCapabilitiesTool().execute(empty)
     assert "No device/media capabilities" in res2.output
+
+
+# -- indexed capability exposure (scales to many skills) -------------------
+
+def _cat_with(n_per_domain=2, domains=("media", "window", "system")):
+    from gabagent.commands.model import Command, ShellBackend
+    cat = CommandCatalog()
+    for d in domains:
+        for i in range(n_per_domain):
+            cat.add(Command(id=f"{d}.cmd{i}", domain=d, tier=1, summary=f"{d} thing {i}",
+                            backend=ShellBackend(argv=["true"]), examples=[f"do {d} {i}"]))
+    return cat
+
+
+def test_catalog_index_is_per_domain():
+    cat = _cat_with(n_per_domain=3, domains=("media", "window"))
+    idx = cat.index()
+    assert {d["domain"] for d in idx} == {"media", "window"}
+    media = next(d for d in idx if d["domain"] == "media")
+    assert media["count"] == 3 and len(media["commands"]) == 3 and "params" not in media
+
+
+def test_catalog_search_ranks_matches():
+    from gabagent.commands.model import Command, ShellBackend
+    cat = CommandCatalog()
+    cat.add(Command(id="tidal.play", domain="media", tier=1, summary="Play music on TIDAL",
+                    backend=ShellBackend(argv=["true"]), examples=["play some music"]))
+    cat.add(Command(id="window.close", domain="window", tier=1, summary="Close the active window",
+                    backend=ShellBackend(argv=["true"])))
+    hits = [c.id for c in cat.search("play music")]
+    assert hits and hits[0] == "tidal.play" and "window.close" not in hits
+
+
+async def test_list_capabilities_blank_returns_index_not_everything():
+    import types, json
+    from gabagent.commands.tools import ListCapabilitiesTool
+    ctx = types.SimpleNamespace(command_catalog=_cat_with(n_per_domain=5))
+    out = json.loads((await ListCapabilitiesTool().execute(ctx)).output)
+    assert all("domain" in d and "count" in d and "params" not in d for d in out)  # index, not full dump
+
+
+async def test_list_capabilities_query_and_domain_drill_down():
+    import types, json
+    from gabagent.commands.tools import ListCapabilitiesTool
+    ctx = types.SimpleNamespace(command_catalog=_cat_with(n_per_domain=2))
+    by_domain = json.loads((await ListCapabilitiesTool().execute(ctx, domain="media")).output)
+    assert by_domain and all(r["domain"] == "media" and "params" in r for r in by_domain)
+    by_query = json.loads((await ListCapabilitiesTool().execute(ctx, query="window")).output)
+    assert by_query and all(r["domain"] == "window" for r in by_query)
+
+
+def test_index_stays_flat_as_commands_scale():
+    # The brief must not grow with command count — only with domains.
+    from gabagent.voice.turn import _capability_brief
+    import types
+    small = types.SimpleNamespace(command_catalog=_cat_with(n_per_domain=2))
+    huge = types.SimpleNamespace(command_catalog=_cat_with(n_per_domain=40))   # 120 commands
+    b_small = _capability_brief(small)
+    b_huge = _capability_brief(huge)
+    # Same domains → same domain-index lines; hot set capped → length barely changes.
+    assert abs(len(b_huge) - len(b_small)) < 200
+    assert len(b_huge) < 1200   # nowhere near a 120-command flat dump

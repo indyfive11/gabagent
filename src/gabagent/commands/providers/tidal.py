@@ -47,7 +47,7 @@ class TidalProvider:
                 examples=["find some Radiohead on tidal", "search tidal for jazz"],
             ),
             Command(
-                id="tidal.play", domain="media", tier=1,
+                id="tidal.play", domain="media", tier=1, featured=True,
                 summary="Play music on TIDAL — a track, or a whole album (album=true), or resume",
                 backend=PyBackend(ref=ref + "play"),
                 params=[
@@ -59,11 +59,11 @@ class TidalProvider:
                 examples=["play some Miles Davis on tidal", "play the album Dizzy Up the Girl",
                           "play kind of blue", "play music"],
             ),
-            Command(id="tidal.pause", domain="media", tier=1, summary="Pause TIDAL playback",
+            Command(id="tidal.pause", domain="media", tier=1, featured=True, summary="Pause TIDAL playback",
                     backend=PyBackend(ref=ref + "pause"), examples=["pause the music", "pause tidal"]),
             Command(id="tidal.resume", domain="media", tier=1, summary="Resume TIDAL playback",
                     backend=PyBackend(ref=ref + "resume"), examples=["resume", "keep playing"]),
-            Command(id="tidal.next", domain="media", tier=1, summary="Skip to the next track",
+            Command(id="tidal.next", domain="media", tier=1, featured=True, summary="Skip to the next track",
                     backend=PyBackend(ref=ref + "next"), examples=["next song", "skip"]),
             Command(id="tidal.previous", domain="media", tier=1, summary="Go to the previous track",
                     backend=PyBackend(ref=ref + "previous"), examples=["previous track", "go back a song"]),

@@ -44,3 +44,4 @@ class AgentContext:
     persistent_browser_pw: Any = field(default=None)  # Playwright instance handle | None
     jellyfin_playing_page: Any = field(default=None)  # Playwright Page driving a browser-launched movie
     jellyfin_paused: bool = field(default=False)      # our tracked play/pause state for that page
+    voice_announced_model: Any = field(default=None)  # last model we spoke an "escalating" notice for

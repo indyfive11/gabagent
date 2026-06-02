@@ -257,9 +257,9 @@ def answer_query(ctx: AgentContext, which: str) -> str:
 
 
 _DOMAIN_PHRASE = {
-    "media": "play and search your Jellyfin movies",
+    "media": "play & search music and movies (TIDAL, Jellyfin) and control playback",
     "apps": "open apps and websites",
-    "window": "manage windows — maximize, minimize, move them between monitors, or close them",
+    "window": "manage windows — maximize, minimize, move between monitors, list screens",
     "desktop": "take screenshots, close tabs, and quit apps",
     "system": "adjust the volume and power",
 }

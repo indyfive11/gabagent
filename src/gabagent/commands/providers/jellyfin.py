@@ -37,7 +37,7 @@ class JellyfinProvider:
     def commands(self, ctx: AgentContext) -> list[Command]:
         return [
             Command(
-                id="jellyfin.search", domain="media", tier=1, structured=True,
+                id="jellyfin.search", domain="media", tier=1, structured=True, featured=True,
                 summary="Search the Jellyfin movie library by genre and minimum rating",
                 backend=PyBackend(ref="gabagent.commands.providers.jellyfin:search"),
                 detect=Detect(),
@@ -50,7 +50,7 @@ class JellyfinProvider:
                 examples=["find a 4-star sci-fi movie", "what comedies do I have rated over 8"],
             ),
             Command(
-                id="jellyfin.play", domain="media", tier=1, requires_confirm_surface=True,
+                id="jellyfin.play", domain="media", tier=1, requires_confirm_surface=True, featured=True,
                 summary="Play a movie — on your open client if you have one, or in a new window",
                 confirm_template="Play {title} in Jellyfin?",
                 backend=BrowserBackend(ref="gabagent.commands.providers.jellyfin:play"),
@@ -62,7 +62,7 @@ class JellyfinProvider:
                 examples=["play that one", "play the first movie"],
             ),
             Command(
-                id="jellyfin.control", domain="media", tier=1,
+                id="jellyfin.control", domain="media", tier=1, featured=True,
                 summary="Control playback: pause, resume, stop, or skip to next",
                 backend=PyBackend(ref="gabagent.commands.providers.jellyfin:control"),
                 params=[Slot("action", "enum", True, enum=("pause", "resume", "stop", "next"))],

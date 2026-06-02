@@ -80,31 +80,61 @@ def _param_sig(p: dict) -> str:
     return s
 
 
+_HOT_CAP = 12
+
+
+def _hot_command_ids(ctx, cat) -> list[str]:
+    """The inline hot set: featured first-party core, then usage-promoted ids — capped. Flat as the
+    skill count grows; frequently-used skills bubble up here without curation."""
+    seen: list[str] = []
+    for c in cat.featured():
+        if c.id not in seen:
+            seen.append(c.id)
+    if len(seen) < _HOT_CAP:
+        from gabagent.commands import usage
+        for cid in usage.top(_HOT_CAP):
+            if cid not in seen and cat.get(cid) is not None:
+                seen.append(cid)
+            if len(seen) >= _HOT_CAP:
+                break
+    return seen[:_HOT_CAP]
+
+
 def _capability_brief(ctx: AgentContext) -> str:
-    """Ground the model in exactly what it can do on THIS host AND how to call it, so it never
-    denies a real capability or invents an id. Built live from the catalog (providers + installed
-    skills), grouped by domain, every turn — so newly installed skills appear automatically."""
+    """A TIGHT, ~flat index — a per-domain overview plus a capped hot set of common commands — so the
+    model knows the categories of what it can do without the full per-command manifest in context
+    every turn. Details for the long tail are fetched on demand via list_capabilities. Scales to
+    hundreds of skills; the model never denies a capability that fits a listed domain."""
     cat = getattr(ctx, "command_catalog", None)
     if cat is None:
         return ""
-    rows = cat.summaries()  # sorted by id: {id, domain, summary, tier, params:[{name,type,required,enum?}]}
-    if not rows:
+    idx = cat.index()
+    if not idx:
         return ""
-    by_domain: dict[str, list[str]] = {}
-    for r in rows:
-        sig = ", ".join(_param_sig(p) for p in r["params"])
-        summ = r["summary"]
-        if len(summ) > 72:
-            summ = summ[:72] + "…"
-        by_domain.setdefault(r["domain"], []).append(f"  - {r['id']}({sig}) — {summ}")
-    lines: list[str] = []
-    for dom in sorted(by_domain):
-        lines.append(f"[{dom}]")
-        lines.extend(by_domain[dom])
-    return ("You can do these on this machine RIGHT NOW by calling run_command(command_id, args) with "
-            "the exact ids and parameters below (params marked ? are optional). Do NOT deny a listed "
-            "capability or invent ids that aren't here. If something you need isn't listed, say so or "
-            "call rescan_capabilities:\n" + "\n".join(lines))
+    from gabagent.voice import commands as _vc
+    dom_lines = []
+    for d in idx:
+        desc = _vc._DOMAIN_PHRASE.get(d["domain"], "")
+        dom_lines.append(f"- {d['domain']} ({d['count']})" + (f" — {desc}" if desc else ""))
+
+    hot_ids = set(_hot_command_ids(ctx, cat))
+    hot_lines = []
+    for s in cat.summaries():
+        if s["id"] in hot_ids:
+            sig = ", ".join(_param_sig(p) for p in s["params"])
+            summ = s["summary"][:60]
+            hot_lines.append(f"  - {s['id']}({sig}) — {summ}")
+
+    parts = [
+        "Things you can do on this machine, by domain (act with run_command(command_id, args)). For "
+        "the exact id and parameters of anything not under \"Common\", call "
+        "list_capabilities(domain=… or query=…) FIRST — do NOT deny a capability that fits a listed "
+        "domain; look it up:",
+        *dom_lines,
+    ]
+    if hot_lines:
+        parts += ["Common (call these directly):", *hot_lines]
+    return "\n".join(parts)
 
 
 def _memory_brief(ctx: AgentContext, limit: int = 1500) -> str:
@@ -132,6 +162,17 @@ def _voice_tool_schemas() -> list[dict]:
         s for s in registry.get_schemas()
         if s["function"]["name"] not in ("bash", "run_shell")
     ]
+
+
+def _looks_simple(text: str) -> bool:
+    """Voice-only fast-path: obviously-simple utterances skip the classifier's API round-trip and run
+    on the base model. Conservative — returns False (→ classify) when unsure, so genuinely complex
+    requests still escalate."""
+    t = text.strip().lower()
+    if not t:
+        return True
+    # Short, single-clause commands ("stop", "pause the movie", "volume up") are simple.
+    return len(t.split()) <= 6 and " and " not in f" {t} "
 
 
 def _status_phrase(tool_calls) -> str:
@@ -220,13 +261,18 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             router = ModelRouter(ctx.config)
 
         simple = ctx.config.router.simple_model
-        if router and ctx.active_model is None:
-            try:
-                ctx.active_model = await router.classify_intent(user_text, _active_client(ctx))
-            except Exception:
+        if router:
+            # Re-evaluate routing EACH turn so simple follow-ups drop back to arya instead of pinning
+            # the whole session to the premium model. Obvious-simple utterances skip the classifier's
+            # API round-trip; only substantive prompts pay for classification.
+            if _looks_simple(user_text):
                 ctx.active_model = simple
+            else:
+                try:
+                    ctx.active_model = await router.classify_intent(user_text, _active_client(ctx))
+                except Exception:
+                    ctx.active_model = simple
             dlog(ctx, "route", active=ctx.active_model, via="intent_classify")
-        prev_model = simple
 
         from gabagent.permissions.engine import PermissionEngine
         perm_engine = PermissionEngine(ctx.config)
@@ -234,10 +280,12 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
         last_status = None
         while True:
             cur = ctx.active_model or simple
-            if not ctx.local_mode and cur != simple and cur != prev_model:
+            # Announce an arya→premium transition ONCE (vs. every turn), and de-escalate silently.
+            announced = getattr(ctx, "voice_announced_model", None) or simple
+            if not ctx.local_mode and cur != simple and cur != announced:
                 await emit(events.status(commands.filler("escalate", ctx)))
                 dlog(ctx, "switch", to=cur, via="escalation")
-            prev_model = cur
+            ctx.voice_announced_model = cur
 
             all_messages = _build_voice_messages(ctx, ctx.session.messages())
             tools = _voice_tool_schemas()

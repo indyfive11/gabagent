@@ -179,3 +179,37 @@ async def test_cancel_ends_turn(home):
         evs.append(ev)
     assert any(e.type == "done" for e in evs)
     assert target.read_text() == "keep me\n"                  # edit never applied
+
+
+# -- escalation de-stick (regression: stuck-on-Claude + re-announce every turn) --
+
+def test_looks_simple():
+    from gabagent.voice.turn import _looks_simple
+    assert _looks_simple("stop")
+    assert _looks_simple("pause the movie")
+    assert _looks_simple("turn the volume up")
+    assert not _looks_simple("can you see what is playing and unpause it")   # has 'and'
+    assert not _looks_simple("please research the best approach to scaling this whole system")
+
+
+async def test_escalation_announces_once_then_deescalates(home):
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [["Sure."], ["Okay."], ["Stopped."]])
+    ctx.config.router.enabled = True
+    ctx.config.router.classifier_enabled = True
+    ctx.config.router.complex_model = "claude-sonnet-4-5"
+    classify_calls = []
+    async def fake_classify(messages, model=None):
+        classify_calls.append(1); return "[COMPLEX]"
+    ctx.client.complete_simple = fake_classify
+
+    evs1 = await run_turn(ctx, "please do a fairly complicated multi step thing for me right now")
+    assert len([e for e in evs1 if e.type == "status" and "Claude" in e.text]) == 1   # announced once
+
+    evs2 = await run_turn(ctx, "now do another complicated multi step thing for me as well please")
+    assert [e for e in evs2 if e.type == "status" and "Claude" in e.text] == []        # no re-announce
+
+    n = len(classify_calls)
+    await run_turn(ctx, "stop")                       # short → fast-path
+    assert len(classify_calls) == n                   # classifier NOT called for the simple turn
+    assert ctx.active_model == ctx.config.router.simple_model   # de-escalated back to arya
