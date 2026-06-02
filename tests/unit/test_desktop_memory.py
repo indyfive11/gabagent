@@ -72,6 +72,23 @@ def test_capability_brief_lists_real_catalog(tmp_path):
     assert "Do NOT deny" in brief and "Play a movie" in brief and "media" in brief
 
 
+def test_capability_brief_includes_exact_ids_and_params(tmp_path):
+    from gabagent.commands.model import Slot
+    cat = CommandCatalog()
+    cat.add(Command(id="tidal.play", domain="media", tier=1, summary="Play music on TIDAL",
+                    backend=ShellBackend(argv=["true"]),
+                    params=[Slot("query", "string", False), Slot("uri", "string", False)]))
+    cat.add(Command(id="jellyfin.control", domain="media", tier=1, summary="Control playback",
+                    backend=ShellBackend(argv=["true"]),
+                    params=[Slot("action", "enum", True, enum=("pause", "resume", "stop"))]))
+    brief = _capability_brief(_ctx(tmp_path, command_catalog=cat))
+    # exact id + optional params marked with ?, so the model can call run_command directly
+    assert "tidal.play(query?, uri?)" in brief
+    # required enum slot shows its allowed values and no ?
+    assert "jellyfin.control(action=pause|resume|stop)" in brief
+    assert "run_command(command_id, args)" in brief
+
+
 def test_voice_system_injects_caps_and_memory(home):
     proj = home / "proj"; proj.mkdir()
     MemoryManager(proj).append("The user prefers dark mode.")

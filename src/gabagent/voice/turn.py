@@ -41,7 +41,11 @@ VOICE_ADDENDUM = (
     "When you report what you did, describe only what the action actually guarantees — say 'I opened "
     "it in your browser', not that you changed a specific tab you can't target; never claim an outcome "
     "you can't verify. You keep a growing personal memory of this project: save lasting facts with "
-    "memory_write, and the user can ask what you remember or tell you to forget something."
+    "memory_write, and the user can ask what you remember or tell you to forget something. "
+    "To stop or pause you, the user speaks to the voice layer directly (you never see these): "
+    "'shut down voice mode' (or 'exit/quit voice mode') closes you completely, and 'go to sleep' "
+    "(or 'stop listening') pauses you until they say 'wake up'. If asked how to stop or pause you, "
+    "tell them those phrases."
 )
 
 
@@ -66,21 +70,41 @@ def _voice_system(ctx: AgentContext) -> str:
     return s
 
 
+def _param_sig(p: dict) -> str:
+    """Render one slot as name[=enum|values][?] — ? marks an optional slot."""
+    s = p["name"]
+    if p.get("enum"):
+        s += "=" + "|".join(str(v) for v in p["enum"])
+    if not p.get("required"):
+        s += "?"
+    return s
+
+
 def _capability_brief(ctx: AgentContext) -> str:
-    """Ground the model in what it can actually do on THIS host, so it never denies a real
-    capability (run via run_command; list_capabilities gives ids/params)."""
+    """Ground the model in exactly what it can do on THIS host AND how to call it, so it never
+    denies a real capability or invents an id. Built live from the catalog (providers + installed
+    skills), grouped by domain, every turn — so newly installed skills appear automatically."""
     cat = getattr(ctx, "command_catalog", None)
     if cat is None:
         return ""
-    by_domain: dict[str, list[str]] = {}
-    for c in cat.all():
-        by_domain.setdefault(c.domain, []).append(c.summary)
-    if not by_domain:
+    rows = cat.summaries()  # sorted by id: {id, domain, summary, tier, params:[{name,type,required,enum?}]}
+    if not rows:
         return ""
-    lines = [f"- {dom}: {'; '.join(sorted(set(s)))}" for dom, s in sorted(by_domain.items())]
-    return ("Things you can do on this machine right now (via run_command with the matching command "
-            "id — call list_capabilities for ids and parameters). Do NOT deny a capability listed "
-            "here:\n" + "\n".join(lines))
+    by_domain: dict[str, list[str]] = {}
+    for r in rows:
+        sig = ", ".join(_param_sig(p) for p in r["params"])
+        summ = r["summary"]
+        if len(summ) > 72:
+            summ = summ[:72] + "…"
+        by_domain.setdefault(r["domain"], []).append(f"  - {r['id']}({sig}) — {summ}")
+    lines: list[str] = []
+    for dom in sorted(by_domain):
+        lines.append(f"[{dom}]")
+        lines.extend(by_domain[dom])
+    return ("You can do these on this machine RIGHT NOW by calling run_command(command_id, args) with "
+            "the exact ids and parameters below (params marked ? are optional). Do NOT deny a listed "
+            "capability or invent ids that aren't here. If something you need isn't listed, say so or "
+            "call rescan_capabilities:\n" + "\n".join(lines))
 
 
 def _memory_brief(ctx: AgentContext, limit: int = 1500) -> str:
