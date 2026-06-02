@@ -92,11 +92,18 @@ def build_app(ctx: AgentContext):
         vs.clear_pending(approved=False)
         return JSONResponse({"ok": True})
 
+    async def media_duck(request):
+        # Called on VAD speech-onset/end: duck music + pause video so Aria can hear over playback.
+        from gabagent.voice.ducking import duck_media
+        body = await request.json()
+        return JSONResponse(await duck_media(ctx, bool(body.get("on"))))
+
     app = Starlette(routes=[
         Route("/health", health, methods=["GET"]),
         Route("/respond", respond, methods=["POST"]),
         Route("/confirm", confirm, methods=["POST"]),
         Route("/cancel", cancel, methods=["POST"]),
+        Route("/media/duck", media_duck, methods=["POST"]),
     ])
     app.state.sessions = sessions
     return app
