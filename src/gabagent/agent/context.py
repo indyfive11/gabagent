@@ -42,3 +42,5 @@ class AgentContext:
     command_catalog: Any = field(default=None)  # CommandCatalog | None — discovered capabilities
     persistent_browser: Any = field(default=None)  # Playwright BrowserContext | None
     persistent_browser_pw: Any = field(default=None)  # Playwright instance handle | None
+    jellyfin_playing_page: Any = field(default=None)  # Playwright Page driving a browser-launched movie
+    jellyfin_paused: bool = field(default=False)      # our tracked play/pause state for that page

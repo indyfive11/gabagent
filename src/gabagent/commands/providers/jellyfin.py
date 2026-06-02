@@ -133,6 +133,12 @@ async def control(ctx, action="") -> ToolResult:
     jc = ctx.config.jellyfin
     if action not in _CONTROL:
         return ToolResult(output="", error=f"unknown action: {action}")
+    # The Jellyfin web client ignores remote-control API commands (returns 204, does nothing — a
+    # known upstream issue), so when WE launched the movie in our own browser, control it through
+    # the page instead. Native/controllable clients still go through the Sessions API below.
+    page = _live_jellyfin_page(ctx)
+    if page is not None:
+        return await _browser_control(ctx, page, action)
     sessions = await _sessions(jc)
     target = next((s for s in sessions if s.get("NowPlayingItem")), None) \
         or next((s for s in sessions if s.get("SupportsRemoteControl")), None)
@@ -194,16 +200,31 @@ async def _play_to_session(jc, session_id, item_id, label) -> ToolResult:
 
 async def _play_in_browser(ctx, jc, item_id) -> ToolResult:
     from gabagent.commands.browser import ensure_browser
+    from gabagent.voice import events
+    emit = getattr(ctx, "voice_emit", None)
 
     before = {s["Id"] for s in await _sessions(jc)}
     try:
         bctx = await ensure_browser(ctx, profile="jellyfin")
+        # Optional hands-free auth: pre-seed the web client's credentials so a fresh profile is
+        # already signed in (best-effort; falls back to the one-time manual sign-in below).
+        if jc.username and jc.password:
+            await _inject_jellyfin_auth(jc, bctx)
         page = bctx.pages[0] if bctx.pages else await bctx.new_page()
         await page.goto(jc.base_url.rstrip("/") + "/web/", wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
         return ToolResult(output="", error=f"couldn't open the player: {e}")
 
-    # Wait for the web client to register a new session, then command it.
+    # Don't open a dead player and time out: if the web client isn't signed in, surface a
+    # one-time setup instruction as a `blocked` (the persistent profile remembers the login).
+    if await _browser_needs_login(page):
+        msg = ("I've opened Jellyfin in a browser, but it isn't signed in yet. Please sign in there "
+               "once — I'll remember it — then ask me to play again.")
+        if emit:
+            await emit(events.blocked("jellyfin.play", msg))
+        return ToolResult(output=msg)
+
+    # Signed in: wait for the web client to register a session, then command it.
     session_id = None
     for _ in range(_PLAY_POLL_TRIES):
         await asyncio.sleep(0.5)
@@ -214,5 +235,100 @@ async def _play_in_browser(ctx, jc, item_id) -> ToolResult:
         if session_id:
             break
     if not session_id:
-        return ToolResult(output="I opened the Jellyfin window — please sign in there once, then ask me to play again.")
-    return await _play_to_session(jc, session_id, item_id, "the new window")
+        return ToolResult(output="I opened the Jellyfin window but couldn't take control of it — give it a moment and ask again.")
+    result = await _play_to_session(jc, session_id, item_id, "the new window")
+    if result.success:
+        # Remember the page so pause/resume/stop can drive it directly (the web client ignores
+        # the remote-control API).
+        ctx.jellyfin_playing_page = page
+        ctx.jellyfin_paused = False
+    return result
+
+
+_AUTH_HEADER = ('MediaBrowser Client="gabagent", Device="gabagent voice", '
+                'DeviceId="gabagent-voice", Version="0.1.0"')
+
+
+async def _authenticate(jc) -> dict | None:
+    """Log in via the API and return {AccessToken, UserId, ServerId}, or None on failure."""
+    try:
+        async with httpx.AsyncClient(base_url=jc.base_url.rstrip("/"), timeout=10.0) as c:
+            r = await c.post("/Users/AuthenticateByName",
+                             json={"Username": jc.username, "Pw": jc.password},
+                             headers={"X-Emby-Authorization": _AUTH_HEADER})
+            if r.status_code != 200:
+                return None
+            d = r.json()
+            info = await c.get("/System/Info/Public")
+            sid = info.json().get("Id", "") if info.status_code == 200 else ""
+    except Exception:
+        return None
+    return {"AccessToken": d.get("AccessToken"), "UserId": (d.get("User") or {}).get("Id"), "ServerId": sid}
+
+
+async def _inject_jellyfin_auth(jc, bctx) -> bool:
+    """Best-effort: seed the Jellyfin 10.x web client's localStorage so it boots signed-in.
+    Format targets jellyfin-web 10.x; needs a live confirm, and is harmless if wrong (the page
+    just shows login and the one-time manual path takes over)."""
+    auth = await _authenticate(jc)
+    if not auth or not auth.get("AccessToken"):
+        return False
+    creds = {"Servers": [{
+        "Id": auth["ServerId"], "AccessToken": auth["AccessToken"], "UserId": auth["UserId"],
+        "ManualAddress": jc.base_url.rstrip("/"), "LastConnectionMode": 1,
+    }]}
+    js = f"try{{localStorage.setItem('jellyfin_credentials', {json.dumps(json.dumps(creds))});}}catch(e){{}}"
+    try:
+        await bctx.add_init_script(js)
+        return True
+    except Exception:
+        return False
+
+
+def _live_jellyfin_page(ctx):
+    """The Playwright page of a browser-launched movie, if one is still open; else None."""
+    page = getattr(ctx, "jellyfin_playing_page", None)
+    if page is None:
+        return None
+    try:
+        if page.is_closed():
+            ctx.jellyfin_playing_page = None
+            return None
+    except Exception:
+        ctx.jellyfin_playing_page = None
+        return None
+    return page
+
+
+async def _browser_control(ctx, page, action) -> ToolResult:
+    try:
+        if action == "stop":
+            await page.keyboard.press("Escape")
+            ctx.jellyfin_playing_page = None
+            ctx.jellyfin_paused = False
+            return ToolResult(output="Stopped the movie.")
+        if action == "next":
+            return ToolResult(output="", error="There's nothing to skip to in a movie.")
+        paused = getattr(ctx, "jellyfin_paused", False)
+        if action == "pause" and paused:
+            return ToolResult(output="It's already paused.")
+        if action == "resume" and not paused:
+            return ToolResult(output="It's already playing.")
+        await page.keyboard.press("Space")  # Space toggles play/pause in the Jellyfin web player
+        ctx.jellyfin_paused = (action == "pause")
+        return ToolResult(output="Paused the movie." if action == "pause" else "Resumed the movie.")
+    except Exception as e:
+        return ToolResult(output="", error=f"couldn't control the player: {e}")
+
+
+async def _browser_needs_login(page) -> bool:
+    """True if the Jellyfin web client is showing its login/setup screen (not authenticated).
+    The SPA routes to a #/login.html hash when there's no saved session."""
+    try:
+        await page.wait_for_timeout(1500)  # let the SPA settle / redirect
+        url = (getattr(page, "url", "") or "").lower()
+        if "login" in url or "wizard" in url:
+            return True
+        return await page.locator("input[type=password]").count() > 0
+    except Exception:
+        return False

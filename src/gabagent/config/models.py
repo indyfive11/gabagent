@@ -57,6 +57,8 @@ class JellyfinConfig(BaseModel):
     api_key: str = ""                     # Dashboard → API Keys
     user_id: str = ""                     # optional: enables played/unwatched filtering
     rating_threshold: float = 7.0         # default minimum CommunityRating (IMDb 0–10)
+    username: str = ""                    # optional: hands-free web-player auto-auth (plaintext — opt-in)
+    password: str = ""
 
 
 class TidalConfig(BaseModel):
