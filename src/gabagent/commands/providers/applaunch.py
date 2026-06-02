@@ -22,7 +22,7 @@ class AppLaunchProvider:
         cmds: list[Command] = []
         launcher = ["gtk-launch", "{app}"] if shutil.which("gtk-launch") else ["xdg-open", "{app}"]
         cmds.append(Command(
-            id="app.launch", domain="apps", tier=2,
+            id="app.launch", domain="apps", tier=1,
             summary="Launch a desktop application by name",
             confirm_template="Open {app}?",
             backend=ShellBackend(argv=launcher),
@@ -31,7 +31,7 @@ class AppLaunchProvider:
         ))
         if shutil.which("xdg-open"):
             cmds.append(Command(
-                id="app.open_url", domain="apps", tier=2,
+                id="app.open_url", domain="apps", tier=1,
                 summary="Open a URL in the default browser",
                 confirm_template="Open {url} in your browser?",
                 backend=ShellBackend(argv=["xdg-open", "{url}"]),

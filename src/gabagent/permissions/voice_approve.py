@@ -197,7 +197,8 @@ def _summarize_command(args: dict, ctx: AgentContext) -> str:
     cat = getattr(ctx, "command_catalog", None)
     cmd = cat.get(cid) if cat is not None else None
     if cmd is None:
-        return f"Run {cid}." if cid else "Run a command."
+        nice = cid.split(".", 1)[-1].replace("_", " ").strip() if cid else ""
+        return f"Run {nice}." if nice else "Run a command."
     tmpl = getattr(cmd, "confirm_template", "")
     if tmpl:
         fields = [f for _, f, _, _ in string.Formatter().parse(tmpl) if f]

@@ -48,8 +48,8 @@ async def test_applaunch(monkeypatch):
     monkeypatch.setattr("shutil.which", _which({"gtk-launch", "xdg-open"}))
     assert await applaunch.detect(_ctx()) is True
     cmds = {c.id: c for c in applaunch.commands(_ctx())}
-    assert cmds["app.launch"].tier == 2
+    assert cmds["app.launch"].tier == 1   # opening an app is harmless/reversible
     assert cmds["app.launch"].backend.argv == ["gtk-launch", "{app}"]
-    assert cmds["app.open_url"].tier == 2
+    assert cmds["app.open_url"].tier == 1
     # the {app} slot is a single argv token — a value can't inject a second command
     assert cmds["app.launch"].params[0].name == "app"

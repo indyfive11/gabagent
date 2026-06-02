@@ -22,10 +22,15 @@ if TYPE_CHECKING:
 _TIER1_READS = {
     "read_file", "glob", "grep", "git_status", "git_diff", "git_log",
     "web_search", "web_fetch", "check_inbox", "read_claude_memory",
+    # Internal bookkeeping/telemetry — must auto-run, never prompt the user.
+    "postmortem_log",
+    # The agent's own project memory: reading is a read; writing is reversible (the user can
+    # say "forget that"), so saving a note should never gate. Keeps the growing-memory loop fluid.
+    "memory_read", "memory_write",
 }
 
 # Local, reversible, non-system actions — Tier 2 (spoken yes/no).
-_TIER2_TOOLS = {"git_commit", "git_add", "postmortem_log", "send_to_claude"}
+_TIER2_TOOLS = {"git_commit", "git_add", "send_to_claude"}
 
 # Filesystem-write tools → which arg holds the destination path.
 _WRITE_PATH_ARG = {"write_file": "path", "edit": "path"}
@@ -95,7 +100,9 @@ def tier_of(
     # Command framework: run_command's tier IS the catalog command's declared (effective) tier.
     if tool_name == "run_command":
         cmd = catalog.get(args.get("command_id", "")) if catalog is not None else None
-        return cmd.tier if cmd is not None else 3  # unknown id / no catalog → fail-closed
+        # An unknown id can't execute (the tool rejects it cleanly and the model self-corrects via
+        # list_capabilities), so don't make the user keyboard-confirm a nonexistent command.
+        return cmd.tier if cmd is not None else 1
     if tool_name in ("list_capabilities", "rescan_capabilities"):
         return 1
 

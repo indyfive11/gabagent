@@ -81,3 +81,25 @@ def test_extra_safe_zone_from_config(home):
     cfg.voice_safe_zones = [str(home / "extra")]
     dest = home / "extra" / "f.txt"
     assert tier_of("write_file", {"path": str(dest), "content": "x"}, home / "proj", cfg) == 1
+
+
+def test_unknown_run_command_is_tier1_not_keyboard(home):
+    # A hallucinated/unknown command id must not force a keyboard confirm — it can't execute;
+    # the run_command tool rejects it cleanly and the model self-corrects.
+    from gabagent.commands.catalog import CommandCatalog
+    cfg = _cfg()
+    cat = CommandCatalog()
+    assert tier_of("run_command", {"command_id": "media.play_movie"}, home, cfg, cat) == 1
+    assert tier_of("run_command", {"command_id": "nope"}, home, cfg, None) == 1
+
+
+def test_postmortem_log_is_tier1_internal(home):
+    # Internal bookkeeping/telemetry must auto-run, never prompt the user.
+    assert tier_of("postmortem_log", {"title": "x", "description": "y"}, home, _cfg()) == 1
+
+
+def test_memory_is_tier1_low_friction(home):
+    # The agent's own project memory: reading is a read, writing is reversible ("forget that").
+    cfg = _cfg()
+    assert tier_of("memory_read", {}, home, cfg) == 1
+    assert tier_of("memory_write", {"content": "the user likes jazz"}, home, cfg) == 1

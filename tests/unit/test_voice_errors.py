@@ -59,12 +59,12 @@ def test_summarize_run_command_falls_back_to_summary_without_title(tmp_path):
 
 
 def test_summarize_run_command_unknown_is_clean(tmp_path):
+    # Unknown ids are humanized (namespace + underscores stripped), never read like a raw id.
     ctx = _ctx(tmp_path, command_catalog=CommandCatalog())
-    s = _summarize("run_command", {"command_id": "nope.thing", "args": {}}, ctx)
-    assert s == "Run nope.thing."
-    # and with no catalog at all
+    s = _summarize("run_command", {"command_id": "media.play_movie", "args": {}}, ctx)
+    assert s == "Run play movie." and "_" not in s and "." not in s.rstrip(".")
     ctx2 = _ctx(tmp_path, command_catalog=None)
-    assert _summarize("run_command", {"command_id": "x.y"}, ctx2) == "Run x.y."
+    assert _summarize("run_command", {"command_id": "x.y"}, ctx2) == "Run y."
 
 
 def test_real_jellyfin_play_has_template():

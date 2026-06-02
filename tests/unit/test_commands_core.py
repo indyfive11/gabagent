@@ -102,8 +102,10 @@ def test_tier_of_run_command_uses_catalog(tmp_path):
     cat = CommandCatalog()
     cat.add(_echo_cmd(tier=2))
     assert tier_of("run_command", {"command_id": "test.echo"}, tmp_path, None, cat) == 2
-    assert tier_of("run_command", {"command_id": "nope"}, tmp_path, None, cat) == 3
-    assert tier_of("run_command", {"command_id": "test.echo"}, tmp_path, None, None) == 3
+    # Unknown id / no catalog → Tier 1: it can't execute, so no point prompting the user
+    # (the run_command tool rejects it and the model self-corrects).
+    assert tier_of("run_command", {"command_id": "nope"}, tmp_path, None, cat) == 1
+    assert tier_of("run_command", {"command_id": "test.echo"}, tmp_path, None, None) == 1
     assert tier_of("list_capabilities", {}, tmp_path, None, cat) == 1
 
 
