@@ -1,4 +1,5 @@
 """Desktop/window provider + voice capability-grounding and growing-memory layer."""
+import json
 import types
 from pathlib import Path
 import pytest
@@ -145,3 +146,53 @@ def test_forget_and_memory_summary(home):
     MemoryManager(proj).append("note a")
     assert "cleared everything" in vc.forget(ctx, "all")
     assert "haven't saved" in vc._memory_summary(ctx)
+
+
+# -- multi-monitor targeting (KWin + kscreen-doctor) -----------------------
+
+_KSCREEN = (
+    "Output: 1 DP-1\n\tenabled\n\tpriority 1\n\tGeometry: 768,0 3072x1728\n"
+    "Output: 2 DP-2\n\tenabled\n\tpriority 3\n\tGeometry: 0,1728 1920x1080\n"
+    "Output: 3 HDMI-A-1\n\tenabled\n\tpriority 4\n\tGeometry: 3840,1728 1920x1080\n"
+)
+
+
+async def test_list_screens_parses_names_sizes_largest(monkeypatch):
+    from gabagent.commands.providers import desktop as d
+    async def fake_run(argv, timeout=5.0): return (0, _KSCREEN)
+    monkeypatch.setattr(d, "_run", fake_run)
+    data = json.loads((await d.list_screens(None)).output)
+    assert data["count"] == 3
+    dp1 = next(s for s in data["screens"] if s["name"] == "DP-1")
+    assert dp1["primary"] and dp1["largest"] and dp1["width"] == 3072
+    assert sum(s["largest"] for s in data["screens"]) == 1   # exactly one largest
+
+
+async def test_run_kwin_script_load_start_unload(monkeypatch):
+    from gabagent.commands.providers import desktop as d
+    calls = []
+    async def fake_run(argv, timeout=5.0):
+        calls.append(argv); return (0, "1")
+    monkeypatch.setattr(d, "_run", fake_run)
+    assert await d._run_kwin_script("/*js*/") is True
+    methods = [next(t for t in a if t.startswith("org.kde.kwin.Scripting.")) for a in calls]
+    assert methods == ["org.kde.kwin.Scripting.unloadScript", "org.kde.kwin.Scripting.loadScript",
+                       "org.kde.kwin.Scripting.start", "org.kde.kwin.Scripting.unloadScript"]
+
+
+async def test_to_screen_json_encodes_target_no_injection(monkeypatch):
+    from gabagent.commands.providers import desktop as d
+    captured = {}
+    async def fake_script(js): captured["js"] = js; return True
+    monkeypatch.setattr(d, "_run_kwin_script", fake_script)
+    res = await d.to_screen(None, screen='DP-1"; evil()//')
+    assert res.success
+    assert json.dumps('DP-1"; evil()//') in captured["js"]   # value is a JS string literal, can't break out
+    assert "%TNAME%" not in captured["js"] and "%TI%" not in captured["js"]
+
+
+async def test_to_largest_screen_runs_script(monkeypatch):
+    from gabagent.commands.providers import desktop as d
+    async def fake_script(js): return True
+    monkeypatch.setattr(d, "_run_kwin_script", fake_script)
+    assert (await d.to_largest_screen(None)).success
