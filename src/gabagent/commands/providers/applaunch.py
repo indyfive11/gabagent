@@ -24,6 +24,7 @@ class AppLaunchProvider:
         cmds.append(Command(
             id="app.launch", domain="apps", tier=2,
             summary="Launch a desktop application by name",
+            confirm_template="Open {app}?",
             backend=ShellBackend(argv=launcher),
             params=[Slot("app", "string", True, description="app or .desktop name, e.g. 'firefox', 'org.kde.konsole'")],
             examples=["open firefox", "launch the calculator"],
@@ -32,6 +33,7 @@ class AppLaunchProvider:
             cmds.append(Command(
                 id="app.open_url", domain="apps", tier=2,
                 summary="Open a URL in the default browser",
+                confirm_template="Open {url} in your browser?",
                 backend=ShellBackend(argv=["xdg-open", "{url}"]),
                 params=[Slot("url", "string", True)],
                 examples=["open github.com", "open my email"],

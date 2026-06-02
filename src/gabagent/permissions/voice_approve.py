@@ -52,7 +52,7 @@ async def voice_approve(tool_name: str, args: dict, ctx: AgentContext) -> bool:
     # Tier-3 arming: a recent keyboard confirm covers related actions for a TTL.
     if method == "keyboard" and vs is not None and vs.is_armed(family):
         if emit:
-            await emit(events.status("Still within the confirmed window — going ahead."))
+            await emit(events.status("Okay, going ahead."))
         _audit(ctx, tool_name, args, "armed", tier, summary)
         dlog(ctx, "decision", tool=tool_name, tier=tier, decision="armed")
         return True
@@ -155,11 +155,36 @@ def _summarize(tool_name: str, args: dict, ctx: AgentContext) -> str:
         tail = " This is permanent." if _is_destructive(tool_name, args) else ""
         return f"Run the command: {cmd}.{tail}"
     if tool_name == "git_commit":
-        return f"Commit with the message: {args.get('message', '')}."
+        msg = str(args.get("message", "")).strip().replace("\n", " ")
+        if len(msg) > 80:
+            msg = msg[:80] + "…"
+        return f"Commit with the message: {msg}."
     if tool_name == "run_command":
         return _summarize_command(args, ctx)
-    arg_bits = ", ".join(f"{k}={v}" for k, v in list(args.items())[:3])
-    return f"{tool_name} ({arg_bits})" if arg_bits else tool_name
+    # Every summary is spoken aloud, so never read raw args/tool calls: humanize the tool
+    # name (the specific payload, if useful, rides in `reason` → the keyboard dialog body).
+    return _SPEAKABLE_TOOLS.get(tool_name, f"Run the {tool_name.replace('_', ' ')} action.")
+
+
+# Speakable labels for non-file tools that can reach a Tier-2/3 confirm over voice.
+_SPEAKABLE_TOOLS = {
+    "memory_write": "Save a note to your project memory.",
+    "memory_delete": "Delete a note from your project memory.",
+    "git_add": "Stage changes for commit.",
+    "git_push": "Push commits to the remote.",
+}
+
+
+def _arg_detail(tool_name: str, args: dict) -> str:
+    """A compact, single-line view of an action's key payload — for the keyboard dialog
+    body (shown, not spoken). Flattened and truncated; never a raw multi-line dump."""
+    keys = ("content", "message", "command", "text", "path", "url", "target", "query")
+    for k in keys:
+        v = args.get(k)
+        if v:
+            s = str(v).strip().replace("\n", " ")
+            return (s[:160] + "…") if len(s) > 160 else s
+    return ""
 
 
 def _summarize_command(args: dict, ctx: AgentContext) -> str:
@@ -191,8 +216,14 @@ def _reason(tool_name: str, args: dict, tier: int, ctx: AgentContext) -> str:
         bits.append("Heads up — this will cut my own network connection while I'm on the cloud brain.")
     if _is_destructive(tool_name, args):
         bits.append("This can't be undone.")
-    if tier == 3 and not bits:
-        bits.append("This one needs keyboard confirmation.")
+    if tier == 3:
+        # Keyboard confirms render `reason` in the dialog body (not TTS), so include the
+        # concrete payload there — it's what the summary deliberately keeps out of speech.
+        detail = _arg_detail(tool_name, args)
+        if detail:
+            bits.append(detail)
+        if not bits:
+            bits.append("This one needs keyboard confirmation.")
     return " ".join(bits)
 
 

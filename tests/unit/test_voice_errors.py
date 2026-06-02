@@ -75,6 +75,47 @@ def test_real_jellyfin_play_has_template():
     assert any(s.name == "title" and not s.required for s in play.params)
 
 
+# -- spoken polish: every summary is TTS-ready -----------------------------
+
+def test_summarize_memory_write_is_speakable(tmp_path):
+    ctx = _ctx(tmp_path)
+    s = _summarize("memory_write", {"content": "line one\nline two\nline three"}, ctx)
+    assert "\n" not in s and "(" not in s and "content=" not in s
+    assert s == "Save a note to your project memory."
+
+
+def test_summarize_unknown_tool_never_dumps_args(tmp_path):
+    ctx = _ctx(tmp_path)
+    s = _summarize("frobnicate_widget", {"payload": "x\ny", "secret": "z"}, ctx)
+    assert "\n" not in s and "payload" not in s and "secret" not in s
+    assert s == "Run the frobnicate widget action."
+
+
+def test_summarize_commit_message_flattened(tmp_path):
+    ctx = _ctx(tmp_path)
+    s = _summarize("git_commit", {"message": "title\n\nbody line\nmore"}, ctx)
+    assert "\n" not in s
+
+
+def test_reason_tier3_carries_detail_for_dialog(tmp_path):
+    from gabagent.permissions.voice_approve import _reason
+    r = _reason("memory_write", {"content": "Buy milk and eggs"}, 3, _ctx(tmp_path))
+    assert "Buy milk and eggs" in r           # shown in the keyboard dialog body
+    # ...but the spoken summary stays generic
+    assert "Buy milk" not in _summarize("memory_write", {"content": "Buy milk and eggs"}, _ctx(tmp_path))
+
+
+def test_app_open_url_specific_confirm(tmp_path):
+    cat = CommandCatalog()
+    cat.add(Command(id="app.open_url", domain="apps", tier=2,
+                    summary="Open a URL in the default browser",
+                    confirm_template="Open {url} in your browser?",
+                    backend=BrowserBackend(ref="x:y"), params=[Slot("url", "string", True)]))
+    ctx = _ctx(tmp_path, command_catalog=cat)
+    s = _summarize("run_command", {"command_id": "app.open_url", "args": {"url": "google.com"}}, ctx)
+    assert s == "Open google.com in your browser?"
+
+
 # -- #2 "what went wrong?" reports, doesn't retry --------------------------
 
 def test_detect_error_query():
