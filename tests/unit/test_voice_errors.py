@@ -170,7 +170,8 @@ def test_status_phrase_varies_by_family():
     def tc(name, **a):
         return ToolCallSpec(id=name, name=name, arguments=json.dumps(a))
     assert _status_phrase([tc("write_file", path="x")]) == "Making that change."
-    assert _status_phrase([tc("list_capabilities")]) == "Checking what I can control."
+    assert _status_phrase([tc("list_capabilities")]) == ""          # recon is silent now
+    assert _status_phrase([tc("rescan_capabilities")]) == ""
     assert _status_phrase([tc("grep", pattern="x")]) == "Reading through things."
     assert "Jellyfin" in _status_phrase([tc("run_command", command_id="jellyfin.play")])
     assert _status_phrase([tc("some_unknown_tool")]) == "Looking into it."

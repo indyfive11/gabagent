@@ -136,13 +136,15 @@ def _voice_tool_schemas() -> list[dict]:
 
 def _status_phrase(tool_calls) -> str:
     names = {tc.name for tc in tool_calls}
+    # Pure recon (list/rescan capabilities) is internal — don't narrate it; it's what produced the
+    # noisy "Checking what I can control. Trying Jellyfin…" stacking.
+    if names <= {"list_capabilities", "rescan_capabilities"}:
+        return ""
     if names & {"write_file", "edit", "git_commit"}:
         return "Making that change."
     if "run_command" in names:
         domain = _run_command_domain(tool_calls)
         return f"Trying {domain}…" if domain else "Setting that up."
-    if names & {"list_capabilities", "rescan_capabilities"}:
-        return "Checking what I can control."
     if names & {"web_search", "web_fetch"}:
         return "Looking that up."
     if names & {"grep", "read_file", "glob"}:
@@ -229,6 +231,7 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
         from gabagent.permissions.engine import PermissionEngine
         perm_engine = PermissionEngine(ctx.config)
 
+        last_status = None
         while True:
             cur = ctx.active_model or simple
             if not ctx.local_mode and cur != simple and cur != prev_model:
@@ -279,7 +282,10 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
                     ChatMessage(role="assistant", content=None, tool_calls=tool_calls)
                 )
 
-            await emit(events.status(_status_phrase(tool_calls)))
+            phrase = _status_phrase(tool_calls)
+            if phrase and phrase != last_status:   # skip recon-only batches; dedup brain-side
+                await emit(events.status(phrase))
+                last_status = phrase
             results = await _execute_tool_calls(
                 tool_calls, ctx, perm_engine, None, NullToolDisplay(), router
             )
