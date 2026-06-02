@@ -35,7 +35,7 @@ async def test_detect_false_when_unreachable():
 def test_commands_tiers():
     cmds = {c.id: c for c in jf.PROVIDER.commands(_ctx())}
     assert cmds["jellyfin.search"].tier == 1
-    assert cmds["jellyfin.play"].tier == 2
+    assert cmds["jellyfin.play"].tier == 1   # playing media is reversible → no gate (surface confirm only when a client is open)
     assert cmds["jellyfin.control"].tier == 1
 
 
@@ -49,6 +49,23 @@ async def test_search_returns_structured_results():
     assert res.success
     data = json.loads(res.output)
     assert data[0]["title"] == "Dune" and data[0]["id"] == "abc" and data[0]["rating"] == 8.0
+
+
+@respx.mock
+async def test_title_search_skips_rating_floor_and_includes_tv():
+    # Regression: a named title must not be filtered by the default rating floor, and TV is findable.
+    route = respx.get(f"{BASE}/Items").mock(return_value=httpx.Response(200, json={"Items": []}))
+    await jf.search(_ctx(), query="You Only Live Twice")
+    params = route.calls.last.request.url.params
+    assert "minCommunityRating" not in params
+    assert "Series" in params["IncludeItemTypes"]
+
+
+@respx.mock
+async def test_genre_browse_still_applies_rating_floor():
+    route = respx.get(f"{BASE}/Items").mock(return_value=httpx.Response(200, json={"Items": []}))
+    await jf.search(_ctx(), genre="Action")
+    assert route.calls.last.request.url.params["minCommunityRating"] == "7.0"
 
 
 async def test_search_without_api_key():
@@ -113,3 +130,35 @@ async def test_play_falls_back_to_browser_sign_in(monkeypatch):
 
     res = await jf.play(_ctx(), item_id="abc")
     assert "sign in" in res.output.lower()   # opened the window, asks for one-time login
+
+
+@respx.mock
+async def test_play_browser_path_with_voice_emit_does_not_crash(monkeypatch):
+    # Regression: `events` was imported only inside the controllable-session branch, so the
+    # browser fallback raised UnboundLocalError when a voice emit was set and no client was open.
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[]))
+    monkeypatch.setattr(jf, "_PLAY_POLL_TRIES", 1)
+
+    class _FakePage:
+        async def goto(self, *a, **k): ...
+
+    async def _fake_browser(ctx, profile="default"):
+        return types.SimpleNamespace(pages=[_FakePage()])
+
+    monkeypatch.setattr("gabagent.commands.browser.ensure_browser", _fake_browser)
+
+    async def _no_sleep(*a, **k): ...
+    monkeypatch.setattr(jf.asyncio, "sleep", _no_sleep)
+
+    ctx = _ctx()
+    emitted = []
+
+    async def emit(ev):
+        emitted.append(ev)
+
+    ctx.voice_emit = emit
+    ctx.voice_session = VoiceSession("s", None)
+
+    res = await jf.play(ctx, item_id="abc")          # must not raise UnboundLocalError
+    assert "sign in" in res.output.lower()
+    assert any(e.type == "status" for e in emitted)  # "Opening the player…" reached the emit

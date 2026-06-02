@@ -50,7 +50,7 @@ class JellyfinProvider:
                 examples=["find a 4-star sci-fi movie", "what comedies do I have rated over 8"],
             ),
             Command(
-                id="jellyfin.play", domain="media", tier=2, requires_confirm_surface=True,
+                id="jellyfin.play", domain="media", tier=1, requires_confirm_surface=True,
                 summary="Play a movie — on your open client if you have one, or in a new window",
                 confirm_template="Play {title} in Jellyfin?",
                 backend=BrowserBackend(ref="gabagent.commands.providers.jellyfin:play"),
@@ -98,10 +98,13 @@ async def search(ctx, genre=None, min_rating=None, query=None, unwatched=False) 
     if not jc.api_key:
         return ToolResult(output="", error="Jellyfin API key not set (settings: jellyfin.api_key).")
     params = {
-        "IncludeItemTypes": "Movie", "Recursive": "true",
+        "IncludeItemTypes": "Movie,Series", "Recursive": "true",
         "Fields": "Genres,CommunityRating,ProductionYear", "SortBy": "Random", "Limit": "20",
     }
-    mr = min_rating if min_rating is not None else jc.rating_threshold
+    # The rating floor is for browse/recommendation ("find a good sci-fi"), NOT for an explicit
+    # title lookup — otherwise a title the user named silently vanishes if it's rated below the
+    # threshold (this is why "You Only Live Twice" (~6.8) couldn't be found under the 7.0 default).
+    mr = min_rating if min_rating is not None else (None if query else jc.rating_threshold)
     if mr:
         params["minCommunityRating"] = str(mr)
     if genre:
@@ -145,6 +148,7 @@ async def control(ctx, action="") -> ToolResult:
 
 async def play(ctx, item_id="", title="") -> ToolResult:
     # `title` is carried for the spoken confirmation only; playback uses item_id.
+    from gabagent.voice import events  # used by both the surface-confirm and the browser path
     jc = ctx.config.jellyfin
     if not item_id:
         return ToolResult(output="", error="no item to play")
@@ -156,7 +160,6 @@ async def play(ctx, item_id="", title="") -> ToolResult:
 
     # Ask-if-ambiguous: a client is already open — use it, or open a new window?
     if controllable and vs is not None and emit is not None:
-        from gabagent.voice import events
         names = " or ".join(s.get("DeviceName", "a device") for s in controllable[:2])
         what = f"{title} " if title else ""
         cid = uuid4().hex
