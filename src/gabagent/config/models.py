@@ -71,6 +71,14 @@ class TidalConfig(BaseModel):
     rpc_url: str = "http://localhost:6680/mopidy/rpc"
 
 
+class DesktopConfig(BaseModel):
+    """KDE/Wayland desktop control (first-party provider)."""
+    # Friendly monitor names → KWin connector (e.g. {"hisense": "DP-1"}). Display make/model isn't
+    # exposed by kscreen-doctor, so this lets a user say "move it to the Hisense" and have it resolve.
+    # Keys are matched case-insensitively. Host-specific → set in your settings.json, not in source.
+    screen_aliases: dict[str, str] = Field(default_factory=dict)
+
+
 class GabAgentConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="GABAI_",
@@ -107,3 +115,4 @@ class GabAgentConfig(BaseSettings):
     attestation: AttestationConfig = Field(default_factory=AttestationConfig)
     jellyfin: JellyfinConfig = Field(default_factory=JellyfinConfig)
     tidal: TidalConfig = Field(default_factory=TidalConfig)
+    desktop: DesktopConfig = Field(default_factory=DesktopConfig)

@@ -39,18 +39,23 @@ def _kwin(shortcut: str) -> ShellBackend:
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
-# Move the active window to the largest output (by logical area).
-_JS_LARGEST = (
-    "(function(){var w=workspace.activeWindow;if(!w)return;var s=workspace.screens;"
-    "if(!s||!s.length)return;var b=s[0];for(var i=1;i<s.length;i++){"
-    "if(s[i].geometry.width*s[i].geometry.height>b.geometry.width*b.geometry.height)b=s[i];}"
-    "workspace.sendClientToScreen(w,b);})();"
-)
-# Move the active window to a named output (%TNAME%) or 1-based index (%TI%).
-_JS_TO_SCREEN = (
-    "(function(){var w=workspace.activeWindow;if(!w)return;var tn=%TNAME%;var ti=%TI%;"
+# Move the ACTIVE window to a named output (%TNAME%). Used only when we have no better target —
+# while the user is talking to the voice agent the active window is usually NOT the one they mean.
+_JS_ACTIVE_TO_SCREEN = (
+    "(function(){var w=workspace.activeWindow;if(!w)return;var tn=%TNAME%;"
     "var s=workspace.screens;for(var i=0;i<s.length;i++){"
-    "if(s[i].name===tn||(i+1)===ti){workspace.sendClientToScreen(w,s[i]);return;}}})();"
+    "if(s[i].name===tn){workspace.sendClientToScreen(w,s[i]);return;}}})();"
+)
+# Move the window whose caption OR app class contains %NAME% (lowercased substring) to output
+# %TNAME%. This targets the *movie* window by title even when it isn't focused — the activeWindow
+# approach silently moved the wrong window (the focused terminal/voice UI) and still reported success.
+_JS_MOVE_NAMED = (
+    "(function(){var n=%NAME%;var tn=%TNAME%;var ws=workspace.windowList();var w=null;"
+    "for(var i=0;i<ws.length;i++){var c=(ws[i].caption||'').toLowerCase();"
+    "var k=(ws[i].resourceClass||'').toLowerCase();"
+    "if(c.indexOf(n)>=0||k.indexOf(n)>=0){w=ws[i];break;}}"
+    "if(!w)return;var s=workspace.screens;for(var j=0;j<s.length;j++){"
+    "if(s[j].name===tn){workspace.sendClientToScreen(w,s[j]);return;}}})();"
 )
 # Close the first window whose caption OR app class contains %NAME% (lowercased substring). Plasma 6
 # KWin scripting: workspace.windowList() + window.closeWindow() (verified on the host).
@@ -130,24 +135,98 @@ async def list_screens(ctx) -> ToolResult:
     return ToolResult(output=json.dumps({"count": len(screens), "screens": screens}))
 
 
-async def to_largest_screen(ctx) -> ToolResult:
-    ok = await _run_kwin_script(_JS_LARGEST)
-    return ToolResult(output="Moved it to your largest screen.") if ok \
+def _screen_aliases(ctx) -> dict:
+    """User-configured friendly monitor name → connector (e.g. {'hisense': 'DP-1'}); empty if none."""
+    try:
+        return dict(ctx.config.desktop.screen_aliases or {})
+    except Exception:
+        return {}
+
+
+def _resolve_screen(query: str, screens: list[dict], aliases: dict | None = None) -> dict | None:
+    """Map a spoken screen reference to a real output, or None if it doesn't match any.
+
+    The KWin output name is the connector (DP-1, HDMI-A-1) — the display's make/model (e.g.
+    "Hisense") is NOT exposed by kscreen-doctor or sysfs here, so a request we can't resolve must
+    fail honestly rather than silently no-op while reporting success. A user can bridge a make/model
+    to a connector via config `desktop.screen_aliases` (e.g. {"hisense": "DP-1"})."""
+    q = query.strip().lower()
+    if not q:
+        return None
+    for name, connector in (aliases or {}).items():   # friendly alias (substring) → connector
+        if name.strip().lower() in q:
+            q = str(connector).strip().lower()
+            break
+    if any(w in q for w in ("large", "big", "main", "primary")):
+        return max(screens, key=lambda s: s["width"] * s["height"])
+    try:                                   # 1-based index ("screen 2")
+        i = int(q)
+        if 1 <= i <= len(screens):
+            return screens[i - 1]
+    except ValueError:
+        pass
+    for s in screens:                      # exact connector name
+        if s["name"].lower() == q:
+            return s
+    for s in screens:                      # connector substring ("hdmi" → HDMI-A-1)
+        if q in s["name"].lower():
+            return s
+    return None
+
+
+async def _movie_window_hint(ctx) -> str:
+    """Caption hint for a movie WE launched (its browser window title), so a move can target that
+    window by name instead of whatever happens to be focused. Empty if no movie page is open."""
+    page = getattr(ctx, "jellyfin_playing_page", None) if ctx is not None else None
+    if page is None:
+        return ""
+    try:
+        if page.is_closed():
+            return ""
+        return (await page.title() or "").strip()
+    except Exception:
+        return ""
+
+
+async def _move_to_target(ctx, target: dict) -> ToolResult:
+    """Move the movie window (by title) if one is open, else the active window, to `target` output.
+    Phrasing is honest about which it moved and that we can't confirm KWin actually relocated it."""
+    hint = await _movie_window_hint(ctx)
+    if hint:
+        js = _JS_MOVE_NAMED.replace("%NAME%", json.dumps(hint.lower())) \
+                           .replace("%TNAME%", json.dumps(target["name"]))
+        what = "the movie"
+    else:
+        js = _JS_ACTIVE_TO_SCREEN.replace("%TNAME%", json.dumps(target["name"]))
+        what = "this window"
+    ok = await _run_kwin_script(js)
+    return ToolResult(output=f"Sent {what} to {target['name']}.") if ok \
         else ToolResult(output="", error="couldn't move the window")
+
+
+async def to_largest_screen(ctx) -> ToolResult:
+    screens = await _kscreen_outputs()
+    if not screens:
+        return ToolResult(output="", error="couldn't read the display configuration")
+    return await _move_to_target(ctx, max(screens, key=lambda s: s["width"] * s["height"]))
 
 
 async def to_screen(ctx, screen="") -> ToolResult:
     screen = str(screen).strip()
     if not screen:
         return ToolResult(output="", error="which screen?")
-    try:
-        idx = int(screen)
-    except ValueError:
-        idx = -1
-    js = _JS_TO_SCREEN.replace("%TNAME%", json.dumps(screen)).replace("%TI%", str(idx))
-    ok = await _run_kwin_script(js)
-    return ToolResult(output=f"Moved it to {screen}.") if ok \
-        else ToolResult(output="", error="couldn't move the window")
+    screens = await _kscreen_outputs()
+    if not screens:
+        return ToolResult(output="", error="couldn't read the display configuration")
+    target = _resolve_screen(screen, screens, _screen_aliases(ctx))
+    if target is None:
+        # Honest failure: don't claim a move that didn't happen (the "Hisense" false-success bug).
+        names = ", ".join(s["name"] for s in screens)
+        biggest = max(screens, key=lambda s: s["width"] * s["height"])["name"]
+        return ToolResult(output="", error=(
+            f"I don't see a screen called '{screen}'. I have {names} — the largest is {biggest}. "
+            "Tell me one of those, or say 'the largest screen'."))
+    return await _move_to_target(ctx, target)
 
 
 async def close_named(ctx, name="") -> ToolResult:
@@ -193,11 +272,15 @@ class DesktopProvider:
                         backend=PyBackend(ref="gabagent.commands.providers.desktop:to_largest_screen"),
                         examples=["move it to the biggest screen", "put the movie on my largest monitor"]),
                 Command(id="window.to_screen", domain="window", tier=1,
-                        summary="Move the active window to a specific monitor by name or number",
+                        summary="Move the active window to a specific monitor by connector name, "
+                                "number, or 'largest'",
                         backend=PyBackend(ref="gabagent.commands.providers.desktop:to_screen"),
                         params=[Slot("screen", "string", True,
-                                     description="monitor name (e.g. 'DP-1') or number from window.list_screens")],
-                        examples=["move it to DP-1", "put it on screen 2"]),
+                                     description="connector name (e.g. 'DP-1', 'HDMI-A-1'), a 1-based "
+                                     "number from window.list_screens, or 'largest'/'primary'. A "
+                                     "display make/model (e.g. 'Hisense') is NOT a valid name — call "
+                                     "window.list_screens first if unsure")],
+                        examples=["move it to DP-1", "put it on screen 2", "move it to the largest screen"]),
                 Command(id="window.switch", domain="window", tier=1,
                         summary="Switch to the next window", backend=_kwin("Walk Through Windows"),
                         examples=["switch windows", "next window"]),

@@ -13,6 +13,11 @@ from gabagent.voice import commands as vc
 from gabagent.voice.turn import _voice_system, _capability_brief
 
 
+async def _aw(value):
+    """Wrap a plain value as an awaitable, for monkeypatching async helpers."""
+    return value
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
@@ -205,19 +210,117 @@ async def test_run_kwin_script_load_start_unload(monkeypatch):
                        "org.kde.kwin.Scripting.start", "org.kde.kwin.Scripting.unloadScript"]
 
 
-async def test_to_screen_json_encodes_target_no_injection(monkeypatch):
+_FAKE_SCREENS = [
+    {"name": "DP-1", "width": 3072, "height": 1728, "primary": True},
+    {"name": "DP-2", "width": 1920, "height": 1080, "primary": False},
+    {"name": "HDMI-A-1", "width": 1920, "height": 1080, "primary": False},
+]
+
+
+async def test_to_screen_resolves_and_json_encodes_connector(monkeypatch):
     from gabagent.commands.providers import desktop as d
     captured = {}
     async def fake_script(js): captured["js"] = js; return True
     monkeypatch.setattr(d, "_run_kwin_script", fake_script)
-    res = await d.to_screen(None, screen='DP-1"; evil()//')
-    assert res.success
-    assert json.dumps('DP-1"; evil()//') in captured["js"]   # value is a JS string literal, can't break out
+    monkeypatch.setattr(d, "_kscreen_outputs", lambda: _aw(_FAKE_SCREENS))
+    res = await d.to_screen(None, screen="hdmi")          # substring → HDMI-A-1
+    assert res.success and "HDMI-A-1" in res.output
+    assert json.dumps("HDMI-A-1") in captured["js"]        # only the resolved connector reaches the JS
     assert "%TNAME%" not in captured["js"] and "%TI%" not in captured["js"]
 
 
-async def test_to_largest_screen_runs_script(monkeypatch):
+async def test_to_screen_unknown_name_fails_honestly(monkeypatch):
+    """A display make/model (e.g. 'Hisense') resolves to no connector → honest error, NO false success
+    and the KWin script is never run (the bug: it claimed 'Moved it' after a silent no-op)."""
     from gabagent.commands.providers import desktop as d
-    async def fake_script(js): return True
+    ran = []
+    async def fake_script(js): ran.append(js); return True
     monkeypatch.setattr(d, "_run_kwin_script", fake_script)
-    assert (await d.to_largest_screen(None)).success
+    monkeypatch.setattr(d, "_kscreen_outputs", lambda: _aw(_FAKE_SCREENS))
+    res = await d.to_screen(None, screen="Hisense")
+    assert not res.success
+    assert "Hisense" in res.error and "DP-1" in res.error   # names the real screens
+    assert ran == []                                        # never pretended to move
+
+
+def test_resolve_screen_largest_index_name(monkeypatch):
+    from gabagent.commands.providers.desktop import _resolve_screen
+    assert _resolve_screen("largest", _FAKE_SCREENS)["name"] == "DP-1"
+    assert _resolve_screen("the biggest screen", _FAKE_SCREENS)["name"] == "DP-1"
+    assert _resolve_screen("2", _FAKE_SCREENS)["name"] == "DP-2"      # 1-based index
+    assert _resolve_screen("DP-2", _FAKE_SCREENS)["name"] == "DP-2"   # exact connector
+    assert _resolve_screen("hdmi", _FAKE_SCREENS)["name"] == "HDMI-A-1"  # substring
+    assert _resolve_screen("Hisense", _FAKE_SCREENS) is None          # make/model → unresolvable
+
+
+def test_resolve_screen_alias(monkeypatch):
+    from gabagent.commands.providers.desktop import _resolve_screen
+    aliases = {"hisense": "DP-1"}
+    # The make/model now resolves via the configured alias, even embedded in a phrase.
+    assert _resolve_screen("Hisense", _FAKE_SCREENS, aliases)["name"] == "DP-1"
+    assert _resolve_screen("move it to the hisense monitor", _FAKE_SCREENS, aliases)["name"] == "DP-1"
+    assert _resolve_screen("nope", _FAKE_SCREENS, aliases) is None
+
+
+class _FakePage:
+    def __init__(self, title): self._title = title; self._closed = False
+    def is_closed(self): return self._closed
+    async def title(self): return self._title
+
+
+async def test_to_screen_targets_movie_window_by_title(monkeypatch):
+    """When a movie WE launched is open, the move targets that window by caption via windowList()
+    (not activeWindow, which is usually the focused terminal/voice UI)."""
+    import types
+    from gabagent.commands.providers import desktop as d
+    captured = {}
+    async def fake_script(js): captured["js"] = js; return True
+    monkeypatch.setattr(d, "_run_kwin_script", fake_script)
+    monkeypatch.setattr(d, "_kscreen_outputs", lambda: _aw(_FAKE_SCREENS))
+    ctx = types.SimpleNamespace(jellyfin_playing_page=_FakePage("What Dreams May Come"),
+                                config=types.SimpleNamespace(desktop=types.SimpleNamespace(
+                                    screen_aliases={"hisense": "DP-1"})))
+    res = await d.to_screen(ctx, screen="hisense")            # alias → DP-1
+    assert res.success and "movie" in res.output and "DP-1" in res.output
+    assert "windowList" in captured["js"]                     # by-title path, not activeWindow
+    assert json.dumps("what dreams may come") in captured["js"]   # caption hint
+    assert json.dumps("DP-1") in captured["js"]
+
+
+async def test_to_screen_falls_back_to_active_window(monkeypatch):
+    """No movie open → move the active window (still by resolved connector name)."""
+    import types
+    from gabagent.commands.providers import desktop as d
+    captured = {}
+    async def fake_script(js): captured["js"] = js; return True
+    monkeypatch.setattr(d, "_run_kwin_script", fake_script)
+    monkeypatch.setattr(d, "_kscreen_outputs", lambda: _aw(_FAKE_SCREENS))
+    ctx = types.SimpleNamespace(jellyfin_playing_page=None,
+                                config=types.SimpleNamespace(desktop=types.SimpleNamespace(screen_aliases={})))
+    res = await d.to_screen(ctx, screen="DP-2")
+    assert res.success and "this window" in res.output
+    assert "activeWindow" in captured["js"] and "windowList" not in captured["js"]
+
+
+async def test_to_largest_screen_moves_to_biggest(monkeypatch):
+    from gabagent.commands.providers import desktop as d
+    captured = {}
+    async def fake_script(js): captured["js"] = js; return True
+    monkeypatch.setattr(d, "_run_kwin_script", fake_script)
+    monkeypatch.setattr(d, "_kscreen_outputs", lambda: _aw(_FAKE_SCREENS))
+    res = await d.to_largest_screen(None)
+    assert res.success and "DP-1" in res.output              # DP-1 is the largest of _FAKE_SCREENS
+
+
+def test_catalog_resolves_window_move_alias():
+    """The model keeps inventing `window.move_window`; the catalog aliases it to `window.to_screen`
+    so the guess just works instead of an Unknown-command turn."""
+    from gabagent.commands.catalog import CommandCatalog
+    from gabagent.commands.model import Command, ShellBackend
+    cat = CommandCatalog()
+    cmd = Command(id="window.to_screen", domain="window", summary="move it", tier=1,
+                  backend=ShellBackend(argv=["true"]))
+    cat.add(cmd)
+    assert cat.get("window.move_window") is cmd     # alias resolves
+    assert cat.get("window.to_screen") is cmd       # real id still works
+    assert cat.get("window.bogus") is None          # unknown still None

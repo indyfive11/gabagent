@@ -2,6 +2,13 @@
 from __future__ import annotations
 from gabagent.commands.model import Command
 
+# Plausible-but-wrong ids the model reliably guesses → the real command. Saves a wasted
+# unknown-command turn + list_capabilities recovery (e.g. it kept inventing `window.move_window`).
+_ID_ALIASES = {
+    "window.move_window": "window.to_screen",
+    "window.move": "window.to_screen",
+}
+
 
 class CommandCatalog:
     def __init__(self) -> None:
@@ -11,7 +18,7 @@ class CommandCatalog:
         self._cmds[cmd.id] = cmd
 
     def get(self, command_id: str) -> Command | None:
-        return self._cmds.get(command_id)
+        return self._cmds.get(command_id) or self._cmds.get(_ID_ALIASES.get(command_id, ""))
 
     def all(self) -> list[Command]:
         return list(self._cmds.values())
