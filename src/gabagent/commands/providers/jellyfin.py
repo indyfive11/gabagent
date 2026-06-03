@@ -173,7 +173,8 @@ async def play(ctx, item_id="", title="") -> ToolResult:
 
     # Ask-if-ambiguous: a client is already open — use it, or open a new window?
     if controllable and vs is not None and emit is not None:
-        names = " or ".join(s.get("DeviceName", "a device") for s in controllable[:2])
+        # Dedup identical device names so two browser windows don't read as "Chrome or Chrome".
+        names = " or ".join(dict.fromkeys(s.get("DeviceName", "a device") for s in controllable))
         what = f"{title} " if title else ""
         cid = uuid4().hex
         fut = vs.new_confirm(cid)

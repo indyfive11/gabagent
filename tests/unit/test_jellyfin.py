@@ -285,3 +285,25 @@ async def test_inject_auth_seeds_localstorage(monkeypatch):
     monkeypatch.setattr(jf, "_authenticate", fake_auth)
     ok = await jf._inject_jellyfin_auth(_ctx().config.jellyfin, _BCtx())
     assert ok and "jellyfin_credentials" in captured["js"] and "tok" in captured["js"]
+
+
+@respx.mock
+async def test_play_confirm_dedups_identical_device_names():
+    """Two browser windows both named 'Chrome' must read as 'your open Chrome', not 'Chrome or Chrome'."""
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "c1", "SupportsRemoteControl": True, "DeviceName": "Chrome"},
+        {"Id": "c2", "SupportsRemoteControl": True, "DeviceName": "Chrome"},
+    ]))
+    respx.post(f"{BASE}/Sessions/c1/Playing").mock(return_value=httpx.Response(204))
+    ctx = _ctx()
+    vs = VoiceSession("s", None)
+    ctx.voice_session = vs
+    seen = {}
+    async def emit(ev):
+        if ev.type == "confirm":
+            seen["text"] = ev.summary
+            vs.resolve(ev.id, True)
+    ctx.voice_emit = emit
+    await jf.play(ctx, item_id="abc")
+    assert "Chrome or Chrome" not in seen["text"]
+    assert seen["text"].count("Chrome") == 1
