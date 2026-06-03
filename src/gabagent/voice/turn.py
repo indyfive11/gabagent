@@ -13,9 +13,11 @@ rather than forking the tool loop.
 """
 from __future__ import annotations
 import asyncio
+import json
 from typing import AsyncIterator, TYPE_CHECKING
 
 from gabagent.api.models import ChatMessage
+from gabagent.api.client import _is_transient_generation_error
 from gabagent.agent.loop import _execute_tool_calls, _active_client
 from gabagent.voice import events
 from gabagent.voice.events import VoiceEvent
@@ -30,7 +32,9 @@ _WINDOW = 12  # recent non-system messages sent to the model
 
 VOICE_ADDENDUM = (
     "You are speaking out loud through a voice assistant. Keep replies short and "
-    "conversational — a sentence or two, no lists, headings, code blocks, or markdown. "
+    "conversational — ONE short sentence, no lists, headings, code blocks, or markdown. "
+    "Don't add pleasantries or offers like 'let me know if you need anything else' or 'glad I "
+    "could help' — just answer or report the result and stop. "
     "Don't read code or long file contents aloud — make the change and say one sentence "
     "about what you did. You can read files, search the web, and edit files in safe folders "
     "without asking. For edits to the current project you'll ask out loud to confirm. For "
@@ -46,7 +50,10 @@ VOICE_ADDENDUM = (
     "To stop or pause you, the user speaks to the voice layer directly (you never see these): "
     "'shut down voice mode' (or 'exit/quit voice mode') closes you completely, and 'go to sleep' "
     "(or 'stop listening') pauses you until they say 'wake up'. If asked how to stop or pause you, "
-    "tell them those phrases."
+    "tell them those phrases. You CANNOT end, pause, or sleep voice mode yourself — those only work "
+    "when the user speaks them to the voice layer. If a request reaches you that sounds like shutting "
+    "you down, turning you off, or going to sleep, do NOT say you're doing it; say you can't end voice "
+    "mode yourself and that they should say 'shut down voice mode.'"
 )
 
 
@@ -285,6 +292,8 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
         perm_engine = PermissionEngine(ctx.config)
 
         last_status = None
+        status_emitted = False   # cap spoken status to ONE per turn (no "Opening… Trying… Looking…" chains)
+        fell_back = False        # turn-level arya fallback fires at most once per turn
         while True:
             cur = ctx.active_model or simple
             # Announce an arya→premium transition ONCE (vs. every turn), and de-escalate silently.
@@ -325,12 +334,25 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
                         text_buf = prose
                 await _emit_filtered(sfilter, sfilter.feed(text_buf), emit)
             else:
-                async for chunk in stream:
-                    if isinstance(chunk, str):
-                        text_buf += chunk
-                        await _emit_filtered(sfilter, sfilter.feed(chunk), emit)
-                    elif isinstance(chunk, list):
-                        tool_calls = [tc for tc in chunk if tc.name]
+                try:
+                    async for chunk in stream:
+                        if isinstance(chunk, str):
+                            text_buf += chunk
+                            await _emit_filtered(sfilter, sfilter.feed(chunk), emit)
+                        elif isinstance(chunk, list):
+                            tool_calls = [tc for tc in chunk if tc.name]
+                except Exception as e:
+                    # An escalated turn that fails to generate (gab.ai 'inference_failed') falls back to
+                    # the simple model at the TURN level — a guaranteed arya answer beats a spoken error.
+                    # Only safe before any speech was emitted (else we'd replay it), and only once.
+                    if (not text_buf and not fell_back and cur != simple
+                            and _is_transient_generation_error(e)):
+                        fell_back = True
+                        ctx.active_model = simple
+                        ctx.voice_announced_model = simple   # don't announce the switch back
+                        dlog(ctx, "fallback", to=simple, reason="inference_failed")
+                        continue
+                    raise
             await _emit_filtered(sfilter, sfilter.flush(), emit)
 
             if text_buf:
@@ -345,14 +367,24 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
                 )
 
             phrase = _status_phrase(tool_calls)
-            if phrase and phrase != last_status:   # skip recon-only batches; dedup brain-side
+            if phrase and not status_emitted:   # one status per turn — no stacked preambles
                 await emit(events.status(phrase))
+                status_emitted = True
                 last_status = phrase
             results = await _execute_tool_calls(
                 tool_calls, ctx, perm_engine, None, NullToolDisplay(), router
             )
             for tc, result in zip(tool_calls, results):
-                dlog(ctx, "tool", name=tc.name, ok=result.success, error=result.error)
+                # Record the run_command command_id so the debug log shows WHICH capability ran each
+                # turn (was inferred-by-tier before) — e.g. to see exactly what a "move the window" turn
+                # invoked, or whether a control command paused a movie.
+                cid = None
+                if tc.name == "run_command":
+                    try:
+                        cid = (json.loads(tc.arguments) if tc.arguments else {}).get("command_id") or None
+                    except Exception:
+                        cid = None
+                dlog(ctx, "tool", name=tc.name, command_id=cid, ok=result.success, error=result.error)
                 ctx.session.append_message(
                     ChatMessage(role="tool", content=result.to_content(), tool_call_id=tc.id)
                 )
@@ -380,7 +412,7 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             # voice-agent speaks `error.text` and logs `summary`; the trailing `done`
             # closes the SSE. (It also suppresses any status right after an error.)
             vs.queue.put_nowait(events.error(
-                cause, "Sorry, I hit a problem — ask me what went wrong for details."))
+                cause, "Sorry, I had a brief hiccup — could you say that again?"))
             vs.queue.put_nowait(events.done())
 
 

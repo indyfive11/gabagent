@@ -213,3 +213,82 @@ async def test_escalation_announces_once_then_deescalates(home):
     await run_turn(ctx, "stop")                       # short → fast-path
     assert len(classify_calls) == n                   # classifier NOT called for the simple turn
     assert ctx.active_model == ctx.config.router.simple_model   # de-escalated back to arya
+
+
+# -- A1: one status per turn (no stacked "Opening… Trying window… Looking into it" preambles) -----
+
+async def test_one_status_per_turn(home, monkeypatch):
+    """A multi-batch turn (different tools → different status phrases) speaks ONE status, not one
+    per batch."""
+    from gabagent.api.models import ToolResult
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, *a, **k):
+        return [ToolResult(output="ok") for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    ctx = make_ctx(home, [
+        [[_spec("read_file", path="x")]],     # phrase: "Reading through things."
+        [[_spec("web_search", query="y")]],   # phrase: "Looking that up."  (different)
+        ["all done"],
+    ])
+    evs = await run_turn(ctx, "do a couple of things")
+    statuses = [e for e in evs if e.type == "status"]
+    assert len(statuses) == 1                 # capped — without the fix this would be 2
+
+
+# -- B1: turn-level arya fallback when an escalated turn fails to generate (G6) --------------------
+
+class _FallbackClient:
+    def __init__(self, fail_always=False, text_first=False):
+        self.model = "arya"; self.calls = []
+        self.fail_always = fail_always; self.text_first = text_first
+    async def stream_complete(self, messages, tools=None, model=None, retry_model=None,
+                              fallback_model=None, **kw):
+        self.calls.append(model)
+        if self.text_first:
+            yield "partial "
+        if self.fail_always or (model and model != "arya"):
+            raise RuntimeError("APIError: The model failed to generate a response. "
+                               "code: 'inference_failed'")
+        yield "Recovered on arya."
+
+
+async def test_escalated_inference_failure_falls_back_to_arya(home):
+    ctx = make_ctx(home, [])
+    ctx.client = _FallbackClient()
+    ctx.active_model = "claude-sonnet-4-5"          # escalated for this turn
+    evs = await run_turn(ctx, "a complex question")
+    text = "".join(e.text for e in evs if e.type == "token")
+    assert "Recovered on arya" in text              # answered, not errored
+    assert ctx.client.calls == ["claude-sonnet-4-5", "arya"]   # retried once on the simple model
+    assert not any(e.type == "error" for e in evs)
+
+
+async def test_no_fallback_when_already_on_simple(home):
+    """On the simple model already → no retry (nothing better to fall back to); surfaces the error."""
+    ctx = make_ctx(home, [])
+    ctx.client = _FallbackClient(fail_always=True)
+    ctx.active_model = "arya"
+    evs = await run_turn(ctx, "hi")
+    assert ctx.client.calls == ["arya"]             # exactly one attempt, no fallback loop
+    assert any(e.type == "error" for e in evs)
+
+
+async def test_no_fallback_after_text_emitted(home):
+    """If speech was already emitted, we must NOT replay on arya (no double-speak) — surface error."""
+    ctx = make_ctx(home, [])
+    ctx.client = _FallbackClient(text_first=True)
+    ctx.active_model = "claude-sonnet-4-5"
+    evs = await run_turn(ctx, "a complex question")
+    # Content was already received (text_buf non-empty), so we must NOT replay on arya — surfaces the
+    # error instead. (The speakable filter may still be buffering the partial, hence no token assert.)
+    assert ctx.client.calls == ["claude-sonnet-4-5"]
+    assert any(e.type == "error" for e in evs)
+
+
+# -- C: shutdown honesty lives in the prompt -------------------------------------------------------
+
+def test_addendum_has_shutdown_honesty():
+    from gabagent.voice.turn import VOICE_ADDENDUM
+    a = VOICE_ADDENDUM.lower()
+    assert "cannot end" in a and "shut down voice mode" in a
+    assert "do not say you're doing it" in a or "do not say you’re doing it" in a
