@@ -165,6 +165,62 @@ async def test_parse_error_retries_on_stronger_model_with_nudge():
     assert _TOOLCALL_NUDGE in comp.calls[1]["messages"][-1]["content"]  # nudged
 
 
+class _ParseErrStream:
+    """create() succeeds but ITERATING raises a parse error — gab.ai validates tool_calls mid-stream, so
+    the open-time nudge_retry never sees it; the outer handler must recover it."""
+    def __aiter__(self):
+        async def _gen():
+            raise _ParseErr("api_error invalid_tool_calls: unknown_tool 'tidal.set_volume'")
+            yield  # unreachable — makes this an async generator
+        return _gen()
+
+
+class _NudgedToolStream:
+    def __aiter__(self):
+        async def _gen():
+            yield types.SimpleNamespace(choices=[types.SimpleNamespace(
+                delta=types.SimpleNamespace(content=None, tool_calls=[types.SimpleNamespace(
+                    index=0, id="t1", function=types.SimpleNamespace(
+                        name="run_command",
+                        arguments='{"command_id":"tidal.set_volume","args":{"level":30}}'))]),
+                finish_reason="tool_calls")])
+        return _gen()
+
+
+class _MidStreamParseCompletions:
+    """arya's stream parse-errors DURING iteration; the nudged+escalated retry yields a valid call."""
+    def __init__(self): self.calls = []
+    async def create(self, **kw):
+        self.calls.append(kw)
+        msgs = kw.get("messages", [])
+        nudged = bool(msgs) and msgs[-1].get("role") == "system"   # the run_command nudge was appended
+        return _NudgedToolStream() if nudged else _ParseErrStream()
+
+
+async def test_midstream_parse_error_self_heals_via_nudge():
+    # The tidal.set_volume live miss: gab.ai rejected a command-id-called-as-a-function DURING streaming,
+    # which hit the outer handler that only recovered transient errors → the turn errored. Now the outer
+    # handler applies the run_command nudge + escalation for a mid-stream parse error too.
+    from gabagent.api.client import GabAIClient, _TOOLCALL_NUDGE
+    from gabagent.api.models import ChatMessage
+    c = GabAIClient("k", "https://gab.ai/v1", "arya", _rl())
+    comp = _MidStreamParseCompletions()
+    c._client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=comp))
+    tools = [{"type": "function", "function": {"name": "run_command", "parameters": {}}}]
+    specs = None
+    async for chunk in c.stream_complete([ChatMessage(role="user", content="set the music to 30")],
+                                         tools, model="arya", stream=True,
+                                         retry_model="claude-sonnet-4-5"):
+        if isinstance(chunk, list):
+            specs = chunk
+    assert specs and specs[0].name == "run_command"            # recovered instead of erroring the turn
+    assert len(comp.calls) == 2
+    assert comp.calls[0].get("model") == "arya"
+    assert comp.calls[1].get("model") == "claude-sonnet-4-5"   # escalated on the mid-stream recovery
+    assert comp.calls[1]["messages"][-1]["content"] == _TOOLCALL_NUDGE
+    assert c.tools_supported is True                           # not permanently disabled
+
+
 class _StreamCompletions:
     def __init__(self): self.calls = 0
     async def create(self, **kw):

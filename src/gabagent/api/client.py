@@ -226,6 +226,7 @@ class GabAIClient:
         # has been yielded yet. Callers (agent loop / voice turn) emit text deltas immediately, so
         # replaying after partial output would double-emit; "failed to generate" yields zero tokens,
         # so the common case is safely retryable.
+        nudged_for_parse = False   # have we already added the run_command nudge for a mid-stream parse error?
         for attempt in range(_MAX_GEN_ATTEMPTS):
             tc_names: dict[int, str] = defaultdict(str)
             tc_ids: dict[int, str] = defaultdict(str)
@@ -302,6 +303,25 @@ class GabAIClient:
                             and fallback_model != (kwargs.get("model") or active_model)):
                         kwargs["model"] = fallback_model
                         self.rate_limiter.record(fallback_model)
+                    continue
+                # The model called a command-id as a function (e.g. tidal.set_volume) → gab.ai rejects the
+                # tool_calls. With stream=True this arrives DURING iteration (not at the open create()), so
+                # the open-time nudge_retry above never sees it — recover it here instead, as long as
+                # nothing was emitted yet (replaying mid-output would double-emit). First retry adds the
+                # run_command nudge + escalates; if it STILL parse-errors, drop tools for a graceful text
+                # answer. Mirrors the open-time path so the slip self-heals on every transport.
+                if (not yielded_any and attempt + 1 < _MAX_GEN_ATTEMPTS
+                        and tools and self.tools_supported and "tools" in kwargs
+                        and _is_toolcall_parse_error(e)):
+                    if not nudged_for_parse:
+                        kwargs["messages"] = raw_messages + [{"role": "system", "content": _TOOLCALL_NUDGE}]
+                        if retry_model and retry_model != (kwargs.get("model") or active_model):
+                            kwargs["model"] = retry_model
+                            self.rate_limiter.record(retry_model)
+                        nudged_for_parse = True
+                    else:
+                        kwargs.pop("tools", None)         # nudge didn't take → no-tools text answer
+                        kwargs.pop("tool_choice", None)
                     continue
                 body = getattr(e, "body", None)
                 if body:
