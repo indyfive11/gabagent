@@ -8,6 +8,12 @@ from gabagent.commands.model import Command
 _ID_ALIASES = {
     "window.move_window": "window.to_screen",
     "window.move": "window.to_screen",
+    # The model invents an ABSOLUTE volume id on the system provider (which only has relative
+    # volume_up/down) for "set the music to N%" — route those to the stream-targeted music control,
+    # not the master sink (whose volume also carries the assistant's own voice). Live: system.set_volume_level.
+    "system.set_volume_level": "tidal.set_volume",
+    "system.set_volume": "tidal.set_volume",
+    "media.set_volume": "tidal.set_volume",
 }
 
 
@@ -18,6 +24,11 @@ def _fuzzy_alias(command_id: str) -> str | None:
     if cid.startswith(("window.", "desktop.")) and "move" in cid and (
             "screen" in cid or "monitor" in cid or "window" in cid or "display" in cid):
         return "window.to_screen"
+    # An invented absolute-volume setter ("set"+"volume", e.g. system.set_volume_to / audio.set_volume):
+    # the real relative system.volume_up/down resolve by exact match first, so only fabricated
+    # absolute-set shapes reach here → the stream-level music volume.
+    if "volume" in cid and "set" in cid:
+        return "tidal.set_volume"
     return None
 
 

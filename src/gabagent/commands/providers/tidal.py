@@ -76,6 +76,16 @@ class TidalProvider:
                 examples=["what should I listen to", "play my recommendations", "my mixes",
                           "recommend something based on what I listen to"],
             ),
+            Command(
+                id="tidal.set_volume", domain="media", tier=1, featured=True,
+                summary="Set the music volume to a specific level (0-100%) — use this for the MUSIC "
+                        "volume, not the system volume",
+                backend=PyBackend(ref=ref + "set_volume"),
+                params=[Slot("level", "integer", True,
+                             description="target volume as a percent, 0-100, e.g. 30")],
+                examples=["set the music to 30%", "turn the music down to 20", "make the music quieter",
+                          "music volume 50 percent", "lower the volume to 40"],
+            ),
             Command(id="tidal.pause", domain="media", tier=1, featured=True, summary="Pause TIDAL playback",
                     backend=PyBackend(ref=ref + "pause"), examples=["pause the music", "pause tidal"]),
             Command(id="tidal.resume", domain="media", tier=1, summary="Resume TIDAL playback",
@@ -306,6 +316,49 @@ async def _transport(ctx, method: str, said: str) -> ToolResult:
     except Exception as e:
         return ToolResult(output="", error=f"couldn't do that: {_human_err(e)}")
     return ToolResult(output=said)
+
+
+def _volume_floor(ctx) -> int:
+    """Clamp an absolute volume set up to at least this % so 'turn it way down' can't ratchet the
+    music to inaudible (to truly silence it the user pauses/stops). Config media_volume_floor."""
+    try:
+        f = int(getattr(ctx.config, "media_volume_floor", 5))
+    except Exception:
+        f = 5
+    return max(0, min(100, f))
+
+
+async def _set_stream_volume(ctx, target: int) -> None:
+    """Set the MUSIC stream's volume — the Mopidy software mixer AND its PipeWire sink-input — never the
+    system master sink (@DEFAULT_SINK@). Targeting the master sink (as system.volume_* does) would also
+    attenuate the assistant's own voice, which shares that sink. Best-effort on the sink-input."""
+    await _rpc(ctx.config.tidal, "core.mixer.set_volume", {"volume": target}, timeout=2.0)
+    try:
+        # Local import to avoid a module-load cycle (ducking imports this module's _rpc), mirroring
+        # _hold_ambient. The sink-input is the node the user actually hears.
+        from gabagent.voice.ducking import _mopidy_sink_input, _run_pactl
+        found = await _mopidy_sink_input()
+        if found:
+            await _run_pactl("set-sink-input-volume", found[0], f"{target}%")
+    except Exception:
+        pass
+
+
+async def set_volume(ctx, level=None) -> ToolResult:
+    """Set the music volume to an absolute level (0-100), targeting the music stream — idempotent, with
+    a floor so it can't be ratcheted to silence. Replaces brute-forced relative system volume steps."""
+    if level is None or level == "":
+        return ToolResult(output="", error="no volume level given")
+    try:
+        target = int(round(float(level)))
+    except (TypeError, ValueError):
+        return ToolResult(output="", error="that volume isn't a number")
+    target = max(_volume_floor(ctx), min(100, target))
+    try:
+        await _set_stream_volume(ctx, target)
+    except Exception as e:
+        return ToolResult(output="", error=f"couldn't set the volume: {_human_err(e)}")
+    return ToolResult(output=f"Set the music volume to {target} percent.")
 
 
 async def pause(ctx) -> ToolResult:

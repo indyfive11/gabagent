@@ -116,6 +116,10 @@ class GabAgentConfig(BaseSettings):
     # it — the speech-duck drops it deeper, then restores to this cap. 100 disables. Slide down if VAD
     # tuning alone can't keep up. Env: GABAI_MEDIA_AMBIENT_CAP.
     media_ambient_cap: int = 90
+    # Floor for an absolute media-volume set (tidal.set_volume): clamp the requested level up to at
+    # least this % so "turn the music way down" can't ratchet to inaudible — to actually silence music
+    # the user pauses/stops it. Env: GABAI_MEDIA_VOLUME_FLOOR.
+    media_volume_floor: int = 5
     attestation: AttestationConfig = Field(default_factory=AttestationConfig)
     jellyfin: JellyfinConfig = Field(default_factory=JellyfinConfig)
     tidal: TidalConfig = Field(default_factory=TidalConfig)

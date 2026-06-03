@@ -340,6 +340,26 @@ def test_catalog_fuzzy_window_move_alias():
     assert cat.get("window.maximize") is None        # unrelated unknown id not hijacked
 
 
+def test_catalog_resolves_volume_set_alias():
+    """The model invents an absolute volume setter on the system provider (which only has relative
+    volume_up/down); those route to the stream-targeted tidal.set_volume, while real relative system
+    volume commands are left alone."""
+    from gabagent.commands.catalog import CommandCatalog
+    from gabagent.commands.model import Command, ShellBackend
+    cat = CommandCatalog()
+    setv = Command(id="tidal.set_volume", domain="media", summary="set music volume", tier=1,
+                   backend=ShellBackend(argv=["true"]))
+    voldn = Command(id="system.volume_down", domain="system", summary="system volume down", tier=1,
+                    backend=ShellBackend(argv=["true"]))
+    cat.add(setv)
+    cat.add(voldn)
+    for invented in ("system.set_volume_level", "system.set_volume", "media.set_volume",
+                     "audio.set_volume_to", "system.set_volume_percent"):
+        assert cat.get(invented) is setv, invented
+    assert cat.get("system.volume_down") is voldn    # real relative command untouched
+    assert cat.get("system.brightness_up") is None   # unrelated unknown not hijacked
+
+
 def test_clean_title_strips_year_and_quality_tags():
     from gabagent.commands.providers.desktop import _clean_title
     assert _clean_title("12 Angry Men (1957)") == "12 angry men"

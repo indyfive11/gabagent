@@ -186,6 +186,58 @@ def test_new_commands_registered_and_featured():
     assert cmds["tidal.playlists"].structured and cmds["tidal.recommendations"].structured
 
 
+def test_set_volume_registered_featured_and_typed():
+    cmds = {c.id: c for c in td.PROVIDER.commands(_ctx())}
+    assert "tidal.set_volume" in cmds and cmds["tidal.set_volume"].featured
+    lvl = next(s for s in cmds["tidal.set_volume"].params if s.name == "level")
+    assert lvl.type == "integer" and lvl.required
+
+
+@respx.mock
+async def test_set_volume_targets_stream_not_master_sink(monkeypatch):
+    """The absolute set must hit the Mopidy mixer AND the Mopidy sink-input — never the master sink
+    (@DEFAULT_SINK@), which would mute the assistant's own voice."""
+    seen = []
+    respx.post(RPC).mock(side_effect=lambda r: (seen.append(json.loads(r.content)["method"]),
+                         httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": None}))[1])
+    pactl_args = []
+    async def _fake_sink():
+        return ("677", 100)
+    async def _fake_pactl(*args, **kw):
+        pactl_args.append(args)
+        return (0, "")
+    monkeypatch.setattr("gabagent.voice.ducking._mopidy_sink_input", _fake_sink)
+    monkeypatch.setattr("gabagent.voice.ducking._run_pactl", _fake_pactl)
+
+    res = await td.set_volume(_ctx(), level=30)
+    assert res.success and "30 percent" in res.output
+    assert "core.mixer.set_volume" in seen                       # software mixer (the stream)
+    assert pactl_args == [("set-sink-input-volume", "677", "30%")]  # the stream's node, by index
+    assert all("@DEFAULT_SINK@" not in " ".join(a) for a in pactl_args)  # never the master sink
+
+
+@respx.mock
+async def test_set_volume_floor_clamps_and_validates(monkeypatch):
+    seen_vol = []
+    def _resp(r):
+        body = json.loads(r.content)
+        if body["method"] == "core.mixer.set_volume":
+            seen_vol.append(body["params"]["volume"])
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": None})
+    respx.post(RPC).mock(side_effect=_resp)
+    async def _none():
+        return None
+    monkeypatch.setattr("gabagent.voice.ducking._mopidy_sink_input", _none)
+    ctx = _ctx()
+    ctx.config.media_volume_floor = 5
+    # 0% is clamped up to the floor so music can't be ratcheted to silence
+    await td.set_volume(ctx, level=0)
+    assert seen_vol[-1] == 5
+    # a non-numeric level is a clean error, not a crash
+    bad = await td.set_volume(ctx, level="loud")
+    assert not bad.success and "number" in bad.error
+
+
 @respx.mock
 async def test_playlists_lists_saved_playlists():
     respx.post(RPC).mock(side_effect=_rpc_router({"core.playlists.as_list": [
