@@ -87,6 +87,28 @@ async def test_health(tmp_path):
         assert r.json() == {"status": "ok", "mode": "voice"}
 
 
+async def test_respond_logs_received_marker_and_turn_lifecycle(tmp_path):
+    # The `respond_recv` marker (fires even on a busy 409) + turn_start/turn_done bracket every turn, so a
+    # future freeze is localised: no respond_recv after a wake = voice never reached us; turn_start with no
+    # turn_done = the turn itself hung. (Diagnoses the close-movie freeze class.)
+    ctx = make_ctx(tmp_path, [["All done."]])           # no tools → quick done
+    ctx.voice_debug_path = tmp_path / "voice_debug.jsonl"
+    app = build_app(ctx)
+    async with _client(app) as client:
+        async with client.stream("POST", "/respond", json={"session_id": "s1", "text": "hello there"}) as resp:
+            await _drain(resp)
+    rows = []
+    for _ in range(50):                                  # turn_done fires in the task's finally, post-done
+        rows = [json.loads(l) for l in ctx.voice_debug_path.read_text().splitlines() if l.strip()]
+        if any(r["event"] == "turn_done" for r in rows):
+            break
+        await asyncio.sleep(0.02)
+    rr = next(r for r in rows if r["event"] == "respond_recv")
+    assert rr["busy"] is False and rr["words"] == 2
+    assert "turn_start" in {r["event"] for r in rows}
+    assert "dur_ms" in next(r for r in rows if r["event"] == "turn_done")
+
+
 async def test_respond_streams_tokens(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     proj = tmp_path / "proj"

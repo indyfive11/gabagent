@@ -1,3 +1,4 @@
+import asyncio
 import json
 import types
 import httpx
@@ -215,11 +216,37 @@ async def test_browser_control_pause_resume_stop():
     assert ctx.jellyfin_playing_page is page and ctx.jellyfin_paused is True
 
 
+@respx.mock
 async def test_browser_control_close_closes_owned_page():
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[]))
     page = _FakePlayPage()
     ctx = _ctx(); ctx.jellyfin_playing_page = page
     r = await jf.control(ctx, action="close")
     assert r.success and page._closed is True and ctx.jellyfin_playing_page is None
+    assert r.output == "Closed the movie window."          # nothing else playing → plain close
+
+
+@respx.mock
+async def test_close_warns_when_another_unowned_session_still_playing():
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "x", "NowPlayingItem": {"Name": "The Matrix"}, "PlayState": {"IsPaused": False}},
+    ]))
+    page = _FakePlayPage()
+    ctx = _ctx(); ctx.jellyfin_playing_page = page; ctx.jellyfin_playing_title = "You Only Live Twice"
+    r = await jf.control(ctx, action="close")
+    assert r.success and "another Jellyfin is still playing" in r.output
+
+
+@respx.mock
+async def test_close_quiet_when_only_just_closed_title_lingers():
+    # Our own just-closed movie can linger in /Sessions for a beat — that must NOT be reported as another player.
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "x", "NowPlayingItem": {"Name": "You Only Live Twice"}, "PlayState": {"IsPaused": False}},
+    ]))
+    page = _FakePlayPage()
+    ctx = _ctx(); ctx.jellyfin_playing_page = page; ctx.jellyfin_playing_title = "You Only Live Twice"
+    r = await jf.control(ctx, action="close")
+    assert r.success and r.output == "Closed the movie window."
 
 
 async def test_browser_control_movie_volume_adjusts_video_and_duck_prior():
@@ -394,3 +421,27 @@ async def test_control_exit_fullscreen_unowned_is_honest(monkeypatch):
     ctx = _ctx(); ctx.jellyfin_playing_page = None; ctx.jellyfin_playing_title = "Pulp Fiction"
     res = await jf.control(ctx, action="exit_fullscreen")
     assert res.success and "press Escape" in res.output    # honest about the player layer we can't drive
+
+
+async def test_page_eval_caps_a_hanging_evaluate(monkeypatch):
+    """A wedged renderer (right after page.close(), or when an app-close moved the audio sink) must not
+    hang the single shared voice loop — every page.evaluate is capped, falling back to a safe default."""
+    monkeypatch.setattr(jf, "_EVAL_TIMEOUT", 0.05)
+    class _HangPage:
+        async def evaluate(self, expr, arg=None):
+            await asyncio.sleep(5)                          # never returns within the cap
+    page = _HangPage()
+    assert await jf._page_eval(page, "() => 1", default="X") == "X"
+    assert await jf._video_paused(page) is None            # read → safe None, no hang
+    assert await jf._video_volume(page) is None
+    assert await jf._set_video_volume(page, 0.5) is False   # set → False (distinguishable from success)
+
+
+def test_live_jellyfin_page_none_after_close():
+    """A closed page is detected and the stale ref cleared, so no eval is ever attempted on a dead page."""
+    ctx = _ctx()
+    class _ClosedPage:
+        def is_closed(self): return True
+    ctx.jellyfin_playing_page = _ClosedPage()
+    assert jf._live_jellyfin_page(ctx) is None
+    assert ctx.jellyfin_playing_page is None                # cleared

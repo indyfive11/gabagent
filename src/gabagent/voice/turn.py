@@ -14,6 +14,7 @@ rather than forking the tool loop.
 from __future__ import annotations
 import asyncio
 import json
+import time
 from typing import AsyncIterator, TYPE_CHECKING
 
 from gabagent.api.models import ChatMessage
@@ -48,7 +49,10 @@ VOICE_ADDENDUM = (
     "you can't verify. Never state what's currently playing or the current state of anything from "
     "memory or assumption — CHECK it first (e.g. now_playing) before answering, because something you "
     "started earlier may since have been paused or stopped; don't say music is playing unless you just "
-    "verified it. Don't invent reasons for being slow or for anything you can't actually explain — say "
+    "verified it. When the user asks for several things in one breath (e.g. 'play some music and keep it "
+    "quiet'), do every part and mention each one you did — don't report only the last action. To change "
+    "how loud MUSIC is, use the music volume control, not the system volume. "
+    "Don't invent reasons for being slow or for anything you can't actually explain — say "
     "you're not sure rather than making up a cause. If a tool returns an error or says it couldn't do something, tell the user it "
     "didn't work — never say you did it. You can take a screenshot, but you can't see or read images: "
     "if asked what's on the screen, say you can capture it but can't look at it — never make up what it "
@@ -271,6 +275,10 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
     confirm (inside voice_approve's await) and resumes when /confirm resolves it.
     Always terminates the event stream with a `done`."""
     emit = ctx.voice_emit
+    # Turn lifecycle markers: a `turn_start` with no matching `turn_done` is the signature of a hang
+    # (model loop, tool, or page-eval) that left no other trace — the close-movie freeze had none of these.
+    _t0 = time.monotonic()
+    dlog(ctx, "turn_start", words=len(user_text.split()))
     try:
         mc = commands.detect_meta_command(user_text)
         if mc is not None:
@@ -449,6 +457,10 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             vs.queue.put_nowait(events.error(
                 cause, "Sorry, I had a brief hiccup — could you say that again?"))
             vs.queue.put_nowait(events.done())
+    finally:
+        # Fires on EVERY exit (meta return, normal done, cancel, error, fallback) — so the absence of a
+        # turn_done after a turn_start unambiguously localises a hang to this turn.
+        dlog(ctx, "turn_done", dur_ms=int((time.monotonic() - _t0) * 1000))
 
 
 def start_turn(ctx: AgentContext, vs, user_text: str) -> "asyncio.Task":

@@ -52,6 +52,28 @@ def test_dlog_drops_none_fields(tmp_path):
     assert "error" not in e and e["ok"] is True
 
 
+async def test_media_state_logs_per_provider_timing(tmp_path):
+    from gabagent.voice.ducking import media_state
+    ctx = _ctx(tmp_path)
+    ctx.config.tidal.enabled = False
+    ctx.config.jellyfin.api_key = ""           # both providers inert → no I/O
+    await media_state(ctx)
+    e = next(r for r in _read_lines(ctx.voice_debug_path) if r["event"] == "media_state")
+    assert "tidal_ms" in e and "jellyfin_ms" in e and e["state"] == "idle"
+
+
+async def test_duck_media_logs_begin_and_end(tmp_path):
+    from gabagent.voice.ducking import duck_media
+    ctx = _ctx(tmp_path)
+    ctx.config.tidal.enabled = False
+    ctx.config.jellyfin.api_key = ""
+    await duck_media(ctx, True, session_id="sess-x")
+    rows = _read_lines(ctx.voice_debug_path)
+    assert "duck_begin" in {r["event"] for r in rows}        # paired entry marker
+    end = next(r for r in rows if r["event"] == "duck")
+    assert end["on"] is True and "dur_ms" in end             # end marker with duration
+
+
 async def test_voice_approve_logs_tier_for_read(tmp_path):
     ctx = _ctx(tmp_path)
     assert await voice_approve("read_file", {"path": "x"}, ctx) is True

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import re
 import shutil
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -37,6 +38,11 @@ def _state(ctx) -> dict:
 
 async def duck_media(ctx, on: bool, session_id: str | None = None) -> dict:
     """Duck (on=True) or restore (on=False) any active media. Fire-and-forget; never raises."""
+    from gabagent.voice.debuglog import dlog
+    # `duck_begin` paired with the `duck` end event: a duck_begin with no duck means a provider duck hung
+    # (e.g. a page-eval on a dead movie page). dlog is self-guarding, so these never raise.
+    _t0 = time.monotonic()
+    dlog(ctx, "duck_begin", session=session_id, on=bool(on))
     ducked = []
     if await _duck_tidal(ctx, on):
         ducked.append("tidal")
@@ -46,10 +52,10 @@ async def duck_media(ctx, on: bool, session_id: str | None = None) -> dict:
     # actually fired can be joined with the voice-agent's DUCK log. On an `off`, "jellyfin" in `ducked`
     # means the restore succeeded; its absence means nothing was restored (the bug signature).
     try:
-        from gabagent.voice.debuglog import dlog
         st = _state(ctx)
         dlog(ctx, "duck", session=session_id, on=bool(on), ducked=ducked,
-             jellyfin_saved=st.get("jellyfin_video_volume"), tidal_prior=st.get("tidal_prior"))
+             jellyfin_saved=st.get("jellyfin_video_volume"), tidal_prior=st.get("tidal_prior"),
+             dur_ms=int((time.monotonic() - _t0) * 1000))
     except Exception:
         pass
     return {"ok": True, "ducked": ducked}
@@ -60,20 +66,41 @@ async def media_state(ctx) -> dict:
     design — NO brain-specific provider names (jellyfin/tidal/…) cross the brain↔voice protocol, so any
     brain can serve it and the voice side never learns what media the brain controls (see
     [[feedback-gabagent-brain-agnostic-protocol]]). Returns {"playing": bool, "state":
-    "playing"|"paused"|"idle"}. Never raises."""
+    "playing"|"paused"|"idle", "kind": "audio"|"video"|None}. `kind` is a generic media TYPE (not a
+    provider name) so the gate can avoid locking the user out of a video they're actively watching.
+    Never raises."""
+    _t0 = time.monotonic()
     tidal = await _tidal_state(ctx)
+    _t1 = time.monotonic()
     jellyfin = await _jellyfin_state(ctx)
+    _t2 = time.monotonic()
     playing = tidal == "playing" or jellyfin == "playing"
     state = "playing" if playing else ("paused" if "paused" in (tidal, jellyfin) else "idle")
+    # Generic media KIND — "audio"|"video"|None. Stays brain-agnostic (a media TYPE, not a provider name:
+    # any brain reports "video" for a movie), so it doesn't leak which provider is in play. Lets the voice
+    # gate skip gating a video the user is actively watching (the worst wake-lockout case — they can pause
+    # by hand). Prefer the actively-playing source; a paused one is the fallback; video outranks audio.
+    if jellyfin == "playing":
+        kind = "video"
+    elif tidal == "playing":
+        kind = "audio"
+    elif jellyfin == "paused":
+        kind = "video"
+    elif tidal == "paused":
+        kind = "audio"
+    else:
+        kind = None
     # Brain-internal debug only (NOT part of the neutral protocol response): record the per-source
     # breakdown so a "DUCK on SKIPPED (nothing playing)" can be explained — e.g. distinguishing a
-    # genuinely paused movie ("paused") from a closed page ("none"). Gated by the voice_debug flag.
+    # genuinely paused movie ("paused") from a closed page ("none"). The per-provider durations surface a
+    # slow/hanging state read (e.g. a wedged movie page-eval) directly on the poll. Gated by the flag.
     try:
         from gabagent.voice.debuglog import dlog
-        dlog(ctx, "media_state", playing=playing, state=state, tidal=tidal, jellyfin=jellyfin)
+        dlog(ctx, "media_state", playing=playing, state=state, kind=kind, tidal=tidal, jellyfin=jellyfin,
+             tidal_ms=int((_t1 - _t0) * 1000), jellyfin_ms=int((_t2 - _t1) * 1000))
     except Exception:
         pass
-    return {"playing": playing, "state": state}
+    return {"playing": playing, "state": state, "kind": kind}
 
 
 async def _tidal_state(ctx) -> str:

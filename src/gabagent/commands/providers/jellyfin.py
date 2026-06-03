@@ -124,6 +124,25 @@ async def _sessions(jc) -> list[dict]:
         return []
 
 
+async def _other_session_playing(jc, exclude_title: str = "") -> bool:
+    """True if some Jellyfin session is actively playing — used after closing our own window to be honest
+    that an unowned client is still going. Skips any session still showing the title we just closed (our
+    own session can linger in /Sessions for a moment after the page closes), so it won't false-positive on
+    the movie we just shut. Best-effort; never raises."""
+    want = exclude_title.strip().lower()
+    try:
+        for s in await _sessions(jc):
+            item = s.get("NowPlayingItem")
+            if not item or (s.get("PlayState") or {}).get("IsPaused"):
+                continue
+            if want and (item.get("Name") or "").strip().lower() == want:
+                continue          # our just-closed movie still settling — not a separate player
+            return True
+    except Exception:
+        return False
+    return False
+
+
 async def search(ctx, genre=None, min_rating=None, query=None, unwatched=False) -> ToolResult:
     jc = ctx.config.jellyfin
     if not jc.api_key:
@@ -168,7 +187,7 @@ async def _exit_fullscreen(ctx) -> ToolResult:
     page = _live_jellyfin_page(ctx)
     if page is not None:
         try:
-            await page.evaluate("() => { if (document.exitFullscreen) document.exitFullscreen(); }")
+            await _page_eval(page, "() => { if (document.exitFullscreen) document.exitFullscreen(); }")
             await page.keyboard.press("Escape")
         except Exception:
             pass
@@ -373,29 +392,38 @@ def _live_jellyfin_page(ctx):
 # Reading the real element state is what stops a manual "pause" and the speech-ducking from fighting:
 # both reconcile to the actual video, instead of guessing via a bool and a blind Space toggle.
 
-async def _video_paused(page) -> bool | None:
+# A page.evaluate() with no timeout can hang for as long as the renderer is unresponsive — e.g. right
+# after page.close(), or when closing another app moved the default audio sink and the page is wedged.
+# media_state and the speech-duck call these on the *single shared* voice event loop, so one hung eval
+# would freeze the whole brain. Cap every eval so it can't: on timeout OR error, return the safe default.
+_EVAL_TIMEOUT = 2.0
+
+
+async def _page_eval(page, script: str, arg=None, *, default=None, timeout: float | None = None):
+    # Resolve the timeout at call time (not bound as a default) so it stays tunable/monkeypatchable.
     try:
-        return await page.evaluate(
-            "() => { const v = document.querySelector('video'); return v ? v.paused : null; }")
+        return await asyncio.wait_for(page.evaluate(script, arg), timeout=timeout or _EVAL_TIMEOUT)
     except Exception:
-        return None
+        return default
+
+
+async def _video_paused(page) -> bool | None:
+    return await _page_eval(
+        page, "() => { const v = document.querySelector('video'); return v ? v.paused : null; }")
 
 
 async def _video_volume(page) -> float | None:
-    try:
-        return await page.evaluate(
-            "() => { const v = document.querySelector('video'); return v ? v.volume : null; }")
-    except Exception:
-        return None
+    return await _page_eval(
+        page, "() => { const v = document.querySelector('video'); return v ? v.volume : null; }")
 
 
 async def _set_video_volume(page, vol: float) -> bool:
-    try:
-        await page.evaluate(
-            "(vol) => { const v = document.querySelector('video'); if (v) v.volume = vol; }", vol)
-        return True
-    except Exception:
-        return False
+    # The JS returns true on success so a timeout/error (default False) is distinguishable from a real set.
+    ok = await _page_eval(
+        page,
+        "(vol) => { const v = document.querySelector('video'); if (v) { v.volume = vol; return true; } return false; }",
+        vol, default=False)
+    return bool(ok)
 
 
 async def _browser_control(ctx, page, action) -> ToolResult:
@@ -404,11 +432,12 @@ async def _browser_control(ctx, page, action) -> ToolResult:
             # Reliably pause (video.pause() needs no user gesture, unlike resume) and drop the player
             # out of fullscreen — but keep the window open. Escape alone (the old behavior) didn't
             # actually halt playback.
-            await page.evaluate("() => { const v = document.querySelector('video'); if (v) v.pause(); }")
+            await _page_eval(page, "() => { const v = document.querySelector('video'); if (v) v.pause(); }")
             await page.keyboard.press("Escape")
             ctx.jellyfin_paused = True
             return ToolResult(output="Paused the movie and came out of fullscreen.")
         if action == "close":
+            closed_title = (getattr(ctx, "jellyfin_playing_title", None) or "")
             try:
                 await page.close()
             except Exception:
@@ -416,6 +445,11 @@ async def _browser_control(ctx, page, action) -> ToolResult:
             ctx.jellyfin_playing_page = None
             ctx.jellyfin_paused = False
             ctx.jellyfin_playing_title = None
+            # Honesty: I only closed the window I opened. If a DIFFERENT (unowned) Jellyfin session is
+            # still playing, say so rather than implying everything stopped (a real live miss — Rob heard
+            # "closed" while a separate Chrome kept playing).
+            if await _other_session_playing(ctx.config.jellyfin, exclude_title=closed_title):
+                return ToolResult(output="I closed the window I opened, but another Jellyfin is still playing.")
             return ToolResult(output="Closed the movie window.")
         if action in ("volume_up", "volume_down"):
             cur = await _video_volume(page)

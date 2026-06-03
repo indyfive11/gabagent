@@ -105,7 +105,7 @@ class _FakeVideoPage:
         self.volume = volume; self.paused = paused; self._closed = False
     def is_closed(self): return self._closed
     async def evaluate(self, expr, arg=None):
-        if "v.volume = vol" in expr: self.volume = arg; return None
+        if "v.volume = vol" in expr: self.volume = arg; return True   # set-JS returns true on success
         if "v.paused" in expr: return self.paused
         if "v.volume" in expr: return self.volume
         return None
@@ -178,7 +178,7 @@ async def test_media_state_browser_playing_and_music():
     ctx = _ctx(tidal=True, jellyfin=True)
     respx.post(RPC).mock(side_effect=_mopidy([], state="playing"))
     ctx.jellyfin_playing_page = _FakeVideoPage(paused=False)
-    assert await media_state(ctx) == {"playing": True, "state": "playing"}
+    assert await media_state(ctx) == {"playing": True, "state": "playing", "kind": "video"}
 
 
 @respx.mock
@@ -187,7 +187,15 @@ async def test_media_state_paused_video_stopped_music():
     ctx = _ctx(tidal=True, jellyfin=True)
     respx.post(RPC).mock(side_effect=_mopidy([], state="stopped"))
     ctx.jellyfin_playing_page = _FakeVideoPage(paused=True)
-    assert await media_state(ctx) == {"playing": False, "state": "paused"}
+    assert await media_state(ctx) == {"playing": False, "state": "paused", "kind": "video"}
+
+
+@respx.mock
+async def test_media_state_kind_audio_when_only_music_plays():
+    from gabagent.voice.ducking import media_state
+    ctx = _ctx(tidal=True, jellyfin=False)
+    respx.post(RPC).mock(side_effect=_mopidy([], state="playing"))
+    assert await media_state(ctx) == {"playing": True, "state": "playing", "kind": "audio"}
 
 
 @respx.mock
@@ -196,21 +204,22 @@ async def test_media_state_nothing_playing():
     ctx = _ctx(tidal=False, jellyfin=True)
     respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[]))
     st = await media_state(ctx)
-    assert st == {"playing": False, "state": "idle"}
+    assert st == {"playing": False, "state": "idle", "kind": None}
 
 
 @respx.mock
 async def test_media_state_is_provider_neutral():
-    # PHILOSOPHY GUARD: the brain↔voice protocol must not leak brain-specific provider names. If a new
-    # provider is added, the /media/state shape must stay generic (aggregate), never grow per-provider
-    # keys — otherwise a different brain stops being pluggable.
+    # PHILOSOPHY GUARD: the brain↔voice protocol must not leak brain-specific PROVIDER names. The shape
+    # stays generic (aggregate) — `kind` is a generic media TYPE ("audio"/"video"), which any brain could
+    # report, NOT a provider — so a different brain stays pluggable.
     from gabagent.voice.ducking import media_state
     ctx = _ctx(tidal=True, jellyfin=True)
     respx.post(RPC).mock(side_effect=_mopidy([], state="playing"))
     ctx.jellyfin_playing_page = _FakeVideoPage(paused=False)
     st = await media_state(ctx)
-    assert set(st.keys()) <= {"playing", "state"}              # neutral keys only
-    assert not any(k in str(st).lower() for k in ("jellyfin", "tidal", "mopidy", "video"))
+    assert set(st.keys()) <= {"playing", "state", "kind"}          # generic keys only
+    assert st["kind"] in ("audio", "video", None)                  # a media type, not a provider
+    assert not any(k in str(st).lower() for k in ("jellyfin", "tidal", "mopidy"))  # no provider names
 
 
 # -- music duck: belt-and-suspenders PipeWire sink-input (the reliably-audible system node) ---------

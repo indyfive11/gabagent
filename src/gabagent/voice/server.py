@@ -60,11 +60,16 @@ def build_app(ctx: AgentContext):
         sid = body.get("session_id", "default")
         text = body.get("text", "")
         vs = get_session(sid)
-        if _busy(vs):
+        ctx.voice_session = vs
+        # Marks that the brain RECEIVED an utterance — fires even on a 409 busy (no turn_start follows
+        # then). Its ABSENCE after a wake means the voice side never reached us (the close-freeze pattern).
+        from gabagent.voice.debuglog import dlog
+        busy = _busy(vs)
+        dlog(ctx, "respond_recv", session=sid, words=len(text.split()), busy=busy)
+        if busy:
             return JSONResponse(
                 {"error": "a turn is already in progress for this session"}, status_code=409
             )
-        ctx.voice_session = vs
         start_turn(ctx, vs, text)
         return _sse(drain(vs))
 
