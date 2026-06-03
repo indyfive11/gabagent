@@ -48,7 +48,8 @@ VOICE_ADDENDUM = (
     "you can't verify. Never state what's currently playing or the current state of anything from "
     "memory or assumption — CHECK it first (e.g. now_playing) before answering, because something you "
     "started earlier may since have been paused or stopped; don't say music is playing unless you just "
-    "verified it. If a tool returns an error or says it couldn't do something, tell the user it "
+    "verified it. Don't invent reasons for being slow or for anything you can't actually explain — say "
+    "you're not sure rather than making up a cause. If a tool returns an error or says it couldn't do something, tell the user it "
     "didn't work — never say you did it. You can take a screenshot, but you can't see or read images: "
     "if asked what's on the screen, say you can capture it but can't look at it — never make up what it "
     "shows or do an unrelated action instead. You can list the screens/monitors (list_screens) but not "
@@ -406,6 +407,29 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             vs.queue.put_nowait(events.done())
         raise
     except Exception as e:
+        # Last-ditch G6 fallback (the reliable one — the in-loop guard wasn't catching the
+        # escalate-after-tool path live). An escalated turn that died on a transient gab.ai
+        # 'inference_failed' gets ONE plain arya narration of the current state — no tools, no
+        # re-execution (the file/tool already ran) — instead of speaking "[gab.ai error]".
+        _simple = ctx.config.router.simple_model
+        if (not ctx.local_mode and vs.queue is not None
+                and (ctx.active_model or _simple) != _simple
+                and _is_transient_generation_error(e)):
+            try:
+                ctx.active_model = _simple
+                ctx.voice_announced_model = _simple
+                msgs = _build_voice_messages(ctx, ctx.session.messages())
+                text = await ctx.client.complete_simple(msgs, model=_simple)
+                if text and text.strip():
+                    dlog(ctx, "fallback", to=_simple, reason="inference_failed", level="turn")
+                    sf = SpeakableFilter(code_notice=commands.filler("code", ctx))
+                    await _emit_filtered(sf, sf.feed(text), emit)
+                    await _emit_filtered(sf, sf.flush(), emit)
+                    ctx.session.append_message(ChatMessage(role="assistant", content=text))
+                    vs.queue.put_nowait(events.done())
+                    return
+            except Exception:
+                pass  # arya also failed → fall through to the graceful error below
         cause = f"{type(e).__name__}: {e}".strip()
         # Persist a full traceback for diagnosis (mirrors the TUI crash path in cli.py).
         try:

@@ -298,3 +298,31 @@ def test_addendum_has_shutdown_and_sleep_honesty():
     assert "can't see or read images" in a or "can't look at it" in a
     # And it must verify current playback before claiming it (the "I'm playing My Mix 3" hallucination).
     assert "now_playing" in a and "from memory or assumption" in a
+    # And it must not fabricate reasons for being slow (the "reconciling recent playback commands" excuse).
+    assert "don't invent reasons for being slow" in a
+
+
+class _EscTextThenFail:
+    """Escalated model emits a token then dies (inference_failed) — the in-loop guard won't replay
+    after speech, so the error reaches the OUTER handler with the model still escalated. arya's
+    complete_simple then narrates. Mirrors the live escalate-after-tool failure shape."""
+    def __init__(self): self.model = "arya"
+    async def stream_complete(self, messages, tools=None, model=None, retry_model=None,
+                              fallback_model=None, **kw):
+        if model and model != "arya":
+            yield "Uh "
+            raise RuntimeError("APIError: The model failed to generate a response. "
+                               "code: 'inference_failed'")
+        yield "(unused)"
+    async def complete_simple(self, messages, model=None):
+        return "I've created the file for you."
+
+
+async def test_escalation_failure_outer_belt_narrates_on_arya(home):
+    ctx = make_ctx(home, [])
+    ctx.client = _EscTextThenFail()
+    ctx.active_model = "claude-sonnet-4-5"                 # escalated turn
+    evs = await run_turn(ctx, "write a file")
+    text = "".join(e.text for e in evs if e.type == "token")
+    assert "created the file" in text                     # arya narrated via the outer belt
+    assert not any(e.type == "error" for e in evs)        # no "[gab.ai error]" spoken
