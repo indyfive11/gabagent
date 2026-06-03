@@ -9,6 +9,15 @@ from gabagent.commands.providers import tidal as td
 
 RPC = "http://mopidy.test:6680/mopidy/rpc"
 
+
+@pytest.fixture(autouse=True)
+def _no_ambient_cap(monkeypatch):
+    """Don't let play's ambient-cap hook touch real system audio (pactl) or perturb the asserted RPC
+    sequence — stub it. The ambient cap's own behavior is covered in test_ducking."""
+    async def _noop(ctx):
+        return None
+    monkeypatch.setattr("gabagent.voice.ducking.apply_ambient_cap", _noop)
+
 _TRACK = {
     "__model__": "Track", "uri": "tidal:track:1", "name": "So What",
     "artists": [{"name": "Miles Davis"}], "album": {"name": "Kind of Blue"}, "length": 540000,

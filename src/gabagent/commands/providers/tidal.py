@@ -228,6 +228,16 @@ async def search(ctx, query="", limit=8) -> ToolResult:
     return ToolResult(output=json.dumps(tracks + albums))
 
 
+async def _hold_ambient(ctx) -> None:
+    """Cap the just-started music at the ambient ceiling so VAD can hear the user over it. Best-effort
+    (local import to avoid a cycle with the voice layer)."""
+    try:
+        from gabagent.voice.ducking import apply_ambient_cap
+        await apply_ambient_cap(ctx)
+    except Exception:
+        pass
+
+
 async def play(ctx, query="", uri="", album=False) -> ToolResult:
     tc = ctx.config.tidal
     # Container intent: a whole album/playlist/mix, not a single track. `album=true` with a query
@@ -256,6 +266,7 @@ async def play(ctx, query="", uri="", album=False) -> ToolResult:
         await _play_uris(tc, [uri])
     except Exception as e:
         return ToolResult(output="", error=f"couldn't play that: {_human_err(e)}")
+    await _hold_ambient(ctx)
     return ToolResult(output=f"Playing {label} on TIDAL." if label else "Playing on TIDAL.")
 
 
@@ -284,6 +295,7 @@ async def _play_container(ctx, tc, query="", uri="", album=False) -> ToolResult:
         await _play_uris(tc, uris)
     except Exception as e:
         return ToolResult(output="", error=f"couldn't play that {noun}: {_human_err(e)}")
+    await _hold_ambient(ctx)
     return ToolResult(output=f"Playing the {noun} {label} on TIDAL." if label
                       else f"Playing that {noun} on TIDAL.")
 

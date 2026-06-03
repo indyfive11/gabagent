@@ -259,15 +259,58 @@ async def test_duck_tidal_sink_noop_when_no_mopidy_stream(monkeypatch):
     assert _dk._state(ctx)["tidal_sink_prior"] is None        # nothing to duck → no state saved
 
 
-async def test_duck_tidal_sink_stranded_low_restores_full(monkeypatch):
-    """Sink-input already at/below the duck level (leftover from a restart mid-duck) → save FULL as the
-    restore target, not the stranded 18% (mirrors the video stranded-0.2 guard)."""
+async def test_duck_tidal_sink_stranded_low_restores_to_cap(monkeypatch):
+    """Sink-input already at/below the duck level (leftover from a restart mid-duck) → save the ambient
+    cap as the restore target, not the stranded 18% (mirrors the video stranded-0.2 guard)."""
     async def fake_pactl(*args, **k):
         if args and args[0] == "list":
             return (0, 'Sink Input #3\n\tVolume: front-left: 11796 / 18% / -20 dB\n'
                        '\tProperties:\n\t\tapplication.name = "Mopidy"\n')
         return (0, "")
     monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
-    ctx = types.SimpleNamespace()
+    ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=90))
     await _dk._duck_tidal_sink(ctx, True)
-    assert _dk._state(ctx)["tidal_sink_prior"] == ("3", 100)   # full, not the stranded 18
+    assert _dk._state(ctx)["tidal_sink_prior"] == ("3", 90)    # the cap, not the stranded 18 or full 100
+
+
+# -- ambient cap: hold playing music at a ceiling so VAD can hear the user over it -----------------
+
+async def test_apply_ambient_cap_lowers_only(monkeypatch):
+    calls = []
+    async def fake_pactl(*a, **k):
+        if a and a[0] == "list":
+            return (0, 'Sink Input #9\n\tVolume: front-left: 65536 / 100% / 0 dB\n'
+                       '\tProperties:\n\t\tapplication.name = "Mopidy"\n')
+        calls.append(a); return (0, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    import gabagent.commands.providers.tidal as td
+    seen = []
+    async def fake_rpc(tc, method, params=None, timeout=2.0):
+        seen.append((method, params)); return 100 if method == "core.mixer.get_volume" else None
+    monkeypatch.setattr(td, "_rpc", fake_rpc)
+    ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=90))
+    await _dk.apply_ambient_cap(ctx)
+    assert ("core.mixer.set_volume", {"volume": 90}) in seen     # mixer lowered to the cap
+    assert ("set-sink-input-volume", "9", "90%") in calls         # sink lowered to the cap
+
+
+async def test_apply_ambient_cap_disabled_at_100(monkeypatch):
+    calls = []
+    async def fake_pactl(*a, **k): calls.append(a); return (1, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=100))
+    await _dk.apply_ambient_cap(ctx)
+    assert calls == []                                            # cap=100 disables → no system calls
+
+
+@respx.mock
+async def test_duck_tidal_restore_caps_above_ambient():
+    """Music ducked from a pre-cap 100 restores to the 90% ambient cap, not back to 100."""
+    ctx = _ctx(tidal=True, jellyfin=False)               # media_ambient_cap defaults to 90
+    seen = []
+    respx.post(RPC).mock(side_effect=_mopidy(seen, vol=100))
+    await duck_media(ctx, True)                           # save 100, duck to 18
+    seen.clear()
+    await duck_media(ctx, False)                          # restore → min(100, 90) = 90
+    assert ("core.mixer.set_volume", {"volume": 90}) in seen
+    assert ("core.mixer.set_volume", {"volume": 100}) not in seen

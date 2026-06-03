@@ -112,6 +112,10 @@ class GabAgentConfig(BaseSettings):
     voice_arm_seconds: int = 120
     voice_debug_log: bool = False  # opt-in per-turn brain-side debug log (keyed by session_id)
     commands_enabled: bool = True  # voice command framework (capability discovery + run_command)
+    # Hold playing music at this % cap continuously (not just on speech) so VAD can hear the user over
+    # it — the speech-duck drops it deeper, then restores to this cap. 100 disables. Slide down if VAD
+    # tuning alone can't keep up. Env: GABAI_MEDIA_AMBIENT_CAP.
+    media_ambient_cap: int = 90
     attestation: AttestationConfig = Field(default_factory=AttestationConfig)
     jellyfin: JellyfinConfig = Field(default_factory=JellyfinConfig)
     tidal: TidalConfig = Field(default_factory=TidalConfig)

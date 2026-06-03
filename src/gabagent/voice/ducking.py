@@ -151,6 +151,38 @@ async def _mopidy_sink_input() -> tuple[str, int | None] | None:
     return _parse_mopidy_sink_input(out)
 
 
+def _ambient_cap(ctx) -> int:
+    """The % ceiling to hold playing music at continuously (config media_ambient_cap, default 90).
+    100 disables the ambient cap. Clamped to a sane range."""
+    try:
+        c = int(getattr(ctx.config, "media_ambient_cap", 90))
+    except Exception:
+        c = 90
+    return max(1, min(100, c))
+
+
+async def apply_ambient_cap(ctx) -> None:
+    """Cap currently-playing music at the ambient ceiling (lower only, never raise) so VAD can hear the
+    user over it. Called when music starts; the speech-duck drops it further and restores to this cap.
+    Best-effort on both the Mopidy software mixer and the PipeWire sink-input. Never raises."""
+    cap = _ambient_cap(ctx)
+    if cap >= 100:
+        return
+    tc = getattr(ctx.config, "tidal", None)
+    try:
+        if tc and getattr(tc, "enabled", False):
+            from gabagent.commands.providers.tidal import _rpc
+            vol = await _rpc(tc, "core.mixer.get_volume", timeout=2.0)
+            if vol is not None and int(vol) > cap:
+                await _rpc(tc, "core.mixer.set_volume", {"volume": cap}, timeout=2.0)
+        found = await _mopidy_sink_input()
+        if found and found[1] is not None and found[1] > cap:
+            await _run_pactl("set-sink-input-volume", found[0], f"{cap}%")
+        _tidal_dlog(ctx, phase="ambient_cap", cap=cap)
+    except Exception:
+        pass
+
+
 async def _duck_tidal_sink(ctx, on: bool) -> None:
     """Belt-and-suspenders for the music duck: also attenuate the Mopidy stream at the SYSTEM node
     (PipeWire sink-input). Mopidy's software mixer proved intermittently inaudible (value changes but
@@ -166,9 +198,10 @@ async def _duck_tidal_sink(ctx, on: bool) -> None:
                 return
             idx, vol = found
             prior = vol if vol is not None else 100
+            cap = _ambient_cap(ctx)
             # Don't strand the music low across a brain restart: if it's already at/below the duck
-            # level, that's almost certainly a leftover duck, not a real user level — restore to full.
-            st["tidal_sink_prior"] = (idx, 100 if prior <= _SINK_DUCK_PCT else prior)
+            # level, that's almost certainly a leftover duck, not a real user level — restore to the cap.
+            st["tidal_sink_prior"] = (idx, cap if prior <= _SINK_DUCK_PCT else prior)
             await _run_pactl("set-sink-input-volume", idx, f"{_SINK_DUCK_PCT}%")
             _tidal_dlog(ctx, phase="sink_on", sink_idx=idx, sink_prior=vol, ducked_to=_SINK_DUCK_PCT)
             return
@@ -176,10 +209,11 @@ async def _duck_tidal_sink(ctx, on: bool) -> None:
         if not saved:
             return
         idx, prior = saved
+        target = min(int(prior), _ambient_cap(ctx))   # restore to the cap (a ceiling), never above it
         cur = await _mopidy_sink_input()      # re-find: the stream/index may have changed
         tgt_idx = cur[0] if cur else idx
-        await _run_pactl("set-sink-input-volume", tgt_idx, f"{int(prior)}%")
-        _tidal_dlog(ctx, phase="sink_off", sink_idx=tgt_idx, restored_to=int(prior))
+        await _run_pactl("set-sink-input-volume", tgt_idx, f"{target}%")
+        _tidal_dlog(ctx, phase="sink_off", sink_idx=tgt_idx, restored_to=target)
         st["tidal_sink_prior"] = None
     except Exception:
         pass
@@ -211,7 +245,7 @@ async def _duck_tidal(ctx, on: bool) -> bool:
             return True
         if st["tidal_prior"] is None:
             return False
-        target = int(st["tidal_prior"])
+        target = min(int(st["tidal_prior"]), _ambient_cap(ctx))   # restore to the cap, never above it
         await _rpc(tc, "core.mixer.set_volume", {"volume": target}, timeout=2.0)
         await _duck_tidal_sink(ctx, False)      # restore the system node alongside the mixer
         if _debug_on(ctx):   # the post-restore read-back is only worth its 2 RPCs while investigating
