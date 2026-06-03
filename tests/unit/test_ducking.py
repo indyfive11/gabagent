@@ -1,10 +1,21 @@
 import json
 import types
 import httpx
+import pytest
 import respx
 
 from gabagent.config.models import GabAgentConfig
+from gabagent.voice import ducking as _dk
 from gabagent.voice.ducking import duck_media
+
+
+@pytest.fixture(autouse=True)
+def _no_real_pactl(monkeypatch):
+    """Never touch real system audio in tests — stub pactl so the sink-input duck no-ops by default
+    (rc=1 → _mopidy_sink_input None). Explicit sink tests override this."""
+    async def _fake(*a, **k):
+        return (1, "")
+    monkeypatch.setattr(_dk, "_run_pactl", _fake)
 
 RPC = "http://mopidy.test:6680/mopidy/rpc"
 BASE = "http://jf.test:8096"
@@ -200,3 +211,63 @@ async def test_media_state_is_provider_neutral():
     st = await media_state(ctx)
     assert set(st.keys()) <= {"playing", "state"}              # neutral keys only
     assert not any(k in str(st).lower() for k in ("jellyfin", "tidal", "mopidy", "video"))
+
+
+# -- music duck: belt-and-suspenders PipeWire sink-input (the reliably-audible system node) ---------
+
+def test_parse_mopidy_sink_input():
+    from gabagent.voice.ducking import _parse_mopidy_sink_input
+    out = (
+        'Sink Input #5\n'
+        '\tVolume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100%\n'
+        '\tProperties:\n\t\tapplication.name = "Firefox"\n'
+        'Sink Input #12\n'
+        '\tVolume: front-left: 45000 / 69% / -3.00 dB\n'
+        '\tProperties:\n\t\tapplication.name = "Mopidy"\n'
+    )
+    assert _parse_mopidy_sink_input(out) == ("12", 69)        # picks the Mopidy stream, parses %
+    assert _parse_mopidy_sink_input("nothing here") is None
+
+
+async def test_duck_tidal_sink_ducks_then_restores(monkeypatch):
+    calls = []
+    list_out = ('Sink Input #7\n\tVolume: front-left: 58000 / 90% / -1.0 dB\n'
+                '\tProperties:\n\t\tapplication.name = "Mopidy"\n')
+    async def fake_pactl(*args, **k):
+        calls.append(args)
+        return (0, list_out) if args and args[0] == "list" else (0, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+
+    ctx = types.SimpleNamespace()
+    await _dk._duck_tidal_sink(ctx, True)
+    st = _dk._state(ctx)
+    assert st["tidal_sink_prior"] == ("7", 90)                # saved real prior
+    assert ("set-sink-input-volume", "7", "18%") in calls     # ducked the system node
+
+    calls.clear()
+    await _dk._duck_tidal_sink(ctx, False)
+    assert st["tidal_sink_prior"] is None
+    assert ("set-sink-input-volume", "7", "90%") in calls     # restored to the saved prior
+
+
+async def test_duck_tidal_sink_noop_when_no_mopidy_stream(monkeypatch):
+    async def fake_pactl(*args, **k):
+        return (0, 'Sink Input #1\n\tProperties:\n\t\tapplication.name = "Firefox"\n')
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    ctx = types.SimpleNamespace()
+    await _dk._duck_tidal_sink(ctx, True)
+    assert _dk._state(ctx)["tidal_sink_prior"] is None        # nothing to duck → no state saved
+
+
+async def test_duck_tidal_sink_stranded_low_restores_full(monkeypatch):
+    """Sink-input already at/below the duck level (leftover from a restart mid-duck) → save FULL as the
+    restore target, not the stranded 18% (mirrors the video stranded-0.2 guard)."""
+    async def fake_pactl(*args, **k):
+        if args and args[0] == "list":
+            return (0, 'Sink Input #3\n\tVolume: front-left: 11796 / 18% / -20 dB\n'
+                       '\tProperties:\n\t\tapplication.name = "Mopidy"\n')
+        return (0, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    ctx = types.SimpleNamespace()
+    await _dk._duck_tidal_sink(ctx, True)
+    assert _dk._state(ctx)["tidal_sink_prior"] == ("3", 100)   # full, not the stranded 18
