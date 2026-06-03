@@ -287,8 +287,14 @@ async def test_no_fallback_after_text_emitted(home):
 
 # -- C: shutdown honesty lives in the prompt -------------------------------------------------------
 
-def test_addendum_has_shutdown_honesty():
+def test_addendum_has_shutdown_and_sleep_honesty():
     from gabagent.voice.turn import VOICE_ADDENDUM
     a = VOICE_ADDENDUM.lower()
-    assert "cannot end" in a and "shut down voice mode" in a
-    assert "do not say you're doing it" in a or "do not say you’re doing it" in a
+    # Distinguishes shutdown from the sleep (mute/pause) escape hatch, and speaks first-person.
+    assert "shut down voice mode" in a            # full stop
+    assert "go to sleep" in a and "stop listening" in a   # mute/pause → sleep
+    assert "first person" in a and "never 'yourself'" in a
+    # And it knows it can't read images (screenshot honesty).
+    assert "can't see or read images" in a or "can't look at it" in a
+    # And it must verify current playback before claiming it (the "I'm playing My Mix 3" hallucination).
+    assert "now_playing" in a and "from memory or assumption" in a
