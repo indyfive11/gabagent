@@ -3,11 +3,22 @@ from __future__ import annotations
 from gabagent.commands.model import Command
 
 # Plausible-but-wrong ids the model reliably guesses → the real command. Saves a wasted
-# unknown-command turn + list_capabilities recovery (e.g. it kept inventing `window.move_window`).
+# unknown-command turn + list_capabilities recovery (e.g. it kept inventing `window.move_window`,
+# `window.move_window_to_screen`, …). Fuzzy families are handled in get() below.
 _ID_ALIASES = {
     "window.move_window": "window.to_screen",
     "window.move": "window.to_screen",
 }
+
+
+def _fuzzy_alias(command_id: str) -> str | None:
+    """Map a whole FAMILY of invented ids to the real one (the model riffs on names — move_window,
+    move_window_to_screen, move_to_monitor, …). Conservative: only well-known hallucination shapes."""
+    cid = command_id.lower()
+    if cid.startswith(("window.", "desktop.")) and "move" in cid and (
+            "screen" in cid or "monitor" in cid or "window" in cid or "display" in cid):
+        return "window.to_screen"
+    return None
 
 
 class CommandCatalog:
@@ -18,7 +29,11 @@ class CommandCatalog:
         self._cmds[cmd.id] = cmd
 
     def get(self, command_id: str) -> Command | None:
-        return self._cmds.get(command_id) or self._cmds.get(_ID_ALIASES.get(command_id, ""))
+        c = self._cmds.get(command_id)
+        if c:
+            return c
+        alias = _ID_ALIASES.get(command_id) or _fuzzy_alias(command_id)
+        return self._cmds.get(alias) if alias else None
 
     def all(self) -> list[Command]:
         return list(self._cmds.values())

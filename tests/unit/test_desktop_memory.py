@@ -324,3 +324,68 @@ def test_catalog_resolves_window_move_alias():
     assert cat.get("window.move_window") is cmd     # alias resolves
     assert cat.get("window.to_screen") is cmd       # real id still works
     assert cat.get("window.bogus") is None          # unknown still None
+
+
+def test_catalog_fuzzy_window_move_alias():
+    """The model riffs on window-move names; the whole family resolves to window.to_screen."""
+    from gabagent.commands.catalog import CommandCatalog
+    from gabagent.commands.model import Command, ShellBackend
+    cat = CommandCatalog()
+    cmd = Command(id="window.to_screen", domain="window", summary="move it", tier=1,
+                  backend=ShellBackend(argv=["true"]))
+    cat.add(cmd)
+    for invented in ("window.move_window", "window.move_window_to_screen",
+                     "window.move_to_monitor", "window.move", "desktop.move_window_to_display"):
+        assert cat.get(invented) is cmd, invented
+    assert cat.get("window.maximize") is None        # unrelated unknown id not hijacked
+
+
+def test_clean_title_strips_year_and_quality_tags():
+    from gabagent.commands.providers.desktop import _clean_title
+    assert _clean_title("12 Angry Men (1957)") == "12 angry men"
+    assert _clean_title("The Matrix [1080p] [YTS]") == "the matrix"
+    assert _clean_title("Inception") == "inception"
+
+
+async def test_movie_hint_uses_stored_title_for_unowned_window():
+    import types
+    from gabagent.commands.providers import desktop as d
+    ctx = types.SimpleNamespace(jellyfin_playing_page=None, jellyfin_playing_title="12 Angry Men (1957)")
+    assert await d._movie_window_hint(ctx) == "12 angry men"   # works with NO owned page (REST/unowned)
+
+
+async def test_to_screen_targets_unowned_movie_by_stored_title(monkeypatch):
+    import types
+    from gabagent.commands.providers import desktop as d
+    captured = {}
+    async def fake_script(js): captured["js"] = js; return True
+    monkeypatch.setattr(d, "_run_kwin_script", fake_script)
+    monkeypatch.setattr(d, "_kscreen_outputs", lambda: _aw(_FAKE_SCREENS))
+    ctx = types.SimpleNamespace(jellyfin_playing_page=None, jellyfin_playing_title="12 Angry Men",
+                                config=types.SimpleNamespace(desktop=types.SimpleNamespace(screen_aliases={})))
+    res = await d.to_screen(ctx, screen="DP-1")
+    assert res.success and "movie" in res.output
+    assert "windowList" in captured["js"] and json.dumps("12 angry men") in captured["js"]
+
+
+async def test_fullscreen_targets_movie_window_when_playing(monkeypatch):
+    import types
+    from gabagent.commands.providers import desktop as d
+    captured = {}
+    async def fake_script(js): captured["js"] = js; return True
+    monkeypatch.setattr(d, "_run_kwin_script", fake_script)
+    ctx = types.SimpleNamespace(jellyfin_playing_page=None, jellyfin_playing_title="12 Angry Men")
+    res = await d.fullscreen(ctx)
+    assert res.success and "movie" in res.output
+    assert "fullScreen=true" in captured["js"] and json.dumps("12 angry men") in captured["js"]
+
+
+async def test_fullscreen_falls_back_to_shortcut_without_movie(monkeypatch):
+    import types
+    from gabagent.commands.providers import desktop as d
+    ran = []
+    async def fake_run(argv, timeout=5.0): ran.append(argv); return (0, "")
+    monkeypatch.setattr(d, "_run", fake_run)
+    ctx = types.SimpleNamespace(jellyfin_playing_page=None, jellyfin_playing_title=None)
+    res = await d.fullscreen(ctx)
+    assert res.success and any("Window Fullscreen" in a for a in ran[0])   # global shortcut path

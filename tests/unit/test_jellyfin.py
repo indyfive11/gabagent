@@ -307,3 +307,51 @@ async def test_play_confirm_dedups_identical_device_names():
     await jf.play(ctx, item_id="abc")
     assert "Chrome or Chrome" not in seen["text"]
     assert seen["text"].count("Chrome") == 1
+
+
+def test_now_playing_command_published():
+    cmds = {c.id for c in jf.PROVIDER.commands(_ctx())}
+    assert "jellyfin.now_playing" in cmds            # real command (model used to invent this id)
+
+
+@respx.mock
+async def test_now_playing_reports_title():
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"NowPlayingItem": {"Name": "The Dark Knight"}, "PlayState": {"IsPaused": False}},
+    ]))
+    res = await jf.now_playing(_ctx(api_key="k"))
+    assert res.success and "The Dark Knight" in res.output and "Playing" in res.output
+
+
+@respx.mock
+async def test_now_playing_nothing():
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[]))
+    res = await jf.now_playing(_ctx(api_key="k"))
+    assert "Nothing is playing" in res.output
+
+
+@respx.mock
+async def test_play_existing_session_stores_title_for_window_targeting():
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "tv1", "SupportsRemoteControl": True, "DeviceName": "Chrome"},
+    ]))
+    respx.post(f"{BASE}/Sessions/tv1/Playing").mock(return_value=httpx.Response(204))
+    ctx = _ctx()
+    vs = VoiceSession("s", None); ctx.voice_session = vs
+    async def emit(ev):
+        if ev.type == "confirm": vs.resolve(ev.id, True)   # yes, use the open Chrome (unowned)
+    ctx.voice_emit = emit
+    res = await jf.play(ctx, item_id="abc", title="12 Angry Men")
+    assert res.success
+    assert ctx.jellyfin_playing_title == "12 Angry Men"   # stored so window-ops can target the window
+
+
+@respx.mock
+async def test_control_stop_clears_playing_title():
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "s1", "NowPlayingItem": {"Name": "X"}, "SupportsRemoteControl": True},
+    ]))
+    respx.post(f"{BASE}/Sessions/s1/Playing/Stop").mock(return_value=httpx.Response(204))
+    ctx = _ctx(); ctx.jellyfin_playing_title = "12 Angry Men"
+    await jf.control(ctx, action="stop")
+    assert ctx.jellyfin_playing_title is None

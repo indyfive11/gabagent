@@ -73,6 +73,12 @@ class JellyfinProvider:
                 examples=["pause", "resume", "stop the movie", "close the movie window",
                           "turn up the movie", "louder on the movie", "movie volume down"],
             ),
+            Command(
+                id="jellyfin.now_playing", domain="media", tier=1,
+                summary="What movie is currently playing in Jellyfin",
+                backend=PyBackend(ref="gabagent.commands.providers.jellyfin:now_playing"),
+                examples=["what are we watching", "what movie is this", "what's playing on Jellyfin"],
+            ),
         ]
 
 
@@ -87,6 +93,22 @@ def _client(jc) -> httpx.AsyncClient:
         headers={"Authorization": f'MediaBrowser Token="{jc.api_key}"'},
         timeout=15.0,
     )
+
+
+async def now_playing(ctx) -> ToolResult:
+    """The currently-playing Jellyfin movie title (the model kept inventing this id; now it's real)."""
+    jc = ctx.config.jellyfin
+    if not jc.enabled or not jc.api_key:
+        return ToolResult(output="", error="Jellyfin isn't set up.")
+    try:
+        for s in await _sessions(jc):
+            item = s.get("NowPlayingItem")
+            if item and item.get("Name"):
+                paused = (s.get("PlayState") or {}).get("IsPaused")
+                return ToolResult(output=f"{'Paused' if paused else 'Playing'}: {item['Name']}")
+    except Exception:
+        return ToolResult(output="", error="I couldn't reach Jellyfin.")
+    return ToolResult(output="Nothing is playing in Jellyfin right now.")
 
 
 async def _sessions(jc) -> list[dict]:
@@ -151,6 +173,8 @@ async def control(ctx, action="") -> ToolResult:
         or next((s for s in sessions if s.get("SupportsRemoteControl")), None)
     if not target:
         return ToolResult(output="", error="No active playback session to control.")
+    if action in ("stop", "close"):
+        ctx.jellyfin_playing_title = None
     try:
         async with _client(jc) as c:
             r = await c.post(f"/Sessions/{target['Id']}/Playing/{_CONTROL[action]}")
@@ -189,12 +213,20 @@ async def play(ctx, item_id="", title="") -> ToolResult:
         except Exception:
             approved = False
         if approved:
-            return await _play_to_session(jc, controllable[0]["Id"], item_id,
-                                          controllable[0].get("DeviceName", "your client"))
+            res = await _play_to_session(jc, controllable[0]["Id"], item_id,
+                                         controllable[0].get("DeviceName", "your client"))
+            if res.success and title:
+                # Remember the title even though we DON'T own this page (existing Chrome): it's the only
+                # handle window-ops have to target the movie window by caption (vs. the active window).
+                ctx.jellyfin_playing_title = title
+            return res
 
     if emit:
         await emit(events.status("Opening the player…"))  # narrate before the slow launch
-    return await _play_in_browser(ctx, jc, item_id)
+    res = await _play_in_browser(ctx, jc, item_id)
+    if res.success and title:
+        ctx.jellyfin_playing_title = title
+    return res
 
 
 async def _play_to_session(jc, session_id, item_id, label) -> ToolResult:
@@ -357,6 +389,7 @@ async def _browser_control(ctx, page, action) -> ToolResult:
                 pass
             ctx.jellyfin_playing_page = None
             ctx.jellyfin_paused = False
+            ctx.jellyfin_playing_title = None
             return ToolResult(output="Closed the movie window.")
         if action in ("volume_up", "volume_down"):
             cur = await _video_volume(page)

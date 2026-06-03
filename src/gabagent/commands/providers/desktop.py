@@ -57,6 +57,12 @@ _JS_MOVE_NAMED = (
     "if(!w)return;var s=workspace.screens;for(var j=0;j<s.length;j++){"
     "if(s[j].name===tn){workspace.sendClientToScreen(w,s[j]);return;}}})();"
 )
+# Fullscreen the first window whose caption OR app class contains %NAME% (lowercased substring).
+_JS_FULLSCREEN_NAMED = (
+    "(function(){var n=%NAME%;var ws=workspace.windowList();for(var i=0;i<ws.length;i++){"
+    "var c=(ws[i].caption||'').toLowerCase();var k=(ws[i].resourceClass||'').toLowerCase();"
+    "if(c.indexOf(n)>=0||k.indexOf(n)>=0){ws[i].fullScreen=true;return;}}})();"
+)
 # Close the first window whose caption OR app class contains %NAME% (lowercased substring). Plasma 6
 # KWin scripting: workspace.windowList() + window.closeWindow() (verified on the host).
 _JS_CLOSE_NAMED = (
@@ -174,18 +180,27 @@ def _resolve_screen(query: str, screens: list[dict], aliases: dict | None = None
     return None
 
 
+def _clean_title(t: str) -> str:
+    """Drop year/quality tags so the title matches the browser window caption:
+    '12 Angry Men (1957)' / 'The Matrix [1080p]' → 'the matrix'."""
+    return re.split(r"[\(\[]", t or "", maxsplit=1)[0].strip().lower()
+
+
 async def _movie_window_hint(ctx) -> str:
-    """Caption hint for a movie WE launched (its browser window title), so a move can target that
-    window by name instead of whatever happens to be focused. Empty if no movie page is open."""
-    page = getattr(ctx, "jellyfin_playing_page", None) if ctx is not None else None
-    if page is None:
+    """Caption hint for the movie window, so a move/fullscreen targets it instead of whatever is
+    focused. Works for a page WE own (live title) AND for a movie played into an UNOWNED window (the
+    title stored at play time) — that unowned-Chrome case was moving the wrong window before. Empty if
+    no movie is in play."""
+    if ctx is None:
         return ""
-    try:
-        if page.is_closed():
-            return ""
-        return (await page.title() or "").strip()
-    except Exception:
-        return ""
+    page = getattr(ctx, "jellyfin_playing_page", None)
+    if page is not None:
+        try:
+            if not page.is_closed():
+                return _clean_title(await page.title() or "")
+        except Exception:
+            pass
+    return _clean_title(getattr(ctx, "jellyfin_playing_title", None) or "")
 
 
 async def _move_to_target(ctx, target: dict) -> ToolResult:
@@ -229,6 +244,20 @@ async def to_screen(ctx, screen="") -> ToolResult:
     return await _move_to_target(ctx, target)
 
 
+async def fullscreen(ctx) -> ToolResult:
+    """Fullscreen the MOVIE window by caption when a movie is playing (even in an unowned Chrome) —
+    otherwise the active window via the global shortcut. The old active-window-only path fullscreened
+    whatever was focused, which was the wrong window when the movie wasn't focused."""
+    hint = await _movie_window_hint(ctx)
+    if hint:
+        ok = await _run_kwin_script(_JS_FULLSCREEN_NAMED.replace("%NAME%", json.dumps(hint)))
+        return ToolResult(output="Set the movie to full screen.") if ok \
+            else ToolResult(output="", error="couldn't set full screen")
+    rc, _ = await _run([*_KGA, "Window Fullscreen"])
+    return ToolResult(output="Set it to full screen.") if rc == 0 \
+        else ToolResult(output="", error="couldn't set full screen")
+
+
 async def close_named(ctx, name="") -> ToolResult:
     name = str(name).strip()
     if not name:
@@ -259,8 +288,9 @@ class DesktopProvider:
                         summary="Minimize the active window", backend=_kwin("Window Minimize"),
                         examples=["minimize this", "hide this window"]),
                 Command(id="window.fullscreen", domain="window", tier=1,
-                        summary="Make the active window fullscreen", backend=_kwin("Window Fullscreen"),
-                        examples=["go fullscreen"]),
+                        summary="Make the movie (or the active window) fullscreen",
+                        backend=PyBackend(ref="gabagent.commands.providers.desktop:fullscreen"),
+                        examples=["go fullscreen", "fullscreen the movie"]),
                 Command(id="window.center", domain="window", tier=1,
                         summary="Center the active window", backend=_kwin("Window Move Center")),
                 Command(id="window.to_other_screen", domain="window", tier=1,
