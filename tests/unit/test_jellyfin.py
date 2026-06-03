@@ -355,3 +355,42 @@ async def test_control_stop_clears_playing_title():
     ctx = _ctx(); ctx.jellyfin_playing_title = "12 Angry Men"
     await jf.control(ctx, action="stop")
     assert ctx.jellyfin_playing_title is None
+
+
+class _FSPage:
+    """Owned page stub for exit-fullscreen: records evaluate() exprs and key presses."""
+    def __init__(self): self.evals = []; self.keys = []; self._closed = False
+    def is_closed(self): return self._closed
+    async def evaluate(self, expr, *a): self.evals.append(expr)
+    @property
+    def keyboard(self):
+        page = self
+        class _K:
+            async def press(self_, k): page.keys.append(k)
+        return _K()
+
+
+def test_control_publishes_exit_fullscreen():
+    cmds = {c.id: c for c in jf.PROVIDER.commands(_ctx())}
+    action = next(s for s in cmds["jellyfin.control"].params if s.name == "action")
+    assert "exit_fullscreen" in action.enum
+
+
+async def test_control_exit_fullscreen_owned_does_both_layers(monkeypatch):
+    called = []
+    async def fake_exit(ctx): called.append(1); return True
+    monkeypatch.setattr("gabagent.commands.providers.desktop.exit_movie_fullscreen", fake_exit)
+    ctx = _ctx(); page = _FSPage(); ctx.jellyfin_playing_page = page
+    res = await jf.control(ctx, action="exit_fullscreen")
+    assert res.success and "Left full screen" in res.output
+    assert any("exitFullscreen" in e for e in page.evals)   # player HTML5 fullscreen
+    assert "Escape" in page.keys                            # belt
+    assert called                                           # KWin window fullscreen too
+
+
+async def test_control_exit_fullscreen_unowned_is_honest(monkeypatch):
+    async def fake_exit(ctx): return True                  # KWin drop succeeds
+    monkeypatch.setattr("gabagent.commands.providers.desktop.exit_movie_fullscreen", fake_exit)
+    ctx = _ctx(); ctx.jellyfin_playing_page = None; ctx.jellyfin_playing_title = "Pulp Fiction"
+    res = await jf.control(ctx, action="exit_fullscreen")
+    assert res.success and "press Escape" in res.output    # honest about the player layer we can't drive

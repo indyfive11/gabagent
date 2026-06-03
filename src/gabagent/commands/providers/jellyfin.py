@@ -18,7 +18,8 @@ if TYPE_CHECKING:
 
 _CONTROL = {"pause": "Pause", "resume": "Unpause", "stop": "Stop", "next": "NextTrack"}
 _BROWSER_ONLY = {"close", "volume_up", "volume_down"}   # only meaningful on the page we own
-_ACTIONS = set(_CONTROL) | _BROWSER_ONLY
+_SPECIAL = {"exit_fullscreen"}                           # handled directly (two fullscreen layers)
+_ACTIONS = set(_CONTROL) | _BROWSER_ONLY | _SPECIAL
 _PLAY_POLL_TRIES = 24   # ~12s waiting for the opened web client to register a session
 
 
@@ -65,12 +66,15 @@ class JellyfinProvider:
             ),
             Command(
                 id="jellyfin.control", domain="media", tier=1, featured=True,
-                summary="Control the movie — pause, resume, stop, close the window, or turn the movie volume up/down",
+                summary="Control the movie — pause, resume, stop, leave full screen, close the window, or turn the movie volume up/down",
                 backend=PyBackend(ref="gabagent.commands.providers.jellyfin:control"),
                 params=[Slot("action", "enum", True,
-                             enum=("pause", "resume", "stop", "next", "close", "volume_up", "volume_down"),
-                             description="required — one of pause/resume/stop/next/close/volume_up/volume_down")],
-                examples=["pause", "resume", "stop the movie", "close the movie window",
+                             enum=("pause", "resume", "stop", "next", "exit_fullscreen", "close",
+                                   "volume_up", "volume_down"),
+                             description="required — one of pause/resume/stop/next/exit_fullscreen/"
+                             "close/volume_up/volume_down (exit_fullscreen = leave the movie's full screen)")],
+                examples=["pause", "resume", "stop the movie", "leave full screen", "exit fullscreen",
+                          "get out of full screen", "close the movie window",
                           "turn up the movie", "louder on the movie", "movie volume down"],
             ),
             Command(
@@ -156,10 +160,32 @@ async def search(ctx, genre=None, min_rating=None, query=None, unwatched=False) 
     return ToolResult(output=json.dumps(results))
 
 
+async def _exit_fullscreen(ctx) -> ToolResult:
+    """Leave full screen — two stacked layers: the Jellyfin web player's own (HTML5) fullscreen and the
+    KWin window fullscreen. Owned page: exit both reliably. Unowned window: drop the KWin fullscreen and
+    be honest that the player's own fullscreen may need a manual Escape."""
+    from gabagent.commands.providers.desktop import exit_movie_fullscreen
+    page = _live_jellyfin_page(ctx)
+    if page is not None:
+        try:
+            await page.evaluate("() => { if (document.exitFullscreen) document.exitFullscreen(); }")
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await exit_movie_fullscreen(ctx)   # also drop any KWin window fullscreen
+        return ToolResult(output="Left full screen.")
+    if await exit_movie_fullscreen(ctx):
+        return ToolResult(output="I've taken the movie window out of full screen. If the player itself "
+                          "is still full screen, press Escape — I can't drive a window I didn't open.")
+    return ToolResult(output="", error="I couldn't find the movie window to leave full screen.")
+
+
 async def control(ctx, action="") -> ToolResult:
     jc = ctx.config.jellyfin
     if action not in _ACTIONS:
         return ToolResult(output="", error=f"unknown action: {action}")
+    if action == "exit_fullscreen":
+        return await _exit_fullscreen(ctx)
     # The Jellyfin web client ignores remote-control API commands (returns 204, does nothing — a
     # known upstream issue), so when WE launched the movie in our own browser, control it through
     # the page instead. Native/controllable clients still go through the Sessions API below.

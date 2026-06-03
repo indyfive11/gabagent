@@ -389,3 +389,21 @@ async def test_fullscreen_falls_back_to_shortcut_without_movie(monkeypatch):
     ctx = types.SimpleNamespace(jellyfin_playing_page=None, jellyfin_playing_title=None)
     res = await d.fullscreen(ctx)
     assert res.success and any("Window Fullscreen" in a for a in ran[0])   # global shortcut path
+
+
+async def test_exit_movie_fullscreen_caption_matched(monkeypatch):
+    import types
+    from gabagent.commands.providers import desktop as d
+    captured = {}
+    async def fake_script(js): captured["js"] = js; return True
+    monkeypatch.setattr(d, "_run_kwin_script", fake_script)
+    ctx = types.SimpleNamespace(jellyfin_playing_page=None, jellyfin_playing_title="Pulp Fiction")
+    assert await d.exit_movie_fullscreen(ctx) is True
+    assert "fullScreen=false" in captured["js"] and json.dumps("pulp fiction") in captured["js"]
+
+
+async def test_exit_movie_fullscreen_noop_without_movie(monkeypatch):
+    import types
+    from gabagent.commands.providers import desktop as d
+    ctx = types.SimpleNamespace(jellyfin_playing_page=None, jellyfin_playing_title=None)
+    assert await d.exit_movie_fullscreen(ctx) is False

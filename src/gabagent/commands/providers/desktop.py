@@ -63,6 +63,12 @@ _JS_FULLSCREEN_NAMED = (
     "var c=(ws[i].caption||'').toLowerCase();var k=(ws[i].resourceClass||'').toLowerCase();"
     "if(c.indexOf(n)>=0||k.indexOf(n)>=0){ws[i].fullScreen=true;return;}}})();"
 )
+# Drop that window OUT of KWin fullscreen (and raise+activate it so a synthetic key can reach it).
+_JS_UNFULLSCREEN_NAMED = (
+    "(function(){var n=%NAME%;var ws=workspace.windowList();for(var i=0;i<ws.length;i++){"
+    "var c=(ws[i].caption||'').toLowerCase();var k=(ws[i].resourceClass||'').toLowerCase();"
+    "if(c.indexOf(n)>=0||k.indexOf(n)>=0){ws[i].fullScreen=false;workspace.activeWindow=ws[i];return;}}})();"
+)
 # Close the first window whose caption OR app class contains %NAME% (lowercased substring). Plasma 6
 # KWin scripting: workspace.windowList() + window.closeWindow() (verified on the host).
 _JS_CLOSE_NAMED = (
@@ -256,6 +262,15 @@ async def fullscreen(ctx) -> ToolResult:
     rc, _ = await _run([*_KGA, "Window Fullscreen"])
     return ToolResult(output="Set it to full screen.") if rc == 0 \
         else ToolResult(output="", error="couldn't set full screen")
+
+
+async def exit_movie_fullscreen(ctx) -> bool:
+    """Drop the movie window out of KWin fullscreen (caption-matched) and activate it. True if the
+    script ran. The Jellyfin player's OWN (HTML5) fullscreen is handled separately on the page."""
+    hint = await _movie_window_hint(ctx)
+    if not hint:
+        return False
+    return await _run_kwin_script(_JS_UNFULLSCREEN_NAMED.replace("%NAME%", json.dumps(hint)))
 
 
 async def close_named(ctx, name="") -> ToolResult:
