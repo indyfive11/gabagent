@@ -64,9 +64,13 @@ By voice you can control:
 
 The brain only ducks or controls media playing on **this** machine — playback on
 other devices/rooms is left untouched. Irreversible actions require a spoken
-confirmation, and it stays honest about what it can and can't do. The protocol is
-brain-agnostic (`/respond`, `/confirm`, `/media/duck`, `/media/state` are all
-generic), so any compatible front-end can drive it.
+confirmation, and it stays honest about what it can and can't do.
+
+**Companion project:** the reference voice front-end (microphone, wake word,
+STT/TTS) is [voice-agent](https://github.com/indyfive11/voice-agent). The two are
+**loosely coupled** — they only share a small brain-agnostic HTTP+SSE protocol
+([docs/VOICE_PROTOCOL.md](docs/VOICE_PROTOCOL.md)), so any compatible front-end can
+drive gabagent, and gabagent can be swapped for any brain that speaks the protocol.
 
 ## License
 
