@@ -189,23 +189,44 @@ def _ambient_cap(ctx) -> int:
 
 
 async def apply_ambient_cap(ctx) -> None:
-    """Cap currently-playing music at the ambient ceiling (lower only, never raise) so VAD can hear the
-    user over it. Called when music starts; the speech-duck drops it further and restores to this cap.
+    """Cap currently-playing music at the ambient ceiling so VAD can hear the user over it, AND mirror
+    the (capped) software-mixer level onto the PipeWire sink-input. Called when music starts.
+
+    The mixer itself is only LOWERED to the cap (never raised above the user's chosen level). The
+    sink-input, by contrast, is MIRRORED to the mixer — raised or lowered to match. That mirror is the
+    fix for the stranded-quiet track: a speech-duck sets the Mopidy sink-input to ~18%, PipeWire's
+    module-stream-restore remembers it, and the NEXT track's sink-input comes up at 18%; a lower-only cap
+    can't raise it, so the music plays stuck-quiet. Matching the sink-input to the mixer un-strands it.
+    Because we mirror the mixer (not force the cap), a genuinely user-lowered volume stays low — no blast.
     Best-effort on both the Mopidy software mixer and the PipeWire sink-input. Never raises."""
     cap = _ambient_cap(ctx)
     if cap >= 100:
         return
     tc = getattr(ctx.config, "tidal", None)
     try:
+        mixer = None
         if tc and getattr(tc, "enabled", False):
             from gabagent.commands.providers.tidal import _rpc
             vol = await _rpc(tc, "core.mixer.get_volume", timeout=2.0)
-            if vol is not None and int(vol) > cap:
-                await _rpc(tc, "core.mixer.set_volume", {"volume": cap}, timeout=2.0)
+            if vol is not None:
+                mixer = int(vol)
+                if mixer > cap:                                # lower-only: never raise the user's level
+                    await _rpc(tc, "core.mixer.set_volume", {"volume": cap}, timeout=2.0)
+                    mixer = cap
+        # Don't fight an in-progress speech duck — the sink is intentionally at the duck level then.
+        if _state(ctx).get("tidal_sink_prior") is not None:
+            _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer, skipped="ducking")
+            return
         found = await _mopidy_sink_input()
-        if found and found[1] is not None and found[1] > cap:
-            await _run_pactl("set-sink-input-volume", found[0], f"{cap}%")
-        _tidal_dlog(ctx, phase="ambient_cap", cap=cap)
+        if found:
+            idx, svol = found
+            # Mirror the (capped) mixer onto the sink-input — fall back to the cap if the mixer is
+            # unknown. This RAISES a stranded-low sink-input (stream-restore replayed a duck) back to the
+            # real level, and lowers one sitting above the cap.
+            target = min(mixer, cap) if mixer is not None else cap
+            if svol != target:
+                await _run_pactl("set-sink-input-volume", idx, f"{target}%")
+        _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer)
     except Exception:
         pass
 

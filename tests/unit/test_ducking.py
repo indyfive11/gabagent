@@ -303,6 +303,48 @@ async def test_apply_ambient_cap_lowers_only(monkeypatch):
     assert ("set-sink-input-volume", "9", "90%") in calls         # sink lowered to the cap
 
 
+async def test_apply_ambient_cap_mirrors_mixer_raising_stranded_sink(monkeypatch):
+    """The stranded-quiet bug: a track comes up at 18% (stream-restore replayed a duck onto the new
+    sink-input). The mirror RAISES it to the mixer level — lower-only capping couldn't. The mixer here
+    (70) is below the cap (90), so it must NOT be lowered, and the sink must mirror 70, not blast to 90."""
+    calls = []
+    async def fake_pactl(*a, **k):
+        if a and a[0] == "list":
+            return (0, 'Sink Input #4\n\tVolume: front-left: 11796 / 18% / -20 dB\n'
+                       '\tProperties:\n\t\tapplication.name = "Mopidy"\n')
+        calls.append(a); return (0, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    import gabagent.commands.providers.tidal as td
+    seen = []
+    async def fake_rpc(tc, method, params=None, timeout=2.0):
+        seen.append((method, params)); return 70 if method == "core.mixer.get_volume" else None
+    monkeypatch.setattr(td, "_rpc", fake_rpc)
+    ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=90))
+    await _dk.apply_ambient_cap(ctx)
+    assert ("core.mixer.set_volume", {"volume": 90}) not in seen   # mixer below cap → left alone, no blast
+    assert ("set-sink-input-volume", "4", "70%") in calls          # sink raised 18→70 to mirror the mixer
+
+
+async def test_apply_ambient_cap_skips_sink_during_active_duck(monkeypatch):
+    """A speech-duck is in progress (sink intentionally at the duck level) → apply_ambient_cap must not
+    raise the sink-input out from under the duck."""
+    calls = []
+    async def fake_pactl(*a, **k):
+        if a and a[0] == "list":
+            return (0, 'Sink Input #4\n\tVolume: front-left: 11796 / 18% / -20 dB\n'
+                       '\tProperties:\n\t\tapplication.name = "Mopidy"\n')
+        calls.append(a); return (0, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    import gabagent.commands.providers.tidal as td
+    async def fake_rpc(tc, method, params=None, timeout=2.0):
+        return 70 if method == "core.mixer.get_volume" else None
+    monkeypatch.setattr(td, "_rpc", fake_rpc)
+    ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=90))
+    _dk._state(ctx)["tidal_sink_prior"] = ("4", 70)               # a duck is active
+    await _dk.apply_ambient_cap(ctx)
+    assert not any(a and a[0] == "set-sink-input-volume" for a in calls)   # sink left at the duck level
+
+
 async def test_apply_ambient_cap_disabled_at_100(monkeypatch):
     calls = []
     async def fake_pactl(*a, **k): calls.append(a); return (1, "")
