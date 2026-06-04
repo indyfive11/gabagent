@@ -287,6 +287,19 @@ async def play(ctx, query="", uri="", album=False) -> ToolResult:
             return ToolResult(output="Resuming.")
         except Exception as e:
             return ToolResult(output="", error=f"couldn't resume: {_human_err(e)}")
+    # F2: if the resolved track is ALREADY the loaded/current one, resume in place instead of
+    # clear+add+play — the latter restarts it from position 0 ("started over" instead of resuming).
+    try:
+        cur = await _rpc(tc, "core.playback.get_current_track", timeout=2.0)
+    except Exception:
+        cur = None
+    if isinstance(cur, dict) and cur.get("uri") == uri:
+        try:
+            await _rpc(tc, "core.playback.resume", timeout=2.0)
+        except Exception:
+            pass
+        await _hold_ambient(ctx)
+        return ToolResult(output=f"Resuming {label} on TIDAL." if label else "Resuming on TIDAL.")
     try:
         await _play_uris(tc, [uri])
     except Exception as e:

@@ -81,9 +81,33 @@ async def test_play_searches_then_queues_and_plays():
     respx.post(RPC).mock(side_effect=_resp)
     res = await td.play(_ctx(), query="kind of blue")
     assert res.success and "So What" in res.output and "Miles Davis" in res.output
-    # the full search -> clear -> add -> play sequence ran, in order
-    assert seen == ["core.library.search", "core.tracklist.clear",
-                    "core.tracklist.add", "core.playback.play"]
+    # search -> (F2 current-track check; not current here) -> clear -> add -> play, in order
+    assert seen == ["core.library.search", "core.playback.get_current_track",
+                    "core.tracklist.clear", "core.tracklist.add", "core.playback.play"]
+
+
+@respx.mock
+async def test_play_same_track_resumes_not_restart():
+    # F2: re-playing the track that's already loaded resumes IN PLACE — never clear+add+play, which would
+    # restart it from position 0 ("the music started over instead of resuming where it was").
+    seen = []
+
+    def _resp(request):
+        method = json.loads(request.content)["method"]
+        seen.append(method)
+        if method == "core.library.search":
+            result = [{"tracks": [_TRACK]}]
+        elif method == "core.playback.get_current_track":
+            result = _TRACK                       # the resolved track is ALREADY current
+        else:
+            result = None
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=_resp)
+    res = await td.play(_ctx(), query="so what")
+    assert res.success and "resuming" in res.output.lower()
+    assert "core.playback.resume" in seen
+    assert "core.tracklist.clear" not in seen and "core.playback.play" not in seen   # no restart
 
 
 @respx.mock
