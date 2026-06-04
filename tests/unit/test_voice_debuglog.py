@@ -52,14 +52,16 @@ def test_dlog_drops_none_fields(tmp_path):
     assert "error" not in e and e["ok"] is True
 
 
-async def test_media_state_logs_per_provider_timing(tmp_path):
+async def test_media_state_logs_inventory_counts(tmp_path):
     from gabagent.voice.ducking import media_state
     ctx = _ctx(tmp_path)
     ctx.config.tidal.enabled = False
-    ctx.config.jellyfin.api_key = ""           # both providers inert → no I/O
+    ctx.config.jellyfin.api_key = ""           # both providers inert → no sources
     await media_state(ctx)
     e = next(r for r in _read_lines(ctx.voice_debug_path) if r["event"] == "media_state")
-    assert "tidal_ms" in e and "jellyfin_ms" in e and e["state"] == "idle"
+    # New inventory-scoped debug shape: local/total/remote counts + a single timing, not per-provider.
+    assert {"local", "total", "remote", "ms"} <= e.keys()
+    assert e["state"] == "idle" and e["local"] == 0
 
 
 async def test_duck_media_logs_begin_and_end(tmp_path):

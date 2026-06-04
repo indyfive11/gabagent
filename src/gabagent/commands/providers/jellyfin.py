@@ -37,6 +37,43 @@ class JellyfinProvider:
         except Exception:
             return False
 
+    async def sources(self, ctx: AgentContext):
+        """Media sources Jellyfin knows about. A movie WE launched (owned browser page) is local+owned.
+        Otherwise every /Sessions entry with a NowPlayingItem is reported with a LOCALITY verdict
+        (loopback endpoint / our DeviceId / configured device-name → local; else remote) and owned=False —
+        so a session on another device is visible for future explicit control but never auto-touched.
+        Never raises."""
+        jc = getattr(ctx.config, "jellyfin", None)
+        if not jc or not getattr(jc, "enabled", True) or not jc.api_key:
+            return []
+        from gabagent.commands.media import MediaSource, judge_locality
+        page = _live_jellyfin_page(ctx)
+        if page is not None:
+            paused = await _video_paused(page)
+            return [MediaSource(provider="jellyfin", kind="video",
+                                state="paused" if paused is True else "playing",
+                                owned=True, locality="local",
+                                title=getattr(ctx, "jellyfin_playing_title", "") or "")]
+        out = []
+        try:
+            for s in await _sessions(jc):
+                npi = s.get("NowPlayingItem")
+                if not npi:
+                    continue
+                paused = (s.get("PlayState") or {}).get("IsPaused")
+                out.append(MediaSource(
+                    provider="jellyfin", kind="video",
+                    state="paused" if paused else "playing", owned=False,
+                    locality=judge_locality(ctx, device_id=s.get("DeviceId", ""),
+                                            device_name=s.get("DeviceName", ""),
+                                            endpoint=s.get("RemoteEndPoint", "")),
+                    device_name=s.get("DeviceName", ""), device_id=s.get("DeviceId", ""),
+                    endpoint=s.get("RemoteEndPoint", ""), session_key=s.get("Id", ""),
+                    title=(npi.get("Name") or "")))
+        except Exception:
+            pass
+        return out
+
     def commands(self, ctx: AgentContext) -> list[Command]:
         return [
             Command(

@@ -120,6 +120,11 @@ class GabAgentConfig(BaseSettings):
     # least this % so "turn the music way down" can't ratchet to inaudible — to actually silence music
     # the user pauses/stops it. Env: GABAI_MEDIA_VOLUME_FLOOR.
     media_volume_floor: int = 5
+    # This machine's friendly name, used to tag media sources as LOCAL vs on another device/room (e.g.
+    # "EndeavorMain"). Empty → defaults to the hostname at use. The brain only AUTO-ducks/controls media it
+    # judges local to this device; remote sources are visible (for future explicit control) but never touched
+    # automatically. Env: GABAI_LOCAL_DEVICE.
+    local_device: str = ""
     attestation: AttestationConfig = Field(default_factory=AttestationConfig)
     jellyfin: JellyfinConfig = Field(default_factory=JellyfinConfig)
     tidal: TidalConfig = Field(default_factory=TidalConfig)

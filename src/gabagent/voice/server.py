@@ -99,9 +99,12 @@ def build_app(ctx: AgentContext):
 
     async def media_duck(request):
         # Called on VAD speech-onset/end: duck music + movie volume so Aria can hear over playback.
+        # `mute=True` (sent when the wake/command window opens) deepens the duck to a full mute (vol 0)
+        # so the media's acoustic AEC residual can't leak a music vocal into a spurious USER turn.
         from gabagent.voice.ducking import duck_media
         body = await request.json()
-        return JSONResponse(await duck_media(ctx, bool(body.get("on")), session_id=body.get("session_id")))
+        return JSONResponse(await duck_media(
+            ctx, bool(body.get("on")), session_id=body.get("session_id"), mute=bool(body.get("mute"))))
 
     async def media_state(request):
         # Read-only: lets the voice client's duck-timing skip ducking when nothing's playing.

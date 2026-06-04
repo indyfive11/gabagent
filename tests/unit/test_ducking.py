@@ -78,18 +78,19 @@ async def test_duck_is_idempotent():
 
 
 @respx.mock
-async def test_duck_jellyfin_pauses_then_resumes():
+async def test_duck_does_not_autopause_unowned_session():
+    # ARCHITECTURE: an unowned Jellyfin /Sessions client (it may be on ANOTHER device/room) must NEVER be
+    # auto-paused when the user speaks — doing so controlled the wrong screen and flapped the gate. Only
+    # brain-OWNED media is auto-ducked. (Cross-device transport is Phase-2 explicit-only.)
     ctx = _ctx(tidal=False, jellyfin=True)
     respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
         {"Id": "s1", "NowPlayingItem": {"Name": "The Matrix"}, "PlayState": {"IsPaused": False}},
     ]))
     pause = respx.post(f"{BASE}/Sessions/s1/Playing/Pause").mock(return_value=httpx.Response(204))
-    unpause = respx.post(f"{BASE}/Sessions/s1/Playing/Unpause").mock(return_value=httpx.Response(204))
 
-    assert (await duck_media(ctx, True))["ducked"] == ["jellyfin"]
-    assert pause.called
-    assert (await duck_media(ctx, False))["ducked"] == ["jellyfin"]
-    assert unpause.called
+    assert (await duck_media(ctx, True))["ducked"] == []      # nothing OWNED → nothing ducked
+    assert not pause.called                                   # the unowned session was left untouched
+    assert (await duck_media(ctx, False))["ducked"] == []
 
 
 async def test_duck_noop_when_nothing_configured():
@@ -268,9 +269,30 @@ async def test_duck_tidal_sink_noop_when_no_mopidy_stream(monkeypatch):
     assert _dk._state(ctx)["tidal_sink_prior"] is None        # nothing to duck → no state saved
 
 
-async def test_duck_tidal_sink_stranded_low_restores_to_cap(monkeypatch):
-    """Sink-input already at/below the duck level (leftover from a restart mid-duck) → save the ambient
-    cap as the restore target, not the stranded 18% (mirrors the video stranded-0.2 guard)."""
+async def test_duck_tidal_sink_prior_from_mixer(monkeypatch):
+    """The sink restore prior MIRRORS the Mopidy software mixer (the source of truth), threaded in by
+    _duck_tidal — even when the sink itself reads low. We no longer fabricate the ambient cap for a
+    low sink (that overrode a deliberately-low user level → the 'turn it down → blasts back to 90' bug);
+    a genuinely stranded sink is un-stranded separately by apply_ambient_cap's mirror-on-play."""
+    calls = []
+    async def fake_pactl(*args, **k):
+        if args and args[0] == "list":
+            return (0, 'Sink Input #3\n\tVolume: front-left: 11796 / 18% / -20 dB\n'
+                       '\tProperties:\n\t\tapplication.name = "Mopidy"\n')
+        calls.append(args)
+        return (0, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=90))
+    await _dk._duck_tidal_sink(ctx, True, mixer_vol=55)        # mixer says the real level is 55
+    assert _dk._state(ctx)["tidal_sink_prior"] == ("3", 55)    # mirrors the mixer, NOT the fabricated cap
+    calls.clear()
+    await _dk._duck_tidal_sink(ctx, False)
+    assert ("set-sink-input-volume", "3", "55%") in calls      # restored to the user level, not 90
+
+
+async def test_duck_tidal_sink_no_mixer_uses_own_read(monkeypatch):
+    """Standalone call (no mixer threaded) falls back to the sink's HONEST read — no cap fabrication.
+    The old code rescued an 18% sink to 90; now it saves 18 (un-stranding is apply_ambient_cap's job)."""
     async def fake_pactl(*args, **k):
         if args and args[0] == "list":
             return (0, 'Sink Input #3\n\tVolume: front-left: 11796 / 18% / -20 dB\n'
@@ -279,7 +301,7 @@ async def test_duck_tidal_sink_stranded_low_restores_to_cap(monkeypatch):
     monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
     ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=90))
     await _dk._duck_tidal_sink(ctx, True)
-    assert _dk._state(ctx)["tidal_sink_prior"] == ("3", 90)    # the cap, not the stranded 18 or full 100
+    assert _dk._state(ctx)["tidal_sink_prior"] == ("3", 18)    # honest read, NOT the old fabricated 90
 
 
 # -- ambient cap: hold playing music at a ceiling so VAD can hear the user over it -----------------
@@ -325,6 +347,31 @@ async def test_apply_ambient_cap_mirrors_mixer_raising_stranded_sink(monkeypatch
     assert ("set-sink-input-volume", "4", "70%") in calls          # sink raised 18→70 to mirror the mixer
 
 
+async def test_apply_ambient_cap_waits_for_late_sink_input(monkeypatch):
+    """F1: a new track's PipeWire sink-input can appear a beat after play; if mirror-on-play runs before
+    it exists, the track comes up stranded-quiet. apply_ambient_cap must poll for the sink, then mirror."""
+    attempts = {"n": 0}
+    async def fake_sink():
+        attempts["n"] += 1
+        return None if attempts["n"] < 3 else ("8", 18)   # appears (stranded at 18) on the 3rd poll
+    calls = []
+    async def fake_pactl(*a, **k):
+        calls.append(a); return (0, "")
+    async def no_sleep(_s):
+        return None
+    monkeypatch.setattr(_dk, "_mopidy_sink_input", fake_sink)
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    monkeypatch.setattr(_dk.asyncio, "sleep", no_sleep)
+    import gabagent.commands.providers.tidal as td
+    async def fake_rpc(tc, method, params=None, timeout=2.0):
+        return 50 if method == "core.mixer.get_volume" else None
+    monkeypatch.setattr(td, "_rpc", fake_rpc)
+    ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=90))
+    await _dk.apply_ambient_cap(ctx)
+    assert attempts["n"] == 3                                  # polled until the sink-input appeared
+    assert ("set-sink-input-volume", "8", "50%") in calls      # then un-stranded it to the mixer level
+
+
 async def test_apply_ambient_cap_skips_sink_during_active_duck(monkeypatch):
     """A speech-duck is in progress (sink intentionally at the duck level) → apply_ambient_cap must not
     raise the sink-input out from under the duck."""
@@ -365,3 +412,256 @@ async def test_duck_tidal_restore_caps_above_ambient():
     await duck_media(ctx, False)                          # restore → min(100, 90) = 90
     assert ("core.mixer.set_volume", {"volume": 90}) in seen
     assert ("core.mixer.set_volume", {"volume": 100}) not in seen
+
+
+# -- mute mode: deepen the duck to a full mute (vol 0) while the wake window is open ----------------
+
+@respx.mock
+async def test_duck_tidal_mute_from_idle():
+    ctx = _ctx(tidal=True, jellyfin=False)
+    seen = []
+    respx.post(RPC).mock(side_effect=_mopidy(seen, vol=80))
+    out = await duck_media(ctx, True, mute=True)
+    assert out["ducked"] == ["tidal"]
+    assert ("core.mixer.set_volume", {"volume": 0}) in seen      # full mute, not the gentle 18
+    assert ("core.mixer.set_volume", {"volume": 18}) not in seen
+    assert _dk._state(ctx)["tidal_prior"] == 80                  # saved the REAL level, not 0
+    assert _dk._state(ctx)["muted"] is True
+
+
+@respx.mock
+async def test_duck_tidal_mute_deepens_existing_duck():
+    """VAD onset ducks to 18; the wake window then sends mute=True → deepen to 0 WITHOUT re-reading or
+    clobbering the saved 80 (so restore still returns to the real level)."""
+    ctx = _ctx(tidal=True, jellyfin=False)
+    seen = []
+    respx.post(RPC).mock(side_effect=_mopidy(seen, vol=80))
+    await duck_media(ctx, True)                                  # plain duck → 18, save 80
+    seen.clear()
+    await duck_media(ctx, True, mute=True)                       # deepen → 0
+    assert ("core.mixer.set_volume", {"volume": 0}) in seen
+    assert not any(m == "core.mixer.get_volume" for m, _ in seen)  # prior NOT re-read/clobbered
+    assert _dk._state(ctx)["tidal_prior"] == 80                  # still the original real level
+    assert _dk._state(ctx)["muted"] is True
+
+
+@respx.mock
+async def test_duck_tidal_mute_restores_prior():
+    ctx = _ctx(tidal=True, jellyfin=False)
+    seen = []
+    respx.post(RPC).mock(side_effect=_mopidy(seen, vol=80))
+    await duck_media(ctx, True, mute=True)                       # save 80, mute to 0
+    seen.clear()
+    await duck_media(ctx, False)                                 # restore
+    assert ("core.mixer.set_volume", {"volume": 80}) in seen     # back to the real level
+    assert _dk._state(ctx)["muted"] is False
+    assert _dk._state(ctx)["tidal_prior"] is None
+
+
+@respx.mock
+async def test_duck_tidal_mute_then_mute_is_noop():
+    ctx = _ctx(tidal=True, jellyfin=False)
+    seen = []
+    respx.post(RPC).mock(side_effect=_mopidy(seen, vol=80))
+    await duck_media(ctx, True, mute=True)                       # mute → 0, muted True
+    seen.clear()
+    out = await duck_media(ctx, True, mute=True)                 # already muted → clean no-op
+    assert out["ducked"] == [] and not seen
+
+
+@respx.mock
+async def test_duck_non_mute_unchanged_regression():
+    """A plain duck (no mute flag) is byte-for-byte the old behavior: 18, never 0, muted stays False."""
+    ctx = _ctx(tidal=True, jellyfin=False)
+    seen = []
+    respx.post(RPC).mock(side_effect=_mopidy(seen, vol=80))
+    await duck_media(ctx, True)
+    assert ("core.mixer.set_volume", {"volume": 18}) in seen
+    assert not any(p == {"volume": 0} for m, p in seen if m == "core.mixer.set_volume")
+    assert _dk._state(ctx)["muted"] is False
+
+
+@respx.mock
+async def test_duck_jellyfin_browser_mute():
+    ctx = _ctx(tidal=False, jellyfin=True)
+    page = _FakeVideoPage(volume=0.9); ctx.jellyfin_playing_page = page
+    assert (await duck_media(ctx, True, mute=True))["ducked"] == ["jellyfin"]
+    assert page.volume == 0.0                                   # full mute, not the gentle 0.2
+    assert _dk._state(ctx)["jellyfin_video_volume"] == 0.9      # saved the REAL prior
+    assert _dk._state(ctx)["muted"] is True
+    assert (await duck_media(ctx, False))["ducked"] == ["jellyfin"]
+    assert page.volume == 0.9                                   # restored the exact prior
+    assert _dk._state(ctx)["muted"] is False
+
+
+@respx.mock
+async def test_duck_jellyfin_browser_mute_deepens():
+    ctx = _ctx(tidal=False, jellyfin=True)
+    page = _FakeVideoPage(volume=0.9); ctx.jellyfin_playing_page = page
+    await duck_media(ctx, True)                                  # plain duck → 0.2, save 0.9
+    assert page.volume == 0.2
+    await duck_media(ctx, True, mute=True)                       # deepen → 0.0, prior preserved
+    assert page.volume == 0.0
+    assert _dk._state(ctx)["jellyfin_video_volume"] == 0.9
+    assert _dk._state(ctx)["muted"] is True
+    await duck_media(ctx, False)
+    assert page.volume == 0.9                                   # restored to the real level
+
+
+async def test_duck_tidal_sink_mute(monkeypatch):
+    """The PipeWire sink-input belt mutes to 0% and preserves the saved prior tuple for restore."""
+    calls = []
+    async def fake_pactl(*a, **k):
+        if a and a[0] == "list":
+            return (0, 'Sink Input #7\n\tVolume: front-left: 52000 / 80% / -5 dB\n'
+                       '\tProperties:\n\t\tapplication.name = "Mopidy"\n')
+        calls.append(a); return (0, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=90))
+    await _dk._duck_tidal_sink(ctx, True, mute=True)
+    assert ("set-sink-input-volume", "7", "0%") in calls
+    assert _dk._state(ctx)["tidal_sink_prior"] == ("7", 80)     # real prior saved, not 0
+    calls.clear()
+    await _dk._duck_tidal_sink(ctx, False)
+    assert ("set-sink-input-volume", "7", "80%") in calls       # restored to the prior
+
+
+# -- set_volume vs an active duck: the "turn it down → blasts back up" fix (option b) --------------
+
+@respx.mock
+async def test_duck_then_set_volume_restores_to_new_level(monkeypatch):
+    """The reported repro: a volume set issued WHILE ducked (command window open) updates the restore
+    prior and does NOT touch the live output (option b), so duck-off returns to the user's NEW level —
+    not the stale pre-duck level that used to blast back."""
+    from gabagent.commands.providers.tidal import set_volume
+    ctx = _ctx(tidal=True)
+    seen = []
+    respx.post(RPC).mock(side_effect=_mopidy(seen, vol=80))
+    sink_calls = []
+    async def fake_pactl(*args, **k):
+        if args and args[0] == "list":
+            return (0, 'Sink Input #5\n\tVolume: front-left: 52000 / 80% / -1 dB\n'
+                       '\tProperties:\n\t\tapplication.name = "Mopidy"\n')
+        sink_calls.append(args)
+        return (0, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+
+    await duck_media(ctx, True)                        # saves prior 80, ducks mixer+sink to 18
+    assert _dk._state(ctx)["tidal_prior"] == 80
+    seen.clear(); sink_calls.clear()
+
+    res = await set_volume(ctx, level=30)              # user lowers it while the window is open
+    assert "30 percent" in res.output
+    assert ("core.mixer.set_volume", {"volume": 30}) not in seen          # option b: no live write mid-window
+    assert not any(a and a[0] == "set-sink-input-volume" for a in sink_calls)
+    assert _dk._state(ctx)["tidal_prior"] == 30                           # prior updated to the new level
+    assert _dk._state(ctx)["tidal_sink_prior"] == ("5", 30)
+
+    seen.clear()
+    await duck_media(ctx, False)                       # restore honors the NEW level
+    assert ("core.mixer.set_volume", {"volume": 30}) in seen              # restored to 30, not stale 80
+    assert ("core.mixer.set_volume", {"volume": 80}) not in seen
+
+
+@respx.mock
+async def test_set_volume_writes_live_when_no_duck():
+    """No active duck → set_volume writes the live mixer as before; note_user_volume returns False."""
+    from gabagent.commands.providers.tidal import set_volume
+    ctx = _ctx(tidal=True)
+    seen = []
+    respx.post(RPC).mock(side_effect=_mopidy(seen, vol=80))
+    assert _dk.note_user_volume(ctx, 40) is False                         # nothing ducked
+    res = await set_volume(ctx, level=40)
+    assert ("core.mixer.set_volume", {"volume": 40}) in seen              # live write happened
+    assert "40 percent" in res.output
+
+
+async def test_set_volume_updates_sink_prior_during_duck(monkeypatch):
+    """A set_volume during an active duck updates BOTH saved priors and writes NO live output."""
+    from gabagent.commands.providers.tidal import set_volume
+    ctx = _ctx(tidal=True)
+    st = _dk._state(ctx)
+    st["tidal_prior"] = 80
+    st["tidal_sink_prior"] = ("5", 80)
+    sink_calls = []
+    async def fake_pactl(*args, **k):
+        sink_calls.append(args)
+        return (1, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    res = await set_volume(ctx, level=30)
+    assert st["tidal_prior"] == 30
+    assert st["tidal_sink_prior"] == ("5", 30)
+    assert not any(a and a[0] == "set-sink-input-volume" for a in sink_calls)   # no live sink write
+    assert "30 percent" in res.output
+
+
+# -- universal local-media duck: heard over ANY local media on a full-mute window-open -------------
+
+def _fake_pactl(listing, sets):
+    async def fake(*args, **k):
+        if args and args[0] == "list":
+            return (0, listing)
+        if args and args[0] == "set-sink-input-volume":
+            sets.append((args[1], args[2]))
+        return (0, "")
+    return fake
+
+
+async def test_universal_duck_mutes_unowned_local_then_restores(monkeypatch):
+    listing = ('Sink Input #10\n\tVolume: front-left: 52000 / 80% / -5 dB\n'
+               '\tProperties:\n\t\tapplication.name = "Chromium"\n')
+    sets = []
+    monkeypatch.setattr(_dk, "_run_pactl", _fake_pactl(listing, sets))
+    monkeypatch.setattr(_dk.shutil, "which", lambda _n: "/usr/bin/pactl")
+    ctx = _ctx(tidal=False, jellyfin=False)
+    out = await duck_media(ctx, True, mute=True)
+    assert "local" in out["ducked"]
+    assert ("10", "0%") in sets                                  # unowned stream muted to 0
+    assert _dk._state(ctx)["local_sink_priors"] == {"10": 80}    # prior saved
+    sets.clear()
+    out2 = await duck_media(ctx, False)
+    assert "local" in out2["ducked"]
+    assert ("10", "80%") in sets                                 # restored to the exact prior
+    assert _dk._state(ctx)["local_sink_priors"] is None
+
+
+async def test_universal_duck_excludes_tts_and_mopidy(monkeypatch):
+    listing = ('Sink Input #10\n\tVolume: front-left: 52000 / 80% / -5 dB\n'
+               '\tProperties:\n\t\tapplication.name = "Chromium"\n'
+               'Sink Input #11\n\tVolume: front-left: 45000 / 70% / -8 dB\n'
+               '\tProperties:\n\t\tnode.name = "alsa_playback.python3.12"\n'
+               'Sink Input #12\n\tVolume: front-left: 60000 / 90% / -3 dB\n'
+               '\tProperties:\n\t\tapplication.name = "Mopidy"\n')
+    sets = []
+    monkeypatch.setattr(_dk, "_run_pactl", _fake_pactl(listing, sets))
+    monkeypatch.setattr(_dk.shutil, "which", lambda _n: "x")
+    ctx = _ctx(tidal=False, jellyfin=False)
+    await duck_media(ctx, True, mute=True)
+    assert ("10", "0%") in sets                                  # unowned Chromium ducked
+    assert not any(idx == "11" for idx, _ in sets)               # TTS (alsa_playback) NEVER muted
+    assert not any(idx == "12" for idx, _ in sets)               # Mopidy (owned) handled elsewhere
+    assert _dk._state(ctx)["local_sink_priors"] == {"10": 80}
+
+
+async def test_universal_duck_excludes_stamped_property(monkeypatch):
+    listing = ('Sink Input #20\n\tVolume: front-left: 52000 / 55% / -5 dB\n'
+               '\tProperties:\n\t\tapplication.name = "SomeApp"\n'
+               '\t\tgabagent.duck_exclude = "1"\n')
+    sets = []
+    monkeypatch.setattr(_dk, "_run_pactl", _fake_pactl(listing, sets))
+    monkeypatch.setattr(_dk.shutil, "which", lambda _n: "x")
+    ctx = _ctx(tidal=False, jellyfin=False)
+    out = await duck_media(ctx, True, mute=True)
+    assert "local" not in out["ducked"] and sets == []          # stamped stream excluded → nothing ducked
+
+
+async def test_universal_duck_skips_plain_vad_duck(monkeypatch):
+    listing = ('Sink Input #30\n\tVolume: front-left: 52000 / 80% / -5 dB\n'
+               '\tProperties:\n\t\tapplication.name = "Chromium"\n')
+    sets = []
+    monkeypatch.setattr(_dk, "_run_pactl", _fake_pactl(listing, sets))
+    monkeypatch.setattr(_dk.shutil, "which", lambda _n: "x")
+    ctx = _ctx(tidal=False, jellyfin=False)
+    out = await duck_media(ctx, True, mute=False)               # gentle VAD-onset duck, not a full mute
+    assert "local" not in out["ducked"] and sets == []          # unowned media left alone until window-open
+    assert _dk._state(ctx)["local_sink_priors"] is None

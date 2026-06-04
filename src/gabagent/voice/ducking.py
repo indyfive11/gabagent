@@ -25,6 +25,18 @@ _DUCK_VOLUME = 18           # percent to duck TIDAL/Mopidy music to while the us
 _DUCK_VIDEO_VOLUME = 0.2    # HTML5 <video>.volume (0–1) to duck a browser-played movie to
 _SINK_DUCK_PCT = 18         # percent to duck the Mopidy PipeWire sink-input to (system-node backup)
 
+# Universal local-media duck: when a wake/command window opens (mute=True), drop EVERY local media
+# sink-input to 0 so Rob is "heard over ANY media playing" (anti-bleed for the open window — complementary
+# to the voice-gate's wake authority, which stays). Two streams are EXCLUDED: the assistant's own TTS output
+# (never mute Aria) and the owned Mopidy stream (ducked separately by _duck_tidal_sink, so it's not double-
+# managed). TTS is matched by a stable property VAC stamps on its output stream, with a node-name safety net.
+_TTS_EXCLUDE_PROP = 'gabagent.duck_exclude = "1"'   # VAC stamps this on the TTS sink-input
+
+# After a new track starts, its PipeWire sink-input can appear a beat late; poll this many times (× delay)
+# for it before giving up, so apply_ambient_cap can un-strand it (F1). Tuned to ~1.6s worst case.
+_AMBIENT_SETTLE_TRIES = 8
+_AMBIENT_SETTLE_DELAY = 0.2
+
 
 def _state(ctx) -> dict:
     s = getattr(ctx, "_duck_state", None)
@@ -33,29 +45,45 @@ def _state(ctx) -> dict:
         ctx._duck_state = s
     s.setdefault("jellyfin_video_volume", None)  # tolerate state dicts from before this field
     s.setdefault("tidal_sink_prior", None)       # (sink-input index, prior volume %) when ducked
+    s.setdefault("muted", False)                 # the active duck has been DEEPENED to a full mute (vol 0)
+    s.setdefault("local_sink_priors", None)      # {sink-input idx: prior %} for the universal local-duck
     return s
 
 
-async def duck_media(ctx, on: bool, session_id: str | None = None) -> dict:
-    """Duck (on=True) or restore (on=False) any active media. Fire-and-forget; never raises."""
+async def duck_media(ctx, on: bool, session_id: str | None = None, mute: bool = False) -> dict:
+    """Duck (on=True) or restore (on=False) any active media. Fire-and-forget; never raises.
+
+    `mute=True` (only meaningful with on=True) DEEPENS the duck to a full mute (vol 0) instead of the gentle
+    ambient duck — used while a wake/command window is open so the media's acoustic AEC residual can't leak a
+    music vocal into a spurious USER turn. It can deepen a duck that's already active (the VAD-onset 18%) to 0
+    without clobbering the saved pre-duck level, so restore on `on=False` still returns to the real volume.
+    Defaults False → byte-for-byte the pre-mute behavior for any client that omits the flag."""
     from gabagent.voice.debuglog import dlog
     # `duck_begin` paired with the `duck` end event: a duck_begin with no duck means a provider duck hung
     # (e.g. a page-eval on a dead movie page). dlog is self-guarding, so these never raise.
     _t0 = time.monotonic()
-    dlog(ctx, "duck_begin", session=session_id, on=bool(on))
+    dlog(ctx, "duck_begin", session=session_id, on=bool(on), mute=bool(mute))
     ducked = []
-    if await _duck_tidal(ctx, on):
+    if await _duck_tidal(ctx, on, mute):
         ducked.append("tidal")
-    if await _duck_jellyfin(ctx, on):
+    if await _duck_jellyfin(ctx, on, mute):
         ducked.append("jellyfin")
-    # Make the duck/restore visible in voice_debug.jsonl so the on/off timing and whether restore
+    # Universal local-media duck: on a full-mute window-open, silence every OTHER local media stream too
+    # (unowned tabs/apps), restoring on close — so Rob is heard over ANY local media. No-op on a plain duck.
+    if await _duck_local_sinks(ctx, on, mute):
+        ducked.append("local")
+    # A restore clears the mute flag once, centrally (not per-provider) so it resets even in a tidal-only or
+    # jellyfin-only setup where one provider's off-branch never runs.
+    if not on:
+        _state(ctx)["muted"] = False
+    # Make the duck/restore visible in voice_debug.jsonl so the on/off/mute timing and whether restore
     # actually fired can be joined with the voice-agent's DUCK log. On an `off`, "jellyfin" in `ducked`
     # means the restore succeeded; its absence means nothing was restored (the bug signature).
     try:
         st = _state(ctx)
-        dlog(ctx, "duck", session=session_id, on=bool(on), ducked=ducked,
-             jellyfin_saved=st.get("jellyfin_video_volume"), tidal_prior=st.get("tidal_prior"),
-             dur_ms=int((time.monotonic() - _t0) * 1000))
+        dlog(ctx, "duck", session=session_id, on=bool(on), mute=bool(mute), muted=st.get("muted"),
+             ducked=ducked, jellyfin_saved=st.get("jellyfin_video_volume"),
+             tidal_prior=st.get("tidal_prior"), dur_ms=int((time.monotonic() - _t0) * 1000))
     except Exception:
         pass
     return {"ok": True, "ducked": ducked}
@@ -69,67 +97,42 @@ async def media_state(ctx) -> dict:
     "playing"|"paused"|"idle", "kind": "audio"|"video"|None}. `kind` is a generic media TYPE (not a
     provider name) so the gate can avoid locking the user out of a video they're actively watching.
     Never raises."""
+    from gabagent.commands.media import inventory, local_audible
     _t0 = time.monotonic()
-    tidal = await _tidal_state(ctx)
+    srcs = await inventory(ctx)
     _t1 = time.monotonic()
-    jellyfin = await _jellyfin_state(ctx)
-    _t2 = time.monotonic()
-    playing = tidal == "playing" or jellyfin == "playing"
-    state = "playing" if playing else ("paused" if "paused" in (tidal, jellyfin) else "idle")
-    # Generic media KIND — "audio"|"video"|None. Stays brain-agnostic (a media TYPE, not a provider name:
-    # any brain reports "video" for a movie), so it doesn't leak which provider is in play. Lets the voice
-    # gate skip gating a video the user is actively watching (the worst wake-lockout case — they can pause
-    # by hand). Prefer the actively-playing source; a paused one is the fallback; video outranks audio.
-    if jellyfin == "playing":
-        kind = "video"
-    elif tidal == "playing":
-        kind = "audio"
-    elif jellyfin == "paused":
-        kind = "video"
-    elif tidal == "paused":
-        kind = "audio"
-    else:
-        kind = None
-    # Brain-internal debug only (NOT part of the neutral protocol response): record the per-source
-    # breakdown so a "DUCK on SKIPPED (nothing playing)" can be explained — e.g. distinguishing a
-    # genuinely paused movie ("paused") from a closed page ("none"). The per-provider durations surface a
-    # slow/hanging state read (e.g. a wedged movie page-eval) directly on the poll. Gated by the flag.
+    # SCOPE: only LOCAL audible media drives the snapshot. A media source on another device/room is
+    # excluded by design — it isn't in this box's audio loop, so it must not drive `kind` or gate the mic.
+    # (This is the structural fix for the cross-device kind-flap that thrashed the voice gate.)
+    local = local_audible(srcs)
+    playing = any(s.state == "playing" for s in local)
+    state = "playing" if playing else ("paused" if any(s.state == "paused" for s in local) else "idle")
+    # Generic media KIND — "audio"|"video"|None. Brain-agnostic (a media TYPE, not a provider name), so it
+    # doesn't leak which provider is in play; lets the gate skip locking the user out of a video they're
+    # watching. Prefer an actively-playing source; a paused one is the fallback; video outranks audio.
+    kind = _pick_kind(local)
+    # Brain-internal debug only (NOT part of the neutral protocol response): local-vs-remote counts explain
+    # a "nothing local playing" snapshot and surface a remote source that's correctly being ignored.
     try:
         from gabagent.voice.debuglog import dlog
-        dlog(ctx, "media_state", playing=playing, state=state, kind=kind, tidal=tidal, jellyfin=jellyfin,
-             tidal_ms=int((_t1 - _t0) * 1000), jellyfin_ms=int((_t2 - _t1) * 1000))
+        dlog(ctx, "media_state", playing=playing, state=state, kind=kind,
+             local=len(local), total=len(srcs),
+             remote=sum(1 for s in srcs if s.locality == "remote"), ms=int((_t1 - _t0) * 1000))
     except Exception:
         pass
     return {"playing": playing, "state": state, "kind": kind}
 
 
-async def _tidal_state(ctx) -> str:
-    tc = getattr(ctx.config, "tidal", None)
-    if not tc or not getattr(tc, "enabled", False):
-        return "stopped"
-    try:
-        from gabagent.commands.providers.tidal import _rpc
-        st = await _rpc(tc, "core.playback.get_state", timeout=2.0)
-        return st if st in ("playing", "paused", "stopped") else "stopped"
-    except Exception:
-        return "stopped"
-
-
-async def _jellyfin_state(ctx) -> str:
-    jc = getattr(ctx.config, "jellyfin", None)
-    if not jc or not getattr(jc, "enabled", True) or not jc.api_key:
-        return "none"
-    from gabagent.commands.providers.jellyfin import _live_jellyfin_page, _video_paused, _sessions
-    page = _live_jellyfin_page(ctx)
-    if page is not None:
-        return "paused" if (await _video_paused(page)) is True else "playing"
-    try:
-        for s in await _sessions(jc):
-            if s.get("NowPlayingItem"):
-                return "paused" if (s.get("PlayState") or {}).get("IsPaused") else "playing"
-    except Exception:
-        pass
-    return "none"
+def _pick_kind(sources) -> str | None:
+    """Generic media TYPE for the gate from a set of (local, audible) sources: prefer an actively-playing
+    source, video outranks audio, a paused source is the fallback. Stays brain-neutral."""
+    for want_state in ("playing", "paused"):
+        group = [s for s in sources if s.state == want_state]
+        if any(s.kind == "video" for s in group):
+            return "video"
+        if any(s.kind == "audio" for s in group):
+            return "audio"
+    return None
 
 
 def _debug_on(ctx) -> bool:
@@ -178,6 +181,68 @@ async def _mopidy_sink_input() -> tuple[str, int | None] | None:
     return _parse_mopidy_sink_input(out)
 
 
+def _parse_sink_inputs(out: str) -> list[dict]:
+    """Every sink-input in `pactl list sink-inputs` as {idx, volume %, block text} — the block is kept so
+    callers can test it for exclusion markers (TTS property / Mopidy ownership)."""
+    items = []
+    for block in out.split("Sink Input #")[1:]:
+        idx = block.splitlines()[0].strip()
+        if not idx.isdigit():
+            continue
+        m = re.search(r"Volume:.*?(\d+)%", block)
+        items.append({"idx": idx, "volume": int(m.group(1)) if m else None, "block": block})
+    return items
+
+
+def _excluded_from_local_duck(block: str) -> bool:
+    """A sink-input the universal local-duck must NOT touch: the assistant's own TTS output (never mute
+    Aria) or the owned Mopidy stream (ducked separately, so it isn't double-managed)."""
+    b = block.lower()
+    if _TTS_EXCLUDE_PROP.lower() in b:                     # the property VAC stamps on its TTS stream
+        return True
+    if "alsa_playback" in b or "voice-agent" in b:        # safety net for the TTS stream pre-stamp
+        return True
+    if 'application.name = "mopidy"' in b or 'node.name = "mopidy"' in b:   # owned, handled by _duck_tidal_sink
+        return True
+    return False
+
+
+async def _duck_local_sinks(ctx, on: bool, mute: bool = False) -> bool:
+    """Universal local-media duck: on a full-mute window-open, drop EVERY other local media sink-input to 0
+    (saving each prior), and restore them on close — so Rob is heard over ANY local media. Only fires on
+    `mute` (the open-window suppression); the gentle VAD-onset duck leaves unowned media alone. Excludes the
+    TTS stream and the owned Mopidy stream. Best-effort; never raises. Returns True if it acted."""
+    st = _state(ctx)
+    try:
+        if on:
+            if not mute or st.get("local_sink_priors"):    # only on a fresh full-mute; idempotent
+                return False
+            if not shutil.which("pactl"):
+                return False
+            rc, out = await _run_pactl("list", "sink-inputs")
+            if rc != 0 or not out:
+                return False
+            priors = {}
+            for si in _parse_sink_inputs(out):
+                if si["volume"] is None or _excluded_from_local_duck(si["block"]):
+                    continue
+                await _run_pactl("set-sink-input-volume", si["idx"], "0%")
+                priors[si["idx"]] = si["volume"]
+            if not priors:
+                return False
+            st["local_sink_priors"] = priors
+            return True
+        priors = st.get("local_sink_priors")
+        if not priors:
+            return False
+        for idx, prior in priors.items():
+            await _run_pactl("set-sink-input-volume", idx, f"{prior}%")
+        st["local_sink_priors"] = None
+        return True
+    except Exception:
+        return False
+
+
 def _ambient_cap(ctx) -> int:
     """The % ceiling to hold playing music at continuously (config media_ambient_cap, default 90).
     100 disables the ambient cap. Clamped to a sane range."""
@@ -217,41 +282,92 @@ async def apply_ambient_cap(ctx) -> None:
         if _state(ctx).get("tidal_sink_prior") is not None:
             _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer, skipped="ducking")
             return
-        found = await _mopidy_sink_input()
+        # Mirror the (capped) mixer onto the sink-input — fall back to the cap if the mixer is unknown.
+        # This RAISES a stranded-low sink-input (stream-restore replayed a duck) back to the real level, and
+        # lowers one above the cap. The new track's sink-input can appear a BEAT after play returns and come
+        # up stranded-quiet (F1, ~1/3 of starts), so poll for it briefly before mirroring; early-exit once
+        # present. (When already present — the common case + every existing test — this is a single pass.)
+        target = min(mixer, cap) if mixer is not None else cap
+        found = None
+        for _ in range(_AMBIENT_SETTLE_TRIES):
+            found = await _mopidy_sink_input()
+            if found:
+                break
+            await asyncio.sleep(_AMBIENT_SETTLE_DELAY)   # sink-input not up yet (new track settling) — wait
         if found:
             idx, svol = found
-            # Mirror the (capped) mixer onto the sink-input — fall back to the cap if the mixer is
-            # unknown. This RAISES a stranded-low sink-input (stream-restore replayed a duck) back to the
-            # real level, and lowers one sitting above the cap.
-            target = min(mixer, cap) if mixer is not None else cap
             if svol != target:
                 await _run_pactl("set-sink-input-volume", idx, f"{target}%")
-        _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer)
+        _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer, settled=bool(found))
     except Exception:
         pass
 
 
-async def _duck_tidal_sink(ctx, on: bool) -> None:
+def note_user_volume(ctx, target: int) -> bool:
+    """Record a user's absolute volume set against an in-progress duck so restore honors it.
+
+    `tidal.set_volume` sets the live mixer+sink, but if a duck is active (the command window is open, music
+    ducked to ~18%) the duck-off restore would otherwise overwrite the user's new level with the stale saved
+    prior — the "I turn it down and it blasts back up" bug. When a duck is active, update the saved restore
+    priors to `target` and signal the caller to SKIP the live write (option b: the bed stays suppressed through
+    the open window, and the new level lands on restore — so a louder mix can't leak into VAD mid-window).
+
+    Returns True if a duck was active (priors updated; caller should skip its live write), False otherwise
+    (no duck → caller does its normal live set). Keeps all duck-state mutation in this module. Never raises."""
+    try:
+        st = _state(ctx)
+        if st.get("tidal_prior") is None and st.get("tidal_sink_prior") is None:
+            return False
+        st["tidal_prior"] = int(target)
+        saved = st.get("tidal_sink_prior")
+        if saved is not None:
+            st["tidal_sink_prior"] = (saved[0], int(target))
+        return True
+    except Exception:
+        return False
+
+
+async def _duck_tidal_sink(ctx, on: bool, mute: bool = False, mixer_vol: int | None = None) -> None:
     """Belt-and-suspenders for the music duck: also attenuate the Mopidy stream at the SYSTEM node
     (PipeWire sink-input). Mopidy's software mixer proved intermittently inaudible (value changes but
     the output stays loud); the sink-input is the node the user reaches by hand, so it's reliably
-    heard. Best-effort, paired with the software-mixer duck in _duck_tidal. Never raises."""
+    heard. Best-effort, paired with the software-mixer duck in _duck_tidal. Never raises.
+
+    `mute=True` targets 0% instead of the ambient duck; it can also deepen an already-active duck to 0
+    without touching the saved prior tuple (so restore still returns to the real level).
+
+    `mixer_vol` is the Mopidy software-mixer level (the source of truth for the user's chosen volume),
+    threaded in by _duck_tidal so the sink restore prior mirrors the mixer rather than guessing from the
+    sink's own read. None on a standalone call → fall back to the sink read."""
     st = _state(ctx)
     try:
         if on:
-            if st.get("tidal_sink_prior") is not None:
-                return  # already ducked
+            sink_target = 0 if mute else _SINK_DUCK_PCT
+            saved = st.get("tidal_sink_prior")
+            if saved is not None:
+                if not (mute and not st.get("muted")):
+                    return  # already ducked, and not a fresh deepen-to-mute → leave it
+                # Deepen the existing duck to a full mute; keep the saved prior so restore is unaffected.
+                cur = await _mopidy_sink_input()
+                tgt_idx = cur[0] if cur else saved[0]
+                await _run_pactl("set-sink-input-volume", tgt_idx, "0%")
+                _tidal_dlog(ctx, phase="sink_deepen_mute", sink_idx=tgt_idx)
+                return
             found = await _mopidy_sink_input()
             if not found:
                 return
             idx, vol = found
-            prior = vol if vol is not None else 100
-            cap = _ambient_cap(ctx)
-            # Don't strand the music low across a brain restart: if it's already at/below the duck
-            # level, that's almost certainly a leftover duck, not a real user level — restore to the cap.
-            st["tidal_sink_prior"] = (idx, cap if prior <= _SINK_DUCK_PCT else prior)
-            await _run_pactl("set-sink-input-volume", idx, f"{_SINK_DUCK_PCT}%")
-            _tidal_dlog(ctx, phase="sink_on", sink_idx=idx, sink_prior=vol, ducked_to=_SINK_DUCK_PCT)
+            # The Mopidy software mixer is the source of truth for the user's chosen level; the sink-input
+            # mirrors it. Prefer the threaded mixer level for the restore prior; fall back to the sink's own
+            # read only when no mixer was supplied (a standalone call). We no longer fabricate the ambient
+            # cap when the sink reads low — that overrode a deliberately-low user level and caused the
+            # "turn it down → blasts back to 90" bug. A genuinely stranded-low sink is un-stranded separately
+            # by apply_ambient_cap's mirror-on-play; restore still clamps to the cap (line below in off-path).
+            prior = mixer_vol if mixer_vol is not None else (vol if vol is not None else 100)
+            st["tidal_sink_prior"] = (idx, prior)
+            await _run_pactl("set-sink-input-volume", idx, f"{sink_target}%")
+            _tidal_dlog(ctx, phase="sink_on", sink_idx=idx, sink_prior=vol, ducked_to=sink_target,
+                        saved_prior=prior)
             return
         saved = st.get("tidal_sink_prior")
         if not saved:
@@ -267,7 +383,7 @@ async def _duck_tidal_sink(ctx, on: bool) -> None:
         pass
 
 
-async def _duck_tidal(ctx, on: bool) -> bool:
+async def _duck_tidal(ctx, on: bool, mute: bool = False) -> bool:
     tc = getattr(ctx.config, "tidal", None)
     if not tc or not getattr(tc, "enabled", False):
         return False
@@ -275,7 +391,16 @@ async def _duck_tidal(ctx, on: bool) -> bool:
     st = _state(ctx)
     try:
         if on:
+            target = 0 if mute else _DUCK_VOLUME
             if st["tidal_prior"] is not None:
+                # Already ducked. A fresh mute DEEPENS it to 0 without re-reading/clobbering the saved
+                # prior; any other repeat is a no-op skip.
+                if mute and not st["muted"]:
+                    await _rpc(tc, "core.mixer.set_volume", {"volume": 0}, timeout=2.0)
+                    await _duck_tidal_sink(ctx, True, mute=True)
+                    st["muted"] = True
+                    _tidal_dlog(ctx, phase="deepen_mute", prior=st["tidal_prior"])
+                    return True
                 _tidal_dlog(ctx, phase="on_skip", prior=st["tidal_prior"])
                 return False  # already ducked — don't clobber the saved level
             state = await _rpc(tc, "core.playback.get_state", timeout=2.0)
@@ -286,10 +411,13 @@ async def _duck_tidal(ctx, on: bool) -> bool:
             if vol is None:
                 return False
             st["tidal_prior"] = int(vol)
-            await _rpc(tc, "core.mixer.set_volume", {"volume": _DUCK_VOLUME}, timeout=2.0)
-            await _duck_tidal_sink(ctx, True)   # also duck the system node (reliably audible)
+            await _rpc(tc, "core.mixer.set_volume", {"volume": target}, timeout=2.0)
+            # Thread the just-read mixer level so the sink restore prior mirrors the source of truth.
+            await _duck_tidal_sink(ctx, True, mute=mute, mixer_vol=int(vol))
+            if mute:
+                st["muted"] = True
             _tidal_dlog(ctx, phase="on", state=state, read_vol=int(vol), saved_prior=int(vol),
-                        ducked_to=_DUCK_VOLUME)
+                        ducked_to=target)
             return True
         if st["tidal_prior"] is None:
             return False
@@ -306,7 +434,7 @@ async def _duck_tidal(ctx, on: bool) -> bool:
         return False
 
 
-async def _duck_jellyfin(ctx, on: bool) -> bool:
+async def _duck_jellyfin(ctx, on: bool, mute: bool = False) -> bool:
     jc = getattr(ctx.config, "jellyfin", None)
     if not jc or not getattr(jc, "enabled", True) or not jc.api_key:
         return False
@@ -315,16 +443,26 @@ async def _duck_jellyfin(ctx, on: bool) -> bool:
     from gabagent.commands.providers.jellyfin import _live_jellyfin_page
     page = _live_jellyfin_page(ctx)
     if page is not None:
-        return await _duck_jellyfin_video(ctx, page, on)
-    return await _duck_jellyfin_rest(ctx, jc, on)
+        return await _duck_jellyfin_video(ctx, page, on, mute)
+    # No brain-OWNED movie page → nothing to AUTO-duck here. A bare /Sessions client may be on ANOTHER
+    # device/room; auto-pausing it controlled the wrong screen AND flapped the gate (the cross-device bug).
+    # Cross-device transport is Phase-2 EXPLICIT-only — via the inventory + `_duck_jellyfin_rest` (kept).
+    return False
 
 
-async def _duck_jellyfin_video(ctx, page, on: bool) -> bool:
+async def _duck_jellyfin_video(ctx, page, on: bool, mute: bool = False) -> bool:
     from gabagent.commands.providers.jellyfin import _video_volume, _set_video_volume
     st = _state(ctx)
     try:
         if on:
+            target = 0.0 if mute else _DUCK_VIDEO_VOLUME
             if st["jellyfin_video_volume"] is not None:
+                # Already ducked. A fresh mute DEEPENS to 0.0 without clobbering the saved prior.
+                if mute and not st["muted"]:
+                    ok = await _set_video_volume(page, 0.0)
+                    if ok:
+                        st["muted"] = True
+                    return ok
                 return False  # already ducked — don't clobber the saved level
             prior = await _video_volume(page)
             if prior is None:
@@ -333,7 +471,9 @@ async def _duck_jellyfin_video(ctx, page, on: bool) -> bool:
             # there by a brain restart mid-duck (the saved prior is in-memory, lost on restart).
             # Saving that as the restore target would keep the movie quiet forever — restore to full.
             st["jellyfin_video_volume"] = 1.0 if float(prior) <= _DUCK_VIDEO_VOLUME else float(prior)
-            await _set_video_volume(page, _DUCK_VIDEO_VOLUME)
+            await _set_video_volume(page, target)
+            if mute:
+                st["muted"] = True
             return True
         if st["jellyfin_video_volume"] is None:
             return False
@@ -349,7 +489,9 @@ async def _duck_jellyfin_video(ctx, page, on: bool) -> bool:
         return False
 
 
-async def _duck_jellyfin_rest(ctx, jc, on: bool) -> bool:
+async def _duck_jellyfin_rest(ctx, jc, on: bool, mute: bool = False) -> bool:
+    # A REST-controlled client is PAUSED to duck (already fully silent), so `mute` is a no-op here —
+    # the param exists only to keep the provider signatures uniform.
     from gabagent.commands.providers.jellyfin import _sessions, _client
     st = _state(ctx)
     try:

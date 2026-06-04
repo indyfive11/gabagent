@@ -37,6 +37,21 @@ class TidalProvider:
         except Exception:
             return False
 
+    async def sources(self, ctx: AgentContext):
+        """Mopidy/TIDAL is a single local player the brain owns — runs on this box, on the default sink.
+        One owned-local audio source when something is loaded. Never raises."""
+        tc = getattr(ctx.config, "tidal", None)
+        if not tc or not getattr(tc, "enabled", False):
+            return []
+        try:
+            st = await _rpc(tc, "core.playback.get_state", timeout=2.0)
+        except Exception:
+            return []
+        if st not in ("playing", "paused"):
+            return []
+        from gabagent.commands.media import MediaSource
+        return [MediaSource(provider="tidal", kind="audio", state=st, owned=True, locality="local")]
+
     def commands(self, ctx: AgentContext) -> list[Command]:
         ref = "gabagent.commands.providers.tidal:"
         return [
@@ -355,7 +370,12 @@ async def set_volume(ctx, level=None) -> ToolResult:
         return ToolResult(output="", error="that volume isn't a number")
     target = max(_volume_floor(ctx), min(100, target))
     try:
-        await _set_stream_volume(ctx, target)
+        # If a duck/command window is open, don't write the live output — that would unduck the bed
+        # mid-window and re-open the music-leak the duck suppresses. Instead record the new level so the
+        # duck-off restore returns to it (option b). With no duck active, set the live stream as usual.
+        from gabagent.voice.ducking import note_user_volume
+        if not note_user_volume(ctx, target):
+            await _set_stream_volume(ctx, target)
     except Exception as e:
         return ToolResult(output="", error=f"couldn't set the volume: {_human_err(e)}")
     return ToolResult(output=f"Set the music volume to {target} percent.")
