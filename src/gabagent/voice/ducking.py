@@ -278,9 +278,25 @@ async def apply_ambient_cap(ctx) -> None:
                 if mixer > cap:                                # lower-only: never raise the user's level
                     await _rpc(tc, "core.mixer.set_volume", {"volume": cap}, timeout=2.0)
                     mixer = cap
-        # Don't fight an in-progress speech duck — the sink is intentionally at the duck level then.
-        if _state(ctx).get("tidal_sink_prior") is not None:
-            _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer, skipped="ducking")
+        # A speech duck is in progress — the sink is intentionally at the duck level, so don't mirror the
+        # mixer onto it (that would un-duck the bed mid-window). BUT a new track can start mid-duck (Rob
+        # rapid-changing songs while the window is open): it gets a FRESH sink-input that stream-restore
+        # brings up at a stale level, and the saved prior still points at the old track's index. Left alone
+        # it strands — quiet ("I don't hear music") or, worse, blasting over the user. So reconcile a NEW
+        # sink-input to the active duck level and re-point the saved tuple at it (keeping the prior level so
+        # duck-off still restores the user's real volume). This is the F1 residual fix. (ducking.py F1.)
+        saved = _state(ctx).get("tidal_sink_prior")
+        if saved is not None:
+            old_idx, prior = saved
+            cur = await _mopidy_sink_input()
+            if cur and cur[0] != old_idx:
+                duck_target = 0 if _state(ctx).get("muted") else _SINK_DUCK_PCT
+                await _run_pactl("set-sink-input-volume", cur[0], f"{duck_target}%")
+                _state(ctx)["tidal_sink_prior"] = (cur[0], prior)
+                _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer,
+                            reconciled_sink=cur[0], duck_target=duck_target)
+            else:
+                _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer, skipped="ducking")
             return
         # Mirror the (capped) mixer onto the sink-input — fall back to the cap if the mixer is unknown.
         # This RAISES a stranded-low sink-input (stream-restore replayed a duck) back to the real level, and
