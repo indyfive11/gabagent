@@ -57,8 +57,17 @@ Return ONLY one tag — no other text:
 [ADDRESSED] — a request, question, or command for Aria to act on or answer (including indirect ones
 like "it's too quiet" or "I can't hear it").
 [ASIDE] — NOT for Aria: an exclamation or curse, thinking aloud, talking to someone else, or
-commentary ABOUT Aria rather than a request to her (e.g. "that was a false positive",
-"the goal is it doesn't trip when I'm just talking").
+commentary ABOUT Aria rather than a request to her.
+
+Decisive rule: speech that REFERS TO Aria but is aimed at someone else is an ASIDE, even when it uses
+"you" or sounds like a question. Addressed means the user wants Aria herself to respond NOW.
+Examples:
+- "that was a false positive" → [ASIDE] (commentary about her)
+- "the goal is it doesn't trip when I'm just talking" → [ASIDE]
+- "he still hasn't bothered to respond, if you noticed" → [ASIDE] (narrating to someone else, "you" is about her)
+- "isn't that incredible?" → [ASIDE] (rhetorical, not a request)
+- "Mel, tell me something interesting" → [ASIDE] (addressed to Mel)
+- "turn it up" / "what's the weather" / "it's too quiet in here" → [ADDRESSED]
 
 When genuinely unsure, return [ADDRESSED].
 
@@ -72,8 +81,9 @@ def _fast_verdict(text: str) -> bool | None:
     t = text.strip().lower()
     if not t:
         return None
-    if t.endswith("?"):                         # a question is addressed
-        return True
+    # NB: a trailing "?" is deliberately NOT a fast-pass — rhetoricals ("isn't that wild?", "really?")
+    # are asides, so anything question-shaped but not led by a question word goes to the classifier.
+    # Genuine questions still fast-pass via their leading question word (what/how/is/are/can…) below.
     words = [w.strip(".,!?;:\"'") for w in t.split()]
     if "aria" in words:                         # naming the assistant is addressed
         return True

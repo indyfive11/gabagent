@@ -28,10 +28,14 @@ def test_fast_verdict_obvious_commands_are_addressed(text):
     "so the whole goal is that the voice doesn't trip when just talking",
     "that was a false positive",
     "ugh, never mind",
+    "isn't that incredible?",        # rhetorical: trailing "?" is NOT a fast-pass anymore
+    "really?",                       # rhetorical question, no question-word lead → defer
+    "he still hasn't bothered to respond if you noticed",  # 2nd-person ABOUT the bot → defer
     "",                              # empty → defer (not a hard True)
 ])
 def test_fast_verdict_ambiguous_defers_to_model(text):
-    # Heuristic NEVER hard-suppresses — ambiguity is None (→ LLM), never False.
+    # Heuristic NEVER hard-suppresses — ambiguity is None (→ LLM), never False. A trailing "?" alone
+    # no longer fast-passes (rhetoricals); genuine questions still fast-pass via their question word.
     assert _fast_verdict(text) is None
 
 
