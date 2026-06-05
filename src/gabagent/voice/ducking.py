@@ -253,7 +253,7 @@ def _ambient_cap(ctx) -> int:
     return max(1, min(100, c))
 
 
-async def apply_ambient_cap(ctx) -> None:
+async def apply_ambient_cap(ctx, new_track: bool = True) -> None:
     """Cap currently-playing music at the ambient ceiling so VAD can hear the user over it, AND mirror
     the (capped) software-mixer level onto the PipeWire sink-input. Called when music starts.
 
@@ -288,13 +288,29 @@ async def apply_ambient_cap(ctx) -> None:
         saved = _state(ctx).get("tidal_sink_prior")
         if saved is not None:
             old_idx, prior = saved
-            cur = await _mopidy_sink_input()
-            if cur and cur[0] != old_idx:
+            # The new track's sink-input appears a BEAT after tidal.play returns (the same race the
+            # no-duck path polls through above), so a single lookup here finds the OLD sink or none and
+            # the reconcile is missed — the new track then strands at a stale level if the window stays
+            # open. POLL for a sink whose index DIFFERS from the ducked one, early-exiting the instant it
+            # shows, then duck it to the active level and re-point the saved tuple (keeping the prior
+            # LEVEL so duck-off still restores the real volume). On a resume (new_track=False) the same
+            # stream is already ducked — single check, no poll, so resume-in-window pays no latency.
+            new = None
+            tries = _AMBIENT_SETTLE_TRIES if new_track else 1
+            for _ in range(tries):
+                cur = await _mopidy_sink_input()
+                if cur and cur[0] != old_idx:
+                    new = cur
+                    break
+                if not new_track:
+                    break
+                await asyncio.sleep(_AMBIENT_SETTLE_DELAY)   # new sink not up yet — wait for it
+            if new is not None:
                 duck_target = 0 if _state(ctx).get("muted") else _SINK_DUCK_PCT
-                await _run_pactl("set-sink-input-volume", cur[0], f"{duck_target}%")
-                _state(ctx)["tidal_sink_prior"] = (cur[0], prior)
+                await _run_pactl("set-sink-input-volume", new[0], f"{duck_target}%")
+                _state(ctx)["tidal_sink_prior"] = (new[0], prior)
                 _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer,
-                            reconciled_sink=cur[0], duck_target=duck_target)
+                            reconciled_sink=new[0], duck_target=duck_target)
             else:
                 _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer, skipped="ducking")
             return

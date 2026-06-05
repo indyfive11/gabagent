@@ -253,12 +253,13 @@ async def search(ctx, query="", limit=8) -> ToolResult:
     return ToolResult(output=json.dumps(tracks + albums))
 
 
-async def _hold_ambient(ctx) -> None:
+async def _hold_ambient(ctx, new_track: bool = True) -> None:
     """Cap the just-started music at the ambient ceiling so VAD can hear the user over it. Best-effort
-    (local import to avoid a cycle with the voice layer)."""
+    (local import to avoid a cycle with the voice layer). `new_track` is False on a resume-in-place (the
+    sink is unchanged) so apply_ambient_cap skips polling for a fresh sink-input."""
     try:
         from gabagent.voice.ducking import apply_ambient_cap
-        await apply_ambient_cap(ctx)
+        await apply_ambient_cap(ctx, new_track=new_track)
     except Exception:
         pass
 
@@ -298,7 +299,7 @@ async def play(ctx, query="", uri="", album=False) -> ToolResult:
             await _rpc(tc, "core.playback.resume", timeout=2.0)
         except Exception:
             pass
-        await _hold_ambient(ctx)
+        await _hold_ambient(ctx, new_track=False)   # resume in place — same sink, no reconcile poll
         return ToolResult(output=f"Resuming {label} on TIDAL." if label else "Resuming on TIDAL.")
     try:
         await _play_uris(tc, [uri])

@@ -415,6 +415,56 @@ async def test_apply_ambient_cap_reconciles_new_track_mid_duck(monkeypatch):
     assert _dk._state(ctx)["tidal_sink_prior"] == ("9", 70)      # tuple re-pointed; prior preserved
 
 
+async def test_apply_ambient_cap_reconcile_polls_for_late_new_sink(monkeypatch):
+    """F1-residual race: the new track's sink-input appears a beat after tidal.play returns, so a single
+    lookup finds the OLD sink and misses the reconcile. apply_ambient_cap must POLL for a new-index sink."""
+    attempts = {"n": 0}
+    async def fake_sink():
+        attempts["n"] += 1
+        return ("4", 0) if attempts["n"] < 3 else ("9", 70)   # old sink lingers, new ("9") appears 3rd poll
+    calls = []
+    async def fake_pactl(*a, **k):
+        calls.append(a); return (0, "")
+    async def no_sleep(_s):
+        return None
+    monkeypatch.setattr(_dk, "_mopidy_sink_input", fake_sink)
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    monkeypatch.setattr(_dk.asyncio, "sleep", no_sleep)
+    import gabagent.commands.providers.tidal as td
+    async def fake_rpc(tc, method, params=None, timeout=2.0):
+        return 50 if method == "core.mixer.get_volume" else None
+    monkeypatch.setattr(td, "_rpc", fake_rpc)
+    ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=90))
+    _dk._state(ctx)["tidal_sink_prior"] = ("4", 70)             # duck active, on the OLD sink
+    await _dk.apply_ambient_cap(ctx)                            # new_track defaults True → polls
+    assert attempts["n"] == 3                                   # polled until the new sink appeared
+    assert ("set-sink-input-volume", "9", f"{_dk._SINK_DUCK_PCT}%") in calls
+    assert _dk._state(ctx)["tidal_sink_prior"] == ("9", 70)     # re-pointed to the new sink
+
+
+async def test_apply_ambient_cap_resume_skips_reconcile_poll(monkeypatch):
+    """A resume-in-place (new_track=False) reuses the same sink, so apply_ambient_cap must NOT poll —
+    single check, no reconcile, no added latency on a resume while a window is open."""
+    attempts = {"n": 0}
+    async def fake_sink():
+        attempts["n"] += 1
+        return ("4", 0)                                        # same ducked sink, never a new index
+    calls = []
+    async def fake_pactl(*a, **k):
+        calls.append(a); return (0, "")
+    monkeypatch.setattr(_dk, "_mopidy_sink_input", fake_sink)
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    import gabagent.commands.providers.tidal as td
+    async def fake_rpc(tc, method, params=None, timeout=2.0):
+        return 50 if method == "core.mixer.get_volume" else None
+    monkeypatch.setattr(td, "_rpc", fake_rpc)
+    ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=90))
+    _dk._state(ctx)["tidal_sink_prior"] = ("4", 70)
+    await _dk.apply_ambient_cap(ctx, new_track=False)          # resume → no poll
+    assert attempts["n"] == 1                                   # single check only
+    assert not any(a and a[0] == "set-sink-input-volume" for a in calls)  # nothing re-ducked
+
+
 async def test_apply_ambient_cap_reconciles_new_track_to_zero_when_muted(monkeypatch):
     """A new mid-duck track during a MUTED window reconciles to 0%, not the partial duck level."""
     async def fake_sink():
