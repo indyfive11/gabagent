@@ -111,6 +111,11 @@ class GabAgentConfig(BaseSettings):
     voice_persona: str = ""
     voice_arm_seconds: int = 120
     voice_debug_log: bool = False  # opt-in per-turn brain-side debug log (keyed by session_id)
+    # "Addressed-to-me?" filter: while the wake window is open, an undirected utterance (a curse,
+    # thinking aloud, commentary about the assistant) gets NO reply/action. Hybrid: obvious
+    # commands/questions skip the check; only ambiguous utterances pay a one-shot classify. Bias is
+    # answer-when-unsure so it never eats a command. Env: GABAI_VOICE_INTENT_FILTER.
+    voice_intent_filter: bool = True
     commands_enabled: bool = True  # voice command framework (capability discovery + run_command)
     # Hold playing music at this % cap continuously (not just on speech) so VAD can hear the user over
     # it — the speech-duck drops it deeper, then restores to this cap. 100 disables. Slide down if VAD

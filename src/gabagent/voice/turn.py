@@ -287,6 +287,20 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             return
         dlog(ctx, "meta", matched="none", routed="llm")
 
+        # "Addressed-to-me?" filter: the wake window passes follow-on speech for multi-part commands,
+        # so undirected speech (a curse, thinking aloud, commentary about the assistant) can land here
+        # and otherwise get a spoken reply it shouldn't. If this utterance isn't directed at the
+        # assistant, emit nothing — no reply, no action, no history append — and close the turn. The
+        # gate stays the wake authority; this is complementary, catching what slips through an open
+        # (or false-wake) window. Conservative: answers when unsure, so it never eats a real command.
+        if getattr(ctx.config, "voice_intent_filter", True):
+            from gabagent.voice.addressed import is_addressed
+            addressed, via = await is_addressed(ctx, user_text)
+            dlog(ctx, "addressed", match=addressed, via=via)
+            if not addressed:
+                await emit(events.done())
+                return
+
         ctx.session.append_message(ChatMessage(role="user", content=user_text))
 
         router = None
