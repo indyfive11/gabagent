@@ -64,7 +64,8 @@ def test_system_extraction_and_tool_result_coalescing():
         ChatMessage(role="system", content="B"),
         ChatMessage(role="user", content="hi"),
         ChatMessage(role="assistant", content="ok",
-                    tool_calls=[ToolCallSpec(id="toolu_1", name="read", arguments='{"p":1}')]),
+                    tool_calls=[ToolCallSpec(id="toolu_1", name="read", arguments='{"p":1}'),
+                                ToolCallSpec(id="toolu_2", name="read", arguments='{"p":2}')]),
         ChatMessage(role="tool", content="r1", tool_call_id="toolu_1"),
         ChatMessage(role="tool", content="r2", tool_call_id="toolu_2"),
     ]
@@ -85,6 +86,48 @@ def test_empty_assistant_turn_skipped():
     msgs = [ChatMessage(role="assistant", content=None)]
     _, out = ClaudetteClient._convert_messages(msgs)
     assert out == []
+
+
+def test_orphan_leading_tool_result_dropped():
+    # History windowing trimmed off the assistant tool_use, leaving a result whose tool_use is gone.
+    # Anthropic 400s if the message list starts with such an orphan; the sanitizer must drop it.
+    msgs = [
+        ChatMessage(role="tool", content="stale", tool_call_id="toolu_x"),
+        ChatMessage(role="user", content="next thing"),
+        ChatMessage(role="assistant", content="sure"),
+    ]
+    _, out = ClaudetteClient._convert_messages(msgs)
+    assert [m["role"] for m in out] == ["user", "assistant"]
+    # no tool_result block survives anywhere
+    for m in out:
+        if isinstance(m["content"], list):
+            assert all(b.get("type") != "tool_result" for b in m["content"])
+
+
+def test_dangling_tool_use_dropped_text_kept():
+    # An aborted/barge-in turn left a tool_use with no following result; Anthropic 400s on it.
+    msgs = [
+        ChatMessage(role="user", content="do it"),
+        ChatMessage(role="assistant", content="working on it",
+                    tool_calls=[ToolCallSpec(id="toolu_y", name="edit", arguments="{}")]),
+        ChatMessage(role="user", content="never mind"),
+    ]
+    _, out = ClaudetteClient._convert_messages(msgs)
+    assert [m["role"] for m in out] == ["user", "assistant", "user"]
+    asst = out[1]["content"]
+    assert asst == [{"type": "text", "text": "working on it"}]  # tool_use dropped, text retained
+
+
+def test_dangling_tool_use_only_drops_whole_message():
+    # Assistant message that was *only* a dangling tool_use (no text) is removed entirely.
+    msgs = [
+        ChatMessage(role="user", content="do it"),
+        ChatMessage(role="assistant", content=None,
+                    tool_calls=[ToolCallSpec(id="toolu_z", name="edit", arguments="{}")]),
+        ChatMessage(role="user", content="stop"),
+    ]
+    _, out = ClaudetteClient._convert_messages(msgs)
+    assert [m["role"] for m in out] == ["user", "user"]
 
 
 def test_tool_schema_conversion():

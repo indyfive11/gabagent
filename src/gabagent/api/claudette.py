@@ -104,7 +104,45 @@ class ClaudetteClient:
                     out.append({"role": "assistant", "content": blocks})
                 continue
 
-        return "\n\n".join(system_parts), out
+        return "\n\n".join(system_parts), ClaudetteClient._pair_tool_blocks(out)
+
+    @staticmethod
+    def _pair_tool_blocks(out: list[dict]) -> list[dict]:
+        """Drop tool_use/tool_result blocks that lost their partner, plus any message left empty.
+
+        Anthropic strictly requires every tool_use to be followed by its tool_result and every
+        tool_result to be preceded by its tool_use (gab.ai tolerated unpaired blocks; Anthropic
+        400s). History windowing (voice/turn.py, agent/loop.py slice the recent tail) can cut
+        between a pair, and an aborted/barge-in turn can leave a tool_use with no result — both
+        desync the list. Enforce the invariant here so the payload is valid regardless of how
+        upstream trimmed it.
+        """
+        use_ids: set[str] = set()
+        result_ids: set[str] = set()
+        for m in out:
+            content = m["content"]
+            if not isinstance(content, list):
+                continue
+            for b in content:
+                if b.get("type") == "tool_use":
+                    use_ids.add(b.get("id"))
+                elif b.get("type") == "tool_result":
+                    result_ids.add(b.get("tool_use_id"))
+
+        cleaned: list[dict] = []
+        for m in out:
+            content = m["content"]
+            if not isinstance(content, list):
+                cleaned.append(m)
+                continue
+            kept = [
+                b for b in content
+                if not (b.get("type") == "tool_use" and b.get("id") not in result_ids)
+                and not (b.get("type") == "tool_result" and b.get("tool_use_id") not in use_ids)
+            ]
+            if kept:  # drop a message emptied by the cull (orphan-only result, dangling-only use)
+                cleaned.append({**m, "content": kept})
+        return cleaned
 
     @staticmethod
     def _convert_tools(tools: list[dict] | None) -> list[dict] | None:
