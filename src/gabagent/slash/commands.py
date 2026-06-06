@@ -30,6 +30,7 @@ async def handle_slash(command: str, ctx: AgentContext) -> bool:
         "/msg": _msg,
         "/inbox": _inbox,
         "/local": _local,
+        "/backend": _backend,
         "/voice": _voice,
         "/skills": _skills,
         "/attestation": _attestation,
@@ -68,7 +69,8 @@ async def _help(arg: str, ctx: AgentContext) -> None:
         ("/msg <text>", "Send a message to Claude Code"),
         ("/inbox", "Check messages from Claude Code"),
         ("/local [on|off]", "Toggle local Ollama model (starts on demand)"),
-        ("/voice [on|off]", "Start/stop the voice brain server (talk to it via voice-agent)"),
+        ("/backend [gab|claude]", "Show or switch the LLM backend (the brain)"),
+        ("/voice [on|brain|off]", "on=brain+mic front-end (talk by voice); brain=brain only; off=stop"),
         ("/skills [list|install <path>]", "Manage attested skill plugins (capabilities)"),
         ("/attestation", "View/set how skill plugins are vetted"),
         ("/exit", "Exit Gab-Agent"),
@@ -97,6 +99,41 @@ async def _model(arg: str, ctx: AgentContext) -> None:
         active = ctx.active_model or ctx.config.model
         console.print(f"[info]Current model: {active}[/info]", markup=True)
         console.print(f"[info]Usage: {ctx.rate_limiter.badge}[/info]", markup=True)
+
+
+async def _backend(arg: str, ctx: AgentContext) -> None:
+    target = arg.strip().lower()
+    if not target:
+        prov = ctx.config.provider
+        base = ctx.config.claude.ladder[0].model if prov == "claude" else ctx.config.model
+        console.print(f"[info]Backend: {prov}  (base model: {base})[/info]", markup=True)
+        console.print("[dim]Switch with: /backend gab  ·  /backend claude[/dim]", markup=True)
+        return
+    if target not in ("gab", "claude"):
+        console.print(f"[warning]Unknown backend '{target}'. Use: /backend gab|claude[/warning]", markup=True)
+        return
+
+    import os
+    if target == "claude" and not (ctx.config.claude.api_key or os.environ.get("ANTHROPIC_API_KEY")):
+        console.print(
+            "[warning]No Anthropic key set. Run 'gab --set-claude-key <key>' or set ANTHROPIC_API_KEY first.[/warning]",
+            markup=True,
+        )
+        return
+
+    ctx.config.provider = target
+    if target == "claude":
+        ctx.config.model = ctx.config.claude.ladder[0].model
+    # Reset per-turn routing state so the next turn re-classifies on the new provider.
+    ctx.active_model = None
+    ctx.active_effort = None
+
+    from gabagent.api.factory import build_client
+    ctx.client = build_client(ctx.config, ctx.rate_limiter)
+
+    from gabagent.config.loader import save_config
+    save_config(ctx.config)
+    console.print(f"[info]Backend switched to: {target}  (base model: {ctx.client.model})[/info]", markup=True)
 
 
 async def _cost(arg: str, ctx: AgentContext) -> None:
@@ -346,7 +383,9 @@ async def _local(arg: str, ctx: AgentContext) -> None:
 
 
 async def _voice(arg: str, ctx: AgentContext) -> None:
-    from gabagent.voice.launcher import start_brain, stop_brain, brain_health
+    from gabagent.voice.launcher import (
+        start_brain, stop_brain, brain_health, start_frontend, stop_frontend,
+    )
 
     parts = arg.strip().split()
     sub = parts[0].lower() if parts else "status"
@@ -359,46 +398,92 @@ async def _voice(arg: str, ctx: AgentContext) -> None:
         up = await brain_health(base)
         if up:
             owner = "started here" if ctx.voice_process is not None else "external"
+            fe = (ctx.voice_frontend_process is not None
+                  and ctx.voice_frontend_process.poll() is None)
             console.print(
-                f"[gab.accent]◆[/gab.accent] [dim]Voice brain: [green]ON[/green] — {base} ({owner})[/dim]",
+                f"[gab.accent]◆[/gab.accent] [dim]Voice brain: [green]ON[/green] — {base} ({owner})  "
+                f"front-end: {'[green]listening[/green]' if fe else 'not started here'}[/dim]",
                 markup=True,
             )
         else:
             console.print("[dim]Voice brain: OFF. Use /voice on to start it.[/dim]", markup=True)
 
-    elif sub == "on":
+    elif sub in ("on", "brain"):
+        want_frontend = sub == "on"
         console.print("[dim]Starting voice brain…[/dim]", markup=True)
         running, spawned, msg = await start_brain(ctx, port)
-        if running:
-            tag = "started" if spawned else "already running — attached"
+        if not running:
+            from gabagent.config.paths import data_dir
+            console.print(f"[error]Could not start voice brain: {msg}[/error]", markup=True)
+            console.print(f"[dim]  See {data_dir() / 'voice-serve.log'}[/dim]", markup=True)
+            return
+
+        tag = "started" if spawned else "already running — attached"
+        console.print(
+            f"[gab.accent]◆[/gab.accent] [dim]Voice brain {tag} on {base}[/dim]", markup=True
+        )
+
+        if not want_frontend:
             console.print(
-                f"[gab.accent]◆[/gab.accent] [dim]Voice brain {tag} on {base}[/dim]", markup=True
+                "[dim]  Brain only. Start voice-agent yourself to talk, or use /voice on next time.[/dim]",
+                markup=True,
+            )
+            return
+
+        # Only grab the mic when WE own the brain — an external brain almost certainly already has a
+        # front-end attached, and a second one would double-capture the mic.
+        if not spawned:
+            console.print(
+                "[dim]  Brain was already running — assuming a front-end is attached. "
+                "Not starting another (use /voice brain to skip this).[/dim]",
+                markup=True,
+            )
+            return
+
+        console.print("[dim]Starting voice-agent front-end (so the brain can hear)…[/dim]", markup=True)
+        fe_ok, fe_msg = await start_frontend(ctx, port)
+        if fe_ok:
+            console.print(
+                "[gab.accent]◆[/gab.accent] [dim]Front-end listening — say your wake word to continue "
+                "this conversation by voice.[/dim]",
+                markup=True,
             )
             console.print(
-                "[dim]  Start voice-agent to talk. "
-                "Tip: avoid typing here while talking — you share this conversation.[/dim]",
+                "[dim]  Tip: avoid typing here while talking — you share this conversation.[/dim]",
                 markup=True,
             )
         else:
             from gabagent.config.paths import data_dir
-            console.print(f"[error]Could not start voice brain: {msg}[/error]", markup=True)
-            console.print(f"[dim]  See {data_dir() / 'voice-serve.log'}[/dim]", markup=True)
+            console.print(
+                f"[warning]Brain is up, but the front-end didn't start: {fe_msg}[/warning]", markup=True
+            )
+            console.print(
+                f"[dim]  Start voice-agent manually to talk. See {data_dir() / 'voice-frontend.log'}[/dim]",
+                markup=True,
+            )
 
     elif sub == "off":
+        stopped_any = False
+        if ctx.voice_frontend_process is not None:
+            stop_frontend(ctx)
+            console.print("[dim]Voice front-end stopped.[/dim]", markup=True)
+            stopped_any = True
         if ctx.voice_process is not None:
             stop_brain(ctx)
             console.print("[dim]Voice brain stopped.[/dim]", markup=True)
-        elif await brain_health(base):
-            console.print(
-                "[warning]A voice brain is running but wasn't started here — leaving it running. "
-                "Stop it where it was launched.[/warning]",
-                markup=True,
-            )
-        else:
-            console.print("[dim]No voice brain to stop.[/dim]", markup=True)
+            stopped_any = True
+        if not stopped_any:
+            if await brain_health(base):
+                console.print(
+                    "[warning]A voice brain is running but wasn't started here — leaving it running. "
+                    "Stop it where it was launched.[/warning]",
+                    markup=True,
+                )
+            else:
+                console.print("[dim]No voice brain to stop.[/dim]", markup=True)
 
     else:
-        console.print("[warning]Usage: /voice [on|off|status][/warning]", markup=True)
+        console.print("[warning]Usage: /voice [on|brain|off|status][/warning]", markup=True)
 
 
 _TIER_NAME = {1: "auto", 2: "spoken-yes", 3: "keyboard"}

@@ -42,6 +42,38 @@ class RouterConfig(BaseModel):
     complex_model: str = "claude-sonnet-4-5"
 
 
+class Rung(BaseModel):
+    """One step on the Claude escalation ladder: a (model, effort) pair.
+
+    `effort=""` means plain / no thinking (the bottom-rung haiku default — effort and
+    adaptive thinking 400 on Haiku 4.5). Otherwise one of low|medium|high|max, applied
+    only to models that support it (opus/sonnet).
+    """
+    model: str
+    effort: str = ""
+
+
+def _default_ladder() -> list[Rung]:
+    # Ascending: least-capable/no-thinking → most-capable/high-effort. The bottom rung's
+    # model doubles as the per-turn rung classifier model (cheapest call).
+    return [
+        Rung(model="claude-haiku-4-5", effort=""),        # rung 0 — bottom: no thinking
+        Rung(model="claude-sonnet-4-6", effort="low"),
+        Rung(model="claude-sonnet-4-6", effort="high"),
+        Rung(model="claude-opus-4-8", effort="medium"),
+        Rung(model="claude-opus-4-8", effort="high"),
+        Rung(model="claude-opus-4-8", effort="xhigh"),    # agentic-coding default
+        Rung(model="claude-opus-4-8", effort="max"),      # rung 6 — top: absolute ceiling (Opus-only)
+    ]
+
+
+class ClaudeConfig(BaseModel):
+    """Anthropic ("claudette") backend settings, used when provider == "claude"."""
+    api_key: str = ""                     # or set ANTHROPIC_API_KEY in the env
+    max_tokens: int = 8192
+    ladder: list[Rung] = Field(default_factory=_default_ladder)
+
+
 class AttestationConfig(BaseModel):
     """How skill plugins are vetted before they may run."""
     reviewer: str = "claude_api"          # claude_api | claude_code_bridge | off
@@ -87,6 +119,9 @@ class GabAgentConfig(BaseSettings):
         extra="ignore",
     )
 
+    # Active LLM backend: "gab" (OpenAI-compatible gab.ai) or "claude" (Anthropic). The
+    # local Ollama path is reached via local_model regardless of provider. Env: GABAI_PROVIDER.
+    provider: str = "gab"
     api_key: str = ""
     base_url: str = "https://gab.ai/v1"
     model: str = "arya"
@@ -110,6 +145,11 @@ class GabAgentConfig(BaseSettings):
     voice_passphrase: str = ""
     voice_persona: str = ""
     voice_arm_seconds: int = 120
+    # `/voice on` spawns the voice-agent front-end (mic + wake word) so the brain can hear, pointed at
+    # the brain we just started. Empty → auto-resolve the `voice-agent` binary on PATH, then
+    # ~/dev/voice-agent/run.sh. Override for a non-standard install. The brain port is passed via
+    # GAB_PORT so the front-end ATTACHES to our brain instead of spawning its own.
+    voice_agent_cmd: list[str] = Field(default_factory=list)
     voice_debug_log: bool = False  # opt-in per-turn brain-side debug log (keyed by session_id)
     # "Addressed-to-me?" filter: while the wake window is open, an undirected utterance (a curse,
     # thinking aloud, commentary about the assistant) gets NO reply/action. Hybrid: obvious
@@ -130,6 +170,7 @@ class GabAgentConfig(BaseSettings):
     # judges local to this device; remote sources are visible (for future explicit control) but never touched
     # automatically. Env: GABAI_LOCAL_DEVICE.
     local_device: str = ""
+    claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
     attestation: AttestationConfig = Field(default_factory=AttestationConfig)
     jellyfin: JellyfinConfig = Field(default_factory=JellyfinConfig)
     tidal: TidalConfig = Field(default_factory=TidalConfig)

@@ -48,7 +48,7 @@ class SpawnAgentTool(ToolBase):
 
 async def _spawn_foreground(ctx: AgentContext, prompt: str, model: str | None) -> ToolResult:
     from gabagent.config.loader import load_config
-    from gabagent.api.client import GabAIClient
+    from gabagent.api.factory import build_client
     from gabagent.api.rate_limit import RateLimiter
     from gabagent.agent.context import AgentContext as Ctx
     from gabagent.agent.system_prompt import build_system_prompt
@@ -71,12 +71,7 @@ async def _spawn_foreground(ctx: AgentContext, prompt: str, model: str | None) -
 
     sub_ctx = Ctx(
         config=cfg,
-        client=GabAIClient(
-            api_key=cfg.api_key,
-            base_url=cfg.base_url,
-            model=cfg.model,
-            rate_limiter=ctx.rate_limiter,
-        ),
+        client=build_client(cfg, ctx.rate_limiter, model=cfg.model if model else None),
         rate_limiter=ctx.rate_limiter,
         session=sf,
         session_id=sid,

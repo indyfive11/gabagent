@@ -273,7 +273,12 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
                 (m.content for m in reversed(messages) if m.role == "user" and m.content),
                 "",
             )
-            ctx.active_model = await router.classify_intent(last_user, ctx.client)
+            if ctx.config.provider == "claude":
+                rung = router.rung(await router.classify_rung(last_user, ctx.client))
+                ctx.active_model = rung.model
+                ctx.active_effort = rung.effort or None
+            else:
+                ctx.active_model = await router.classify_intent(last_user, ctx.client)
 
         tools = registry.get_schemas()
 
@@ -283,9 +288,10 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
         try:
             display_model = ctx.config.local_model if ctx.local_mode else (ctx.active_model or ctx.config.model)
             request_model = None if ctx.local_mode else ctx.active_model
+            request_effort = None if ctx.local_mode else ctx.active_effort
             streaming.start(model=display_model)
             async for chunk in _active_client(ctx).stream_complete(
-                all_messages, tools or None, model=request_model
+                all_messages, tools or None, model=request_model, effort=request_effort
             ):
                 if isinstance(chunk, str):
                     streaming.append(chunk)
@@ -405,13 +411,27 @@ async def _execute_tool_calls(
 
         # Tool-triggered escalation
         if router and not ctx.force_model:
-            override = router.check_tool_complexity(tc.name, args)
-            if override and override != (ctx.active_model or router.simple_model):
-                ctx.active_model = override
-                if not getattr(ctx, "voice_mode", False):
-                    console.print(
-                        f"[gab.accent]▸[/gab.accent] [dim]escalating to {override} (complex tool)[/dim]", markup=True
-                    )
+            if ctx.config.provider == "claude":
+                floor = router.reactive_min_rung(tc.name)
+                if floor is not None:
+                    rung = router.rung(floor)
+                    if rung.model != ctx.active_model or (rung.effort or None) != ctx.active_effort:
+                        ctx.active_model = rung.model
+                        ctx.active_effort = rung.effort or None
+                        if not getattr(ctx, "voice_mode", False):
+                            eff = f"/{rung.effort}" if rung.effort else ""
+                            console.print(
+                                f"[gab.accent]▸[/gab.accent] [dim]escalating to {rung.model}{eff} (complex tool)[/dim]",
+                                markup=True,
+                            )
+            else:
+                override = router.check_tool_complexity(tc.name, args)
+                if override and override != (ctx.active_model or router.simple_model):
+                    ctx.active_model = override
+                    if not getattr(ctx, "voice_mode", False):
+                        console.print(
+                            f"[gab.accent]▸[/gab.accent] [dim]escalating to {override} (complex tool)[/dim]", markup=True
+                        )
 
         start_time = time.time()
         tool_display.show_start(tc.name, tc.arguments)

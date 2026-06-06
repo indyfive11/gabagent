@@ -26,6 +26,7 @@ class AgentContext:
     shell_state: ShellState | None = None
     token_estimate: int = 0
     active_model: str | None = None
+    active_effort: str | None = None  # thinking effort for the current turn (Claude provider)
     force_model: bool = False
     local_client: Any = field(default=None)
     local_mode: bool = False
@@ -39,6 +40,7 @@ class AgentContext:
     voice_audit_path: Any = field(default=None)  # Path | None
     voice_debug_path: Any = field(default=None)  # Path | None — opt-in per-turn debug log
     voice_process: Any = field(default=None)  # subprocess.Popen | None — TUI-spawned voice brain
+    voice_frontend_process: Any = field(default=None)  # subprocess.Popen | None — TUI-spawned voice-agent front-end
     command_catalog: Any = field(default=None)  # CommandCatalog | None — discovered capabilities
     persistent_browser: Any = field(default=None)  # Playwright BrowserContext | None
     persistent_browser_pw: Any = field(default=None)  # Playwright instance handle | None

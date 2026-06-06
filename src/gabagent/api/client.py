@@ -124,6 +124,7 @@ class GabAIClient:
         stream: bool = True,
         retry_model: str | None = None,
         fallback_model: str | None = None,
+        effort: str | None = None,  # accepted for interface parity; gab.ai has no effort concept
     ) -> AsyncIterator[str | list[ToolCallSpec]]:
         active_model = model or self.model
         self.rate_limiter.record(active_model)
@@ -328,7 +329,9 @@ class GabAIClient:
                     raise RuntimeError(f"{type(e).__name__}: {e} | body={body}") from e
                 raise
 
-    async def complete_simple(self, messages: list[ChatMessage], model: str | None = None) -> str:
+    async def complete_simple(
+        self, messages: list[ChatMessage], model: str | None = None, effort: str | None = None
+    ) -> str:
         active_model = model or self.model
         self.rate_limiter.record(active_model)
         raw_messages = [m.to_dict() for m in messages]

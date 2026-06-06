@@ -308,19 +308,31 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             from gabagent.agent.router import ModelRouter
             router = ModelRouter(ctx.config)
 
-        simple = ctx.config.router.simple_model
+        is_claude = ctx.config.provider == "claude"
+        # Baseline "cheap" rung for this provider: arya on gab, the bottom ladder rung on Claude.
+        simple = ctx.config.claude.ladder[0].model if is_claude else ctx.config.router.simple_model
+        simple_effort = (ctx.config.claude.ladder[0].effort or None) if is_claude else None
         if router:
-            # Re-evaluate routing EACH turn so simple follow-ups drop back to arya instead of pinning
-            # the whole session to the premium model. Obvious-simple utterances skip the classifier's
-            # API round-trip; only substantive prompts pay for classification.
+            # Re-evaluate routing EACH turn so simple follow-ups drop back to the cheap rung instead of
+            # pinning the whole session to the premium model. Obvious-simple utterances skip the
+            # classifier's API round-trip; only substantive prompts pay for classification.
             if _looks_simple(user_text):
                 ctx.active_model = simple
+                ctx.active_effort = simple_effort
+            elif is_claude:
+                try:
+                    rung = router.rung(await router.classify_rung(user_text, _active_client(ctx)))
+                    ctx.active_model = rung.model
+                    ctx.active_effort = rung.effort or None
+                except Exception:
+                    ctx.active_model = simple
+                    ctx.active_effort = simple_effort
             else:
                 try:
                     ctx.active_model = await router.classify_intent(user_text, _active_client(ctx))
                 except Exception:
                     ctx.active_model = simple
-            dlog(ctx, "route", active=ctx.active_model, via="intent_classify")
+            dlog(ctx, "route", active=ctx.active_model, effort=ctx.active_effort, via="intent_classify")
 
         from gabagent.permissions.engine import PermissionEngine
         perm_engine = PermissionEngine(ctx.config)
@@ -340,18 +352,20 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             all_messages = _build_voice_messages(ctx, ctx.session.messages())
             tools = _voice_tool_schemas()
             request_model = None if ctx.local_mode else ctx.active_model
+            request_effort = None if ctx.local_mode else ctx.active_effort
             # If the model bungles a tool call (e.g. calls a command-id as a function), the client
             # retries on the stronger model — but only for that failed turn, so simple turns stay cheap.
-            retry_model = None if ctx.local_mode else ctx.config.router.complex_model
-            # If an escalated turn keeps failing to generate (gab.ai 'inference_failed'), fall back to
-            # the simple model rather than erroring — a simpler answer beats a dead turn.
-            fallback_model = None if ctx.local_mode else ctx.config.router.simple_model
+            # (gab-only nudge; Claude has no command-id parse-error path.)
+            retry_model = None if (ctx.local_mode or is_claude) else ctx.config.router.complex_model
+            # If an escalated turn keeps failing to generate, fall back to the cheap rung rather than
+            # erroring — a simpler answer beats a dead turn.
+            fallback_model = None if ctx.local_mode else simple
             sfilter = SpeakableFilter(code_notice=commands.filler("code", ctx))
 
             text_buf = ""
             tool_calls: list = []
             stream = _active_client(ctx).stream_complete(
-                all_messages, tools or None, model=request_model,
+                all_messages, tools or None, model=request_model, effort=request_effort,
                 retry_model=retry_model, fallback_model=fallback_model,
             )
             if ctx.local_mode:
@@ -383,6 +397,7 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
                             and _is_transient_generation_error(e)):
                         fell_back = True
                         ctx.active_model = simple
+                        ctx.active_effort = simple_effort
                         ctx.voice_announced_model = simple   # don't announce the switch back
                         dlog(ctx, "fallback", to=simple, reason="inference_failed")
                         continue
@@ -433,7 +448,8 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
         # escalate-after-tool path live). An escalated turn that died on a transient gab.ai
         # 'inference_failed' gets ONE plain arya narration of the current state — no tools, no
         # re-execution (the file/tool already ran) — instead of speaking "[gab.ai error]".
-        _simple = ctx.config.router.simple_model
+        _simple = (ctx.config.claude.ladder[0].model
+                   if ctx.config.provider == "claude" else ctx.config.router.simple_model)
         if (not ctx.local_mode and vs.queue is not None
                 and (ctx.active_model or _simple) != _simple
                 and _is_transient_generation_error(e)):

@@ -19,7 +19,7 @@ def _build_context(
 ) -> tuple:
     from gabagent.config.loader import load_config
     from gabagent.config.models import GabAgentConfig
-    from gabagent.api.client import GabAIClient
+    from gabagent.api.factory import build_client
     from gabagent.api.rate_limit import UsageTracker
     from gabagent.agent.context import AgentContext
     from gabagent.agent.system_prompt import build_system_prompt
@@ -34,13 +34,14 @@ def _build_context(
 
     cfg = load_config(overrides)
 
-    rate_limiter = UsageTracker(simple_model=cfg.router.simple_model)
-    client = GabAIClient(
-        api_key=cfg.api_key or "__setup_pending__",
-        base_url=cfg.base_url,
-        model=cfg.model,
-        rate_limiter=rate_limiter,
-    )
+    # Provider-aware tier seeding: when on Claude, the bottom ladder rung is the base model and the
+    # display badge's "simple" tier (mutating the runtime cfg is the existing pattern, cf. sub_agent).
+    if cfg.provider == "claude" and not model:
+        cfg.model = cfg.claude.ladder[0].model
+    simple_model = cfg.claude.ladder[0].model if cfg.provider == "claude" else cfg.router.simple_model
+
+    rate_limiter = UsageTracker(simple_model=simple_model)
+    client = build_client(cfg, rate_limiter)
 
     mgr = SessionManager(cwd=cwd)
 
@@ -93,11 +94,23 @@ def main(
     cwd: Path = typer.Option(Path.cwd(), "--cwd", hidden=True, help="Working directory"),
     voice_serve: bool = typer.Option(False, "--voice-serve", help="Run as a voice brain (HTTP+SSE server)"),
     port: int = typer.Option(0, "--port", help="Voice server port (default: config voice_port)"),
+    set_claude_key: str = typer.Option("", "--set-claude-key", help="Save an Anthropic key, switch to the Claude backend, and exit"),
     version: bool = typer.Option(False, "--version", "-v", help="Show version"),
 ) -> None:
     if version:
         from gabagent import __version__
         typer.echo(f"gab-agent {__version__}")
+        raise typer.Exit()
+
+    if set_claude_key:
+        from gabagent.config.loader import load_config, save_config
+        from gabagent.config.paths import settings_file
+        cfg = load_config()
+        cfg.provider = "claude"
+        cfg.claude.api_key = set_claude_key.strip()
+        cfg.model = cfg.claude.ladder[0].model
+        save_config(cfg)
+        typer.echo(f"Saved Claude backend to {settings_file()} (provider=claude, base model {cfg.model}).")
         raise typer.Exit()
 
     from gabagent.tui.renderer import console
@@ -163,17 +176,12 @@ def main(
 
 async def _run(ctx, prompt: str | None) -> None:
     from gabagent.agent.loop import run_loop
+    from gabagent.config.setup import backend_configured, run_first_time_setup
 
-    if not ctx.config.api_key:
-        from gabagent.config.setup import run_first_time_setup
+    if not backend_configured(ctx.config):
         ctx.config = await run_first_time_setup(ctx.config)
-        from gabagent.api.client import GabAIClient
-        ctx.client = GabAIClient(
-            api_key=ctx.config.api_key,
-            base_url=ctx.config.base_url,
-            model=ctx.config.model,
-            rate_limiter=ctx.rate_limiter,
-        )
+        from gabagent.api.factory import build_client
+        ctx.client = build_client(ctx.config, ctx.rate_limiter)
 
     if ctx.config.commands_enabled:
         try:
@@ -205,6 +213,9 @@ async def _run(ctx, prompt: str | None) -> None:
         if ctx.local_process is not None:
             from gabagent.local.ollama import stop_ollama
             stop_ollama(ctx)
+        if ctx.voice_frontend_process is not None:
+            from gabagent.voice.launcher import stop_frontend
+            stop_frontend(ctx)
         if ctx.voice_process is not None:
             from gabagent.voice.launcher import stop_brain
             stop_brain(ctx)
@@ -247,16 +258,12 @@ def _start_voice(ctx, model: str, port: int) -> None:
 
 
 async def _run_voice(ctx, host: str, port: int) -> None:
-    if not ctx.config.api_key:
-        from gabagent.config.setup import run_first_time_setup
+    from gabagent.config.setup import backend_configured, run_first_time_setup
+
+    if not backend_configured(ctx.config):
         ctx.config = await run_first_time_setup(ctx.config)
-        from gabagent.api.client import GabAIClient
-        ctx.client = GabAIClient(
-            api_key=ctx.config.api_key,
-            base_url=ctx.config.base_url,
-            model=ctx.config.model,
-            rate_limiter=ctx.rate_limiter,
-        )
+        from gabagent.api.factory import build_client
+        ctx.client = build_client(ctx.config, ctx.rate_limiter)
 
     # If pinned to the local model, bring Ollama up before serving.
     if ctx.config.voice_model and ctx.config.voice_model == ctx.config.local_model:

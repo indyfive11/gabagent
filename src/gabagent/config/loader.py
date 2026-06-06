@@ -31,9 +31,12 @@ def get_config() -> GabAgentConfig:
 
 
 def save_config(cfg: GabAgentConfig) -> None:
+    global _config
     sf = settings_file()
+    sf.parent.mkdir(parents=True, exist_ok=True)
     data = cfg.model_dump(exclude_unset=False)
     sf.write_text(json.dumps(data, indent=2))
+    _config = cfg  # keep the in-process cache coherent with what was just written
 
 
 def bootstrap_config() -> GabAgentConfig:
