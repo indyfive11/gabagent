@@ -12,6 +12,17 @@ from gabagent.voice.session import VoiceSession
 BASE = "http://jf.test:8096"
 
 
+@pytest.fixture(autouse=True)
+def _no_real_movie_sink(monkeypatch):
+    """Never let the movie-volume path touch real system audio: force the browser sink-input to be
+    unidentifiable, so manual volume falls back to the deterministic <video>.volume page mock. Sink-path
+    behavior is covered separately in test_ducking.py with a stubbed pactl router."""
+    import gabagent.voice.ducking as _dk
+    async def _none(_ctx):
+        return None
+    monkeypatch.setattr(_dk, "_jellyfin_sink_input", _none)
+
+
 def _ctx(**jcfg):
     cfg = GabAgentConfig(api_key="test")
     cfg.jellyfin.base_url = BASE
@@ -188,14 +199,17 @@ class _FakeKbd:
 
 
 class _FakePlayPage:
-    """Models the HTML5 <video> we introspect via page.evaluate (paused + volume) and can close."""
-    def __init__(self, paused=False, volume=1.0):
+    """Models the HTML5 <video> we introspect via page.evaluate (paused + volume + seek) and can close."""
+    def __init__(self, paused=False, volume=1.0, current_time=50.0, duration=100.0):
         self.paused = paused; self.volume = volume
+        self.currentTime = current_time; self.duration = duration
         self.keyboard = _FakeKbd(self); self._closed = False
     def is_closed(self): return self._closed
     async def close(self): self._closed = True
     async def evaluate(self, expr, arg=None):
         if "v.pause()" in expr: self.paused = True; return None   # reliable pause (no gesture)
+        if "v.currentTime =" in expr and arg is not None:         # relative seek
+            self.currentTime = max(0, min(self.duration, self.currentTime + arg)); return None
         if "v.volume = vol" in expr:          # setter
             self.volume = arg; return None
         if "v.paused" in expr: return self.paused
@@ -250,24 +264,58 @@ async def test_close_quiet_when_only_just_closed_title_lingers():
 
 
 async def test_browser_control_movie_volume_adjusts_video_and_duck_prior():
+    # With the browser sink unidentifiable (guard forces no-sink), manual volume falls back to <video>.volume.
     from gabagent.voice.ducking import _state
     page = _FakePlayPage(volume=0.5)
     ctx = _ctx(); ctx.jellyfin_playing_page = page
     r = await jf.control(ctx, action="volume_up")
-    assert r.success and abs(page.volume - 0.6) < 1e-9       # drives <video>.volume, not system
+    assert r.success and abs(page.volume - 0.65) < 1e-9      # drives <video>.volume by the ±0.15 step
     await jf.control(ctx, action="volume_down")
     assert abs(page.volume - 0.5) < 1e-9
     # While ducked, a manual change updates the saved restore level so it survives speech-end.
     st = _state(ctx); st["jellyfin_video_volume"] = 1.0
     page.volume = 0.2
     await jf.control(ctx, action="volume_up")
-    assert abs(page.volume - 0.3) < 1e-9 and abs(st["jellyfin_video_volume"] - 0.3) < 1e-9
+    assert abs(page.volume - 0.35) < 1e-9 and abs(st["jellyfin_video_volume"] - 0.35) < 1e-9
 
 
 async def test_browser_only_actions_need_owned_page():
     ctx = _ctx()  # no jellyfin_playing_page, no live REST session
     r = await jf.control(ctx, action="close")
     assert not r.success and "browser" in r.error.lower()
+
+
+async def test_browser_seek_forward_and_back_set_currenttime():
+    page = _FakePlayPage(current_time=50.0, duration=100.0)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page
+    r = await jf.control(ctx, action="forward")
+    assert r.success and abs(page.currentTime - 80.0) < 1e-9 and "ahead" in r.output   # +30s, clamped to duration
+    r = await jf.control(ctx, action="back")
+    assert r.success and abs(page.currentTime - 50.0) < 1e-9 and "back" in r.output     # -30s
+
+
+@respx.mock
+async def test_remote_volume_uses_general_command():
+    # No owned page → a native controllable session takes VolumeUp via the GeneralCommand endpoint.
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "s1", "NowPlayingItem": {"Name": "X"}}]))
+    route = respx.post(f"{BASE}/Sessions/s1/Command").mock(return_value=httpx.Response(204))
+    ctx = _ctx()  # no jellyfin_playing_page
+    res = await jf.control(ctx, action="volume_up")
+    assert res.success and route.called
+    assert json.loads(route.calls.last.request.content) == {"Name": "VolumeUp"}
+
+
+@respx.mock
+async def test_remote_seek_uses_position_ticks():
+    # No owned page → relative seek on a native client via PositionTicks (+30s = +3e8 ticks).
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "s1", "NowPlayingItem": {"Name": "X"}, "PlayState": {"PositionTicks": 100_000_000}}]))
+    route = respx.post(f"{BASE}/Sessions/s1/Playing/Seek").mock(return_value=httpx.Response(204))
+    ctx = _ctx()
+    res = await jf.control(ctx, action="forward")
+    assert res.success and route.called
+    assert route.calls.last.request.url.params["seekPositionTicks"] == str(100_000_000 + 30 * 10_000_000)
 
 
 async def test_browser_control_idempotent_reads_real_state():

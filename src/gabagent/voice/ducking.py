@@ -43,7 +43,8 @@ def _state(ctx) -> dict:
     if s is None:
         s = {"tidal_prior": None, "jellyfin_paused": None, "jellyfin_video_volume": None}
         ctx._duck_state = s
-    s.setdefault("jellyfin_video_volume", None)  # tolerate state dicts from before this field
+    s.setdefault("jellyfin_video_volume", None)  # tolerate state dicts from before this field; <video> fallback
+    s.setdefault("jellyfin_sink_prior", None)    # (browser sink-input idx, prior vol %) when the movie is ducked
     s.setdefault("tidal_sink_prior", None)       # (sink-input index, prior volume %) when ducked
     s.setdefault("muted", False)                 # the active duck has been DEEPENED to a full mute (vol 0)
     s.setdefault("local_sink_priors", None)      # {sink-input idx: prior %} for the universal local-duck
@@ -202,6 +203,90 @@ async def _mopidy_sink_input() -> tuple[str, int | None] | None:
     return _parse_mopidy_sink_input(out)
 
 
+def _jf_dlog(ctx, **fields) -> None:
+    """Best-effort instrumentation for the Jellyfin movie sink duck/volume (so the next live run proves the
+    browser sink-input was FOUND and the level took, vs. silently no-op'ing). Gated by the voice_debug flag."""
+    try:
+        from gabagent.voice.debuglog import dlog
+        dlog(ctx, "jellyfin_duck", **fields)
+    except Exception:
+        pass
+
+
+async def _run_cmd(*args, timeout: float = 2.0) -> tuple[int, str]:
+    """Generic best-effort subprocess (used for pgrep). Mirrors _run_pactl's never-raise contract."""
+    try:
+        p = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(p.communicate(), timeout=timeout)
+        return p.returncode or 0, out.decode(errors="replace")
+    except Exception:
+        return 1, ""
+
+
+def _proc_descendants(pids: set[str]) -> set[str]:
+    """Expand PIDs to include all descendants. Chromium plays audio from a child *audio service* process,
+    so the sink-input is owned by a descendant of the main browser PID, not the main PID itself. Reads
+    /proc/<pid>/task/<pid>/children; best-effort (a vanished pid just contributes nothing)."""
+    seen = set(pids)
+    frontier = list(pids)
+    while frontier:
+        pid = frontier.pop()
+        try:
+            with open(f"/proc/{pid}/task/{pid}/children") as f:
+                kids = f.read().split()
+        except Exception:
+            kids = []
+        for k in kids:
+            if k not in seen:
+                seen.add(k)
+                frontier.append(k)
+    return seen
+
+
+def _parse_sink_input_by_pid(out: str, pids: set[str]) -> tuple[str, int | None] | None:
+    """The sink-input whose application.process.id is one of `pids` → (idx, vol%). This is the unambiguous
+    match: it's OUR browser's audio stream by process identity, not by a name another Chrome could share."""
+    for si in _parse_sink_inputs(out):
+        m = re.search(r'application\.process\.id = "?(\d+)"?', si["block"])
+        if m and m.group(1) in pids:
+            return si["idx"], si["volume"]
+    return None
+
+
+def _parse_lone_browser_sink(out: str) -> tuple[str, int | None] | None:
+    """Fallback when the PID match finds nothing: a SINGLE Chromium/Chrome sink-input. Only trusted when
+    there's exactly one — more than one is ambiguous (the user's separate Chrome), so we decline rather
+    than risk attenuating the wrong stream."""
+    hits = [si for si in _parse_sink_inputs(out)
+            if re.search(r'application\.name = "(Chromium|Google Chrome|Chrome)"', si["block"])]
+    return (hits[0]["idx"], hits[0]["volume"]) if len(hits) == 1 else None
+
+
+async def _jellyfin_sink_input(ctx) -> tuple[str, int | None] | None:
+    """Our browser-played movie's PipeWire sink-input (idx, vol%), or None.
+
+    Identified by the process tree of OUR persistent browser context: its --user-data-dir
+    (config_dir/browser/jellyfin) is unique to us, so matching the sink-input's owning process against that
+    tree separates our Chromium from any SEPARATE Chrome the user runs (name-matching alone can't). Falls
+    back to a lone Chromium/Chrome sink-input only when the PID match finds nothing. Best-effort; never
+    raises. Re-discovered each call (the index changes when the movie restarts), mirroring _mopidy_sink_input."""
+    if not shutil.which("pactl"):
+        return None
+    rc2, out = await _run_pactl("list", "sink-inputs")
+    if rc2 != 0 or not out:
+        return None
+    from gabagent.config.paths import config_dir
+    profile_dir = str(config_dir() / "browser" / "jellyfin")
+    rc, pout = await _run_cmd("pgrep", "-f", profile_dir)
+    main_pids = {p for p in pout.split() if p.isdigit()} if rc == 0 else set()
+    if main_pids:
+        hit = _parse_sink_input_by_pid(out, _proc_descendants(main_pids))
+        if hit:
+            return hit
+    return _parse_lone_browser_sink(out)
+
+
 def _parse_mopidy_sink_full(out: str) -> dict | None:
     """Richer Mopidy sink-input parse for the audibility probe: index, volume %, the MUTE flag, and the
     sink index it's routed to. A loaded track reads "playing" from the player even when this stream is
@@ -333,9 +418,14 @@ async def _duck_local_sinks(ctx, on: bool, mute: bool = False) -> bool:
             rc, out = await _run_pactl("list", "sink-inputs")
             if rc != 0 or not out:
                 return False
+            # The owned movie sink is ducked separately by _duck_jellyfin_sink (which ran just before this
+            # in duck_media and saved its idx) — exclude it here so the two don't both save/restore it.
+            jf_saved = st.get("jellyfin_sink_prior")
+            owned_jf_idx = jf_saved[0] if jf_saved else None
             priors = {}
             for si in _parse_sink_inputs(out):
-                if si["volume"] is None or _excluded_from_local_duck(si["block"]):
+                if si["volume"] is None or si["idx"] == owned_jf_idx \
+                        or _excluded_from_local_duck(si["block"]):
                     continue
                 await _run_pactl("set-sink-input-volume", si["idx"], "0%")
                 priors[si["idx"]] = si["volume"]
@@ -604,11 +694,115 @@ async def _duck_jellyfin(ctx, on: bool, mute: bool = False) -> bool:
     from gabagent.commands.providers.jellyfin import _live_jellyfin_page
     page = _live_jellyfin_page(ctx)
     if page is not None:
-        return await _duck_jellyfin_video(ctx, page, on, mute)
+        return await _duck_jellyfin_owned(ctx, page, on, mute)
     # No brain-OWNED movie page → nothing to AUTO-duck here. A bare /Sessions client may be on ANOTHER
     # device/room; auto-pausing it controlled the wrong screen AND flapped the gate (the cross-device bug).
     # Cross-device transport is Phase-2 EXPLICIT-only — via the inventory + `_duck_jellyfin_rest` (kept).
     return False
+
+
+async def _duck_jellyfin_owned(ctx, page, on: bool, mute: bool = False) -> bool:
+    """Duck/restore the movie WE launched. Prefer the browser's PipeWire sink-input (robust — attenuates
+    the real audio regardless of whether Jellyfin's web player honors <video>.volume); fall back to the
+    <video>.volume path when the sink can't be identified. On `off`, restore via whichever path is saved."""
+    st = _state(ctx)
+    if on:
+        if st.get("jellyfin_sink_prior") is not None:        # already sink-ducked → stay on the sink path
+            return await _duck_jellyfin_sink(ctx, page, True, mute)
+        if st.get("jellyfin_video_volume") is not None:      # already video-ducked → stay on the video path
+            return await _duck_jellyfin_video(ctx, page, True, mute)
+        found = await _jellyfin_sink_input(ctx)
+        if found is not None:
+            return await _duck_jellyfin_sink(ctx, page, True, mute, found=found)
+        return await _duck_jellyfin_video(ctx, page, True, mute)   # sink not found → fall back
+    # off: restore whichever path is active.
+    if st.get("jellyfin_sink_prior") is not None:
+        return await _duck_jellyfin_sink(ctx, page, False, mute)
+    return await _duck_jellyfin_video(ctx, page, False, mute)
+
+
+async def _duck_jellyfin_sink(ctx, page, on: bool, mute: bool = False, found=None) -> bool:
+    """Duck/restore the movie at the SYSTEM node (browser PipeWire sink-input) — the reliably-audible path.
+    Mirrors _duck_tidal_sink: save the prior on first duck, deepen-to-mute without clobbering it, restore to
+    the exact prior on off, and un-strand a sink left low by a brain-restart-mid-duck. Leaves <video>.volume
+    untouched (the sink is the sole attenuator, so the two can't compound, and Jellyfin's persisted volume
+    isn't disturbed)."""
+    st = _state(ctx)
+    try:
+        if on:
+            sink_target = 0 if mute else _SINK_DUCK_PCT
+            saved = st.get("jellyfin_sink_prior")
+            if saved is not None:
+                # Already ducked. A fresh mute DEEPENS to 0 without clobbering the saved prior; else no-op.
+                if mute and not st.get("muted"):
+                    cur = await _jellyfin_sink_input(ctx)
+                    tgt = cur[0] if cur else saved[0]
+                    await _run_pactl("set-sink-input-volume", tgt, "0%")
+                    st["muted"] = True
+                    _jf_dlog(ctx, phase="sink_deepen_mute", sink_idx=tgt)
+                    return True
+                return False
+            found = found or await _jellyfin_sink_input(ctx)
+            if not found:
+                _jf_dlog(ctx, phase="on_no_sink")
+                return False
+            idx, vol = found
+            # Stranded-low guard: a brain restart mid-duck loses the in-memory prior. If the sink is already
+            # at/below the duck level, saving that keeps the movie quiet forever — restore-to-100 instead.
+            prior = 100 if (vol is not None and vol <= _SINK_DUCK_PCT) else (vol if vol is not None else 100)
+            st["jellyfin_sink_prior"] = (idx, prior)
+            await _run_pactl("set-sink-input-volume", idx, f"{sink_target}%")
+            if mute:
+                st["muted"] = True
+            _jf_dlog(ctx, phase="sink_on", sink_idx=idx, sink_prior=vol, ducked_to=sink_target,
+                     saved_prior=prior)
+            return True
+        saved = st.get("jellyfin_sink_prior")
+        if not saved:
+            return False
+        idx, prior = saved
+        cur = await _jellyfin_sink_input(ctx)     # re-find: the index can change if the movie restarted
+        tgt = cur[0] if cur else idx
+        # Restore to the EXACT prior (no ambient cap — that's a music ceiling; a movie shouldn't creep down).
+        await _run_pactl("set-sink-input-volume", tgt, f"{int(prior)}%")
+        await _unmute_sink_input(tgt)
+        _jf_dlog(ctx, phase="sink_off", sink_idx=tgt, restored_to=int(prior))
+        st["jellyfin_sink_prior"] = None
+        return True
+    except Exception:
+        return False
+
+
+async def adjust_movie_volume(ctx, page, up: bool, step_pct: int = 15) -> bool:
+    """Manual movie volume ±step. Drives the browser sink-input if it can be identified (robust), else the
+    <video>.volume element. Updates whichever duck prior is active so a mid-duck manual change survives the
+    speech-end restore. Returns True if it acted, False if it couldn't read a level. Never raises."""
+    from gabagent.commands.providers.jellyfin import _video_volume, _set_video_volume
+    st = _state(ctx)
+    try:
+        found = await _jellyfin_sink_input(ctx)
+        if found is not None:
+            idx, cur = found
+            cur = cur if cur is not None else 100
+            new = min(100, cur + step_pct) if up else max(0, cur - step_pct)
+            await _run_pactl("set-sink-input-volume", idx, f"{new}%")
+            saved = st.get("jellyfin_sink_prior")
+            if saved is not None:                 # mid-duck: keep the restore level in step with the manual change
+                st["jellyfin_sink_prior"] = (saved[0], new)
+            _jf_dlog(ctx, phase="manual_sink", sink_idx=idx, prev=cur, set_to=new, up=up)
+            return True
+        cur = await _video_volume(page)
+        if cur is None:
+            return False
+        step = step_pct / 100.0
+        new = min(1.0, cur + step) if up else max(0.0, cur - step)
+        await _set_video_volume(page, new)
+        if st.get("jellyfin_video_volume") is not None:
+            st["jellyfin_video_volume"] = new
+        _jf_dlog(ctx, phase="manual_video", prev=cur, set_to=new, up=up)
+        return True
+    except Exception:
+        return False
 
 
 async def _duck_jellyfin_video(ctx, page, on: bool, mute: bool = False) -> bool:

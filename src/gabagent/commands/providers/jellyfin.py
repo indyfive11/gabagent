@@ -17,9 +17,11 @@ if TYPE_CHECKING:
     from gabagent.agent.context import AgentContext
 
 _CONTROL = {"pause": "Pause", "resume": "Unpause", "stop": "Stop", "next": "NextTrack"}
-_BROWSER_ONLY = {"close", "volume_up", "volume_down"}   # only meaningful on the page we own
+_REMOTE_VOLUME = {"volume_up": "VolumeUp", "volume_down": "VolumeDown"}  # GeneralCommand for native clients
+_BROWSER_ONLY = {"close"}                                # only meaningful on the page we own
+_SEEK = {"forward": 30, "back": -30}                     # ±seconds; owned page via currentTime, REST via ticks
 _SPECIAL = {"exit_fullscreen"}                           # handled directly (two fullscreen layers)
-_ACTIONS = set(_CONTROL) | _BROWSER_ONLY | _SPECIAL
+_ACTIONS = set(_CONTROL) | set(_REMOTE_VOLUME) | _BROWSER_ONLY | set(_SEEK) | _SPECIAL
 _PLAY_POLL_TRIES = 24   # ~12s waiting for the opened web client to register a session
 
 
@@ -103,14 +105,16 @@ class JellyfinProvider:
             ),
             Command(
                 id="jellyfin.control", domain="media", tier=1, featured=True,
-                summary="Control the movie — pause, resume, stop, leave full screen, close the window, or turn the movie volume up/down",
+                summary="Control the movie — pause, resume, stop, fast-forward or rewind, leave full screen, close the window, or turn the movie volume up/down",
                 backend=PyBackend(ref="gabagent.commands.providers.jellyfin:control"),
                 params=[Slot("action", "enum", True,
-                             enum=("pause", "resume", "stop", "next", "exit_fullscreen", "close",
-                                   "volume_up", "volume_down"),
-                             description="required — one of pause/resume/stop/next/exit_fullscreen/"
-                             "close/volume_up/volume_down (exit_fullscreen = leave the movie's full screen)")],
-                examples=["pause", "resume", "stop the movie", "leave full screen", "exit fullscreen",
+                             enum=("pause", "resume", "stop", "next", "forward", "back",
+                                   "exit_fullscreen", "close", "volume_up", "volume_down"),
+                             description="required — one of pause/resume/stop/next/forward/back/"
+                             "exit_fullscreen/close/volume_up/volume_down (forward/back = skip ±30s, "
+                             "exit_fullscreen = leave the movie's full screen)")],
+                examples=["pause", "resume", "stop the movie", "fast forward", "skip ahead",
+                          "rewind", "go back thirty seconds", "leave full screen", "exit fullscreen",
                           "get out of full screen", "close the movie window",
                           "turn up the movie", "louder on the movie", "movie volume down"],
             ),
@@ -250,11 +254,16 @@ async def control(ctx, action="") -> ToolResult:
         return await _browser_control(ctx, page, action)
     if action in _BROWSER_ONLY:
         return ToolResult(output="", error="I can only do that to a movie I opened in the browser.")
+    # No owned page → drive a native/controllable Jellyfin client over REST.
     sessions = await _sessions(jc)
     target = next((s for s in sessions if s.get("NowPlayingItem")), None) \
         or next((s for s in sessions if s.get("SupportsRemoteControl")), None)
     if not target:
         return ToolResult(output="", error="No active playback session to control.")
+    if action in _REMOTE_VOLUME:
+        return await _rest_general_command(jc, target["Id"], _REMOTE_VOLUME[action])
+    if action in _SEEK:
+        return await _rest_seek(jc, target, _SEEK[action])
     if action in ("stop", "close"):
         ctx.jellyfin_playing_title = None
     try:
@@ -263,6 +272,33 @@ async def control(ctx, action="") -> ToolResult:
     except Exception as e:
         return ToolResult(output="", error=f"control failed: {e}")
     return ToolResult(output=f"{action} sent.") if r.is_success else ToolResult(output="", error=f"control failed: HTTP {r.status_code}")
+
+
+async def _rest_general_command(jc, session_id, name) -> ToolResult:
+    """A Jellyfin GeneralCommand (e.g. VolumeUp/VolumeDown) against a native, controllable client."""
+    try:
+        async with _client(jc) as c:
+            r = await c.post(f"/Sessions/{session_id}/Command", json={"Name": name})
+    except Exception as e:
+        return ToolResult(output="", error=f"control failed: {e}")
+    if not r.is_success:
+        return ToolResult(output="", error=f"control failed: HTTP {r.status_code}")
+    return ToolResult(output="Turned it up." if name == "VolumeUp" else "Turned it down.")
+
+
+async def _rest_seek(jc, session, secs) -> ToolResult:
+    """Relative seek on a native client: read PositionTicks, add ±secs (1s = 10,000,000 ticks), Seek to it."""
+    pos = (session.get("PlayState") or {}).get("PositionTicks") or 0
+    new = max(0, int(pos) + secs * 10_000_000)
+    try:
+        async with _client(jc) as c:
+            r = await c.post(f"/Sessions/{session['Id']}/Playing/Seek", params={"seekPositionTicks": new})
+    except Exception as e:
+        return ToolResult(output="", error=f"seek failed: {e}")
+    if not r.is_success:
+        return ToolResult(output="", error=f"seek failed: HTTP {r.status_code}")
+    return ToolResult(output=f"Skipped ahead {secs} seconds." if secs > 0
+                      else f"Skipped back {abs(secs)} seconds.")
 
 
 async def play(ctx, item_id="", title="") -> ToolResult:
@@ -489,18 +525,23 @@ async def _browser_control(ctx, page, action) -> ToolResult:
                 return ToolResult(output="I closed the window I opened, but another Jellyfin is still playing.")
             return ToolResult(output="Closed the movie window.")
         if action in ("volume_up", "volume_down"):
-            cur = await _video_volume(page)
-            if cur is None:
+            # Drive the browser's PipeWire sink-input when it can be identified (robust — attenuates the
+            # real audio even if the web player ignores <video>.volume), else fall back to <video>.volume.
+            # adjust_movie_volume also keeps any active duck's restore prior in step with the manual change.
+            from gabagent.voice.ducking import adjust_movie_volume
+            ok = await adjust_movie_volume(ctx, page, up=(action == "volume_up"))
+            if not ok:
                 return ToolResult(output="", error="I couldn't read the movie volume.")
-            new = min(1.0, cur + 0.1) if action == "volume_up" else max(0.0, cur - 0.1)
-            await _set_video_volume(page, new)
-            # If we're mid-duck, update the saved restore level so the manual change survives the
-            # speech-end restore instead of being clobbered back to the pre-duck level.
-            from gabagent.voice.ducking import _state
-            st = _state(ctx)
-            if st.get("jellyfin_video_volume") is not None:
-                st["jellyfin_video_volume"] = new
             return ToolResult(output="Turned the movie up." if action == "volume_up" else "Turned the movie down.")
+        if action in _SEEK:
+            secs = _SEEK[action]
+            await _page_eval(
+                page,
+                "(s) => { const v = document.querySelector('video');"
+                " if (v && !isNaN(v.duration)) v.currentTime = Math.max(0, Math.min(v.duration, v.currentTime + s)); }",
+                secs)
+            return ToolResult(output=f"Skipped ahead {secs} seconds." if secs > 0
+                              else f"Skipped back {abs(secs)} seconds.")
         if action == "next":
             return ToolResult(output="", error="There's nothing to skip to in a movie.")
         # Idempotent: read the REAL play state, then press Space (a toggle — but a *trusted* user

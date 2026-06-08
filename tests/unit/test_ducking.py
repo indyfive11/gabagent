@@ -877,3 +877,111 @@ async def test_universal_duck_skips_plain_vad_duck(monkeypatch):
     out = await duck_media(ctx, True, mute=False)               # gentle VAD-onset duck, not a full mute
     assert "local" not in out["ducked"] and sets == []          # unowned media left alone until window-open
     assert _dk._state(ctx)["local_sink_priors"] is None
+
+
+# -- Jellyfin movie: PipeWire sink-input duck/volume (the robust path) -------------------------------
+
+def test_jellyfin_sink_parse_by_pid_and_lone_fallback():
+    out = ('Sink Input #41\n\tVolume: front-left: 40000 / 62% / -6 dB\n'
+           '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "9001"\n'
+           'Sink Input #42\n\tVolume: front-left: 50000 / 77%\n'
+           '\tProperties:\n\t\tapplication.name = "Google Chrome"\n\t\tapplication.process.id = "5000"\n')
+    # PID match picks OUR stream unambiguously (by owning process identity), even amid another Chrome.
+    assert _dk._parse_sink_input_by_pid(out, {"9001"}) == ("41", 62)
+    assert _dk._parse_sink_input_by_pid(out, {"123"}) is None
+    # Lone-browser fallback declines when MORE than one browser sink exists (ambiguous).
+    assert _dk._parse_lone_browser_sink(out) is None
+    one = ('Sink Input #41\n\tVolume: front-left: 40000 / 62%\n'
+           '\tProperties:\n\t\tapplication.name = "Chromium"\n')
+    assert _dk._parse_lone_browser_sink(one) == ("41", 62)
+
+
+async def test_duck_jellyfin_sink_ducks_then_restores(monkeypatch):
+    sets = []
+    monkeypatch.setattr(_dk, "_run_pactl", _fake_pactl("", sets))
+    async def fake_sink(_ctx): return ("12", 90)
+    monkeypatch.setattr(_dk, "_jellyfin_sink_input", fake_sink)
+    ctx = _ctx(tidal=False, jellyfin=True)
+    ctx.jellyfin_playing_page = _FakeVideoPage(volume=1.0)
+    assert (await duck_media(ctx, True))["ducked"] == ["jellyfin"]
+    st = _dk._state(ctx)
+    assert st["jellyfin_sink_prior"] == ("12", 90)            # saved the real prior
+    assert ("12", "18%") in sets                              # movie sink ducked at the system node
+    sets.clear()
+    assert (await duck_media(ctx, False))["ducked"] == ["jellyfin"]
+    assert st["jellyfin_sink_prior"] is None
+    assert ("12", "90%") in sets                              # restored to the EXACT prior (no ambient cap)
+
+
+async def test_duck_jellyfin_sink_deepen_to_mute(monkeypatch):
+    sets = []
+    monkeypatch.setattr(_dk, "_run_pactl", _fake_pactl("", sets))
+    async def fake_sink(_ctx): return ("12", 80)
+    monkeypatch.setattr(_dk, "_jellyfin_sink_input", fake_sink)
+    ctx = _ctx(tidal=False, jellyfin=True)
+    ctx.jellyfin_playing_page = _FakeVideoPage(volume=1.0)
+    await duck_media(ctx, True)                               # gentle duck → 18%
+    st = _dk._state(ctx)
+    assert ("12", "18%") in sets and st["jellyfin_sink_prior"] == ("12", 80)
+    sets.clear()
+    await duck_media(ctx, True, mute=True)                    # deepen to a full mute
+    assert ("12", "0%") in sets and st["jellyfin_sink_prior"] == ("12", 80)   # prior kept through the deepen
+    sets.clear()
+    await duck_media(ctx, False)                              # restore to the real prior
+    assert ("12", "80%") in sets and st["jellyfin_sink_prior"] is None
+
+
+async def test_duck_jellyfin_sink_stranded_low_restores_full(monkeypatch):
+    # The sink was left AT the duck level by a brain restart mid-duck. Saving 18 would keep it quiet forever.
+    sets = []
+    monkeypatch.setattr(_dk, "_run_pactl", _fake_pactl("", sets))
+    async def fake_sink(_ctx): return ("12", 18)
+    monkeypatch.setattr(_dk, "_jellyfin_sink_input", fake_sink)
+    ctx = _ctx(tidal=False, jellyfin=True); ctx.jellyfin_playing_page = _FakeVideoPage()
+    await duck_media(ctx, True)
+    assert _dk._state(ctx)["jellyfin_sink_prior"] == ("12", 100)   # saved FULL, not the stranded 18
+
+
+async def test_duck_jellyfin_sink_excluded_from_local_sweep(monkeypatch):
+    # On a full-mute window the owned movie sink is ducked by the jellyfin path and MUST be skipped by the
+    # universal local sweep (no double save/restore). A second, unowned Chromium IS swept.
+    listing = ('Sink Input #12\n\tVolume: front-left: 60000 / 90% / -3 dB\n'
+               '\tProperties:\n\t\tapplication.name = "Chromium"\n'
+               'Sink Input #13\n\tVolume: front-left: 52000 / 80% / -5 dB\n'
+               '\tProperties:\n\t\tapplication.name = "Chromium"\n')
+    sets = []
+    monkeypatch.setattr(_dk, "_run_pactl", _fake_pactl(listing, sets))
+    monkeypatch.setattr(_dk.shutil, "which", lambda _n: "x")
+    async def fake_sink(_ctx): return ("12", 90)             # the movie is #12
+    monkeypatch.setattr(_dk, "_jellyfin_sink_input", fake_sink)
+    ctx = _ctx(tidal=False, jellyfin=True); ctx.jellyfin_playing_page = _FakeVideoPage()
+    out = await duck_media(ctx, True, mute=True)
+    assert "jellyfin" in out["ducked"] and "local" in out["ducked"]
+    st = _dk._state(ctx)
+    assert st["jellyfin_sink_prior"] == ("12", 90)           # movie owned by the jellyfin path
+    assert st["local_sink_priors"] == {"13": 80}             # ONLY the unowned #13 swept (12 excluded)
+
+
+async def test_adjust_movie_volume_uses_sink_when_found(monkeypatch):
+    sets = []
+    monkeypatch.setattr(_dk, "_run_pactl", _fake_pactl("", sets))
+    async def fake_sink(_ctx): return ("12", 70)
+    monkeypatch.setattr(_dk, "_jellyfin_sink_input", fake_sink)
+    ctx = _ctx(tidal=False, jellyfin=True)
+    page = _FakeVideoPage(volume=1.0)
+    ok = await _dk.adjust_movie_volume(ctx, page, up=True)
+    assert ok and ("12", "85%") in sets and page.volume == 1.0   # sink moved by +15; <video> untouched
+    # mid-duck: a manual change keeps the saved restore level in step
+    _dk._state(ctx)["jellyfin_sink_prior"] = ("12", 70)
+    sets.clear()
+    await _dk.adjust_movie_volume(ctx, page, up=False)
+    assert ("12", "55%") in sets and _dk._state(ctx)["jellyfin_sink_prior"] == ("12", 55)
+
+
+async def test_adjust_movie_volume_falls_back_to_video(monkeypatch):
+    async def no_sink(_ctx): return None
+    monkeypatch.setattr(_dk, "_jellyfin_sink_input", no_sink)
+    ctx = _ctx(tidal=False, jellyfin=True)
+    page = _FakeVideoPage(volume=0.5)
+    ok = await _dk.adjust_movie_volume(ctx, page, up=True)
+    assert ok and abs(page.volume - 0.65) < 1e-9              # no sink → <video>.volume ±0.15
