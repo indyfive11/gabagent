@@ -10,7 +10,9 @@ server. See SETUP_TIDAL.md.
 """
 from __future__ import annotations
 import asyncio
+import contextlib
 import json
+import time
 from typing import TYPE_CHECKING
 
 import httpx
@@ -22,6 +24,45 @@ if TYPE_CHECKING:
     from gabagent.agent.context import AgentContext
 
 _RPC_TIMEOUT = 30.0   # search and mix/album expand hit TIDAL's live API, not the local cache
+
+# Cached playback state so /media/state (→ inventory → sources()) can be served WITHOUT a live get_state
+# RPC. Mopidy serializes JSON-RPC, so a get_state issued mid-search/play QUEUES behind that op and blocks
+# the voice client's 2s /media/state poll for the whole op (~30s observed) — the gate goes blind to playback
+# and reacts ~30s late. Instead: ops mark themselves in-flight (sources() then serves the cache, no RPC) and
+# update the cache optimistically ('playing' at play-start so the gate reacts on time); sources() only hits
+# Mopidy when idle AND the cache is stale. Lives on ctx so it's per-session and needs no global state.
+_PLAYBACK_CACHE_TTL = 1.5   # seconds a cached state is served before an idle refresh RPC is allowed
+
+
+def _pb_cache(ctx) -> dict:
+    c = getattr(ctx, "_tidal_playback", None)
+    if c is None:
+        c = {"state": None, "ts": 0.0, "inflight": 0}
+        ctx._tidal_playback = c
+    return c
+
+
+def _cache_playback(ctx, state) -> None:
+    c = _pb_cache(ctx)
+    c["state"] = state
+    c["ts"] = time.monotonic()
+
+
+@contextlib.asynccontextmanager
+async def _tidal_op(ctx, *, optimistic=None, result=None):
+    """Mark a TIDAL transport op in flight so sources() serves cached state (no get_state RPC that would
+    queue behind this op in Mopidy and blind the gate). `optimistic` sets the cache at op start (e.g.
+    'playing' so the gate reacts immediately, not after the search settles); `result` sets it on success."""
+    c = _pb_cache(ctx)
+    c["inflight"] += 1
+    if optimistic is not None:
+        _cache_playback(ctx, optimistic)
+    try:
+        yield
+        if result is not None:
+            _cache_playback(ctx, result)
+    finally:
+        c["inflight"] = max(0, c["inflight"] - 1)
 
 
 class TidalProvider:
@@ -43,10 +84,17 @@ class TidalProvider:
         tc = getattr(ctx.config, "tidal", None)
         if not tc or not getattr(tc, "enabled", False):
             return []
-        try:
-            st = await _rpc(tc, "core.playback.get_state", timeout=2.0)
-        except Exception:
-            return []
+        c = _pb_cache(ctx)
+        st = c["state"]
+        # Only hit Mopidy when NO op is in flight AND the cache is stale — otherwise serve the cached state
+        # so the poll never blocks behind an in-flight search/play (the ~30s gate-blind window). A live RPC
+        # failure keeps the last cached state rather than dropping the source.
+        if c["inflight"] == 0 and (time.monotonic() - c["ts"]) > _PLAYBACK_CACHE_TTL:
+            try:
+                st = await _rpc(tc, "core.playback.get_state", timeout=2.0)
+                _cache_playback(ctx, st)
+            except Exception:
+                pass
         if st not in ("playing", "paused"):
             return []
         from gabagent.commands.media import MediaSource
@@ -232,10 +280,31 @@ async def _expand_playable(tc, uri: str) -> list[str]:
             if isinstance(r, dict) and (r.get("uri") or "").startswith("tidal:track:")]
 
 
-async def _play_uris(tc, uris: list[str]) -> None:
+async def _play_uris(tc, uris: list[str]) -> dict:
+    """Clear the tracklist, queue the URIs, and start playback. Returns per-step timings (ms) so the
+    caller can localize where TIDAL play latency lands — `queue_ms` (tracklist.add, which resolves each
+    track) vs `play_ms` (playback.play, which fetches the first stream URL from TIDAL's live API)."""
+    t = {}
+    s = time.monotonic()
     await _rpc(tc, "core.tracklist.clear")
+    t["clear_ms"] = int((time.monotonic() - s) * 1000)
+    s = time.monotonic()
     await _rpc(tc, "core.tracklist.add", {"uris": uris})
+    t["queue_ms"] = int((time.monotonic() - s) * 1000)
+    s = time.monotonic()
     await _rpc(tc, "core.playback.play")
+    t["play_ms"] = int((time.monotonic() - s) * 1000)
+    return t
+
+
+def _play_timing(ctx, **fields) -> None:
+    """Localize TIDAL play latency (search vs queue vs play-start vs ambient-hold) in voice_debug.jsonl —
+    the 10–38s 'Trying tidal…' turns. Best-effort, gated by the voice debug path. Never raises."""
+    try:
+        from gabagent.voice.debuglog import dlog
+        dlog(ctx, "tidal_timing", **fields)
+    except Exception:
+        pass
 
 
 # -- backend callables -----------------------------------------------------
@@ -270,78 +339,111 @@ async def play(ctx, query="", uri="", album=False) -> ToolResult:
     # searches for the album; a tidal:album/playlist/mix URI plays that exact container.
     if bool(album) or _is_container_uri(uri):
         return await _play_container(ctx, tc, query, uri, album=bool(album))
-    label = ""
-    if not uri and query:
+    # Mark the op in flight and optimistically cache "playing" so /media/state reflects it within ~100ms
+    # (the gate reacts on time) instead of blocking ~30s behind the search/play (see _tidal_op). A failed
+    # search/play self-heals: the cache reverts on the next idle poll once nothing's actually playing.
+    async with _tidal_op(ctx, optimistic="playing"):
+        t0 = time.monotonic()
+        label = ""
+        search_ms = None
+        if not uri and query:
+            _s = time.monotonic()
+            try:
+                results = await _rpc_resilient(tc, "core.library.search", {"query": {"any": [query]}})
+            except Exception as e:
+                return ToolResult(output="", error=f"TIDAL search failed: {_human_err(e)}")
+            search_ms = int((time.monotonic() - _s) * 1000)
+            tracks = [t for t in _flatten_tracks(results) if t["uri"]]
+            if not tracks:
+                return ToolResult(output="", error=f"I couldn't find '{query}' on TIDAL.")
+            uri = tracks[0]["uri"]
+            label = tracks[0]["title"] + (f" by {tracks[0]['artist']}" if tracks[0]["artist"] else "")
+        if not uri:
+            # No query and no uri → just resume whatever is queued.
+            try:
+                await _rpc(tc, "core.playback.resume")
+                return ToolResult(output="Resuming.")
+            except Exception as e:
+                return ToolResult(output="", error=f"couldn't resume: {_human_err(e)}")
+        # F2: if the resolved track is ALREADY the loaded/current one, resume in place instead of
+        # clear+add+play — the latter restarts it from position 0 ("started over" instead of resuming).
         try:
-            results = await _rpc_resilient(tc, "core.library.search", {"query": {"any": [query]}})
-        except Exception as e:
-            return ToolResult(output="", error=f"TIDAL search failed: {_human_err(e)}")
-        tracks = [t for t in _flatten_tracks(results) if t["uri"]]
-        if not tracks:
-            return ToolResult(output="", error=f"I couldn't find '{query}' on TIDAL.")
-        uri = tracks[0]["uri"]
-        label = tracks[0]["title"] + (f" by {tracks[0]['artist']}" if tracks[0]["artist"] else "")
-    if not uri:
-        # No query and no uri → just resume whatever is queued.
-        try:
-            await _rpc(tc, "core.playback.resume")
-            return ToolResult(output="Resuming.")
-        except Exception as e:
-            return ToolResult(output="", error=f"couldn't resume: {_human_err(e)}")
-    # F2: if the resolved track is ALREADY the loaded/current one, resume in place instead of
-    # clear+add+play — the latter restarts it from position 0 ("started over" instead of resuming).
-    try:
-        cur = await _rpc(tc, "core.playback.get_current_track", timeout=2.0)
-    except Exception:
-        cur = None
-    if isinstance(cur, dict) and cur.get("uri") == uri:
-        try:
-            await _rpc(tc, "core.playback.resume", timeout=2.0)
+            cur = await _rpc(tc, "core.playback.get_current_track", timeout=2.0)
         except Exception:
-            pass
-        await _hold_ambient(ctx, new_track=False)   # resume in place — same sink, no reconcile poll
-        return ToolResult(output=f"Resuming {label} on TIDAL." if label else "Resuming on TIDAL.")
-    try:
-        await _play_uris(tc, [uri])
-    except Exception as e:
-        return ToolResult(output="", error=f"couldn't play that: {_human_err(e)}")
-    await _hold_ambient(ctx)
-    return ToolResult(output=f"Playing {label} on TIDAL." if label else "Playing on TIDAL.")
+            cur = None
+        if isinstance(cur, dict) and cur.get("uri") == uri:
+            try:
+                await _rpc(tc, "core.playback.resume", timeout=2.0)
+            except Exception:
+                pass
+            await _hold_ambient(ctx, new_track=False)   # resume in place — same sink, no reconcile poll
+            return ToolResult(output=f"Resuming {label} on TIDAL." if label else "Resuming on TIDAL.")
+        try:
+            timings = await _play_uris(tc, [uri])
+        except Exception as e:
+            return ToolResult(output="", error=f"couldn't play that: {_human_err(e)}")
+        _h = time.monotonic()
+        await _hold_ambient(ctx)
+        _play_timing(ctx, phase="play", search_ms=search_ms, **timings,
+                     hold_ms=int((time.monotonic() - _h) * 1000),
+                     total_ms=int((time.monotonic() - t0) * 1000))
+        return ToolResult(output=f"Playing {label} on TIDAL." if label else "Playing on TIDAL.")
 
 
 async def _play_container(ctx, tc, query="", uri="", album=False) -> ToolResult:
     """Play a whole album / playlist / mix. A container URI plays exactly; `album=true` with a
     query searches the album catalog first."""
-    label = ""
-    container_uri = uri if _is_container_uri(uri) else ""
-    if not container_uri and album and query:
+    # In-flight + optimistic "playing" so /media/state is served from cache during the search/expand/play
+    # rather than blocking the gate's poll behind the op (see _tidal_op).
+    async with _tidal_op(ctx, optimistic="playing"):
+        t0 = time.monotonic()
+        label = ""
+        search_ms = None
+        container_uri = uri if _is_container_uri(uri) else ""
+        if not container_uri and album and query:
+            _s = time.monotonic()
+            try:
+                results = await _rpc_resilient(tc, "core.library.search", {"query": {"any": [query]}})
+            except Exception as e:
+                return ToolResult(output="", error=f"TIDAL search failed: {_human_err(e)}")
+            search_ms = int((time.monotonic() - _s) * 1000)
+            albums = [a for a in _flatten_albums(results) if a["uri"]]
+            if not albums:
+                return ToolResult(output="", error=f"I couldn't find the album '{query}' on TIDAL.")
+            container_uri = albums[0]["uri"]
+            label = albums[0]["title"] + (f" by {albums[0]['artist']}" if albums[0]["artist"] else "")
+        if not container_uri:
+            return ToolResult(output="", error="no album, playlist, or mix to play")
+        noun = _container_noun(container_uri)
         try:
-            results = await _rpc_resilient(tc, "core.library.search", {"query": {"any": [query]}})
+            _e = time.monotonic()
+            uris = await _expand_playable(tc, container_uri)
+            expand_ms = int((time.monotonic() - _e) * 1000)
+            if not uris:
+                return ToolResult(output="", error=f"that {noun} has no playable tracks")
+            timings = await _play_uris(tc, uris)
         except Exception as e:
-            return ToolResult(output="", error=f"TIDAL search failed: {_human_err(e)}")
-        albums = [a for a in _flatten_albums(results) if a["uri"]]
-        if not albums:
-            return ToolResult(output="", error=f"I couldn't find the album '{query}' on TIDAL.")
-        container_uri = albums[0]["uri"]
-        label = albums[0]["title"] + (f" by {albums[0]['artist']}" if albums[0]["artist"] else "")
-    if not container_uri:
-        return ToolResult(output="", error="no album, playlist, or mix to play")
-    noun = _container_noun(container_uri)
-    try:
-        uris = await _expand_playable(tc, container_uri)
-        if not uris:
-            return ToolResult(output="", error=f"that {noun} has no playable tracks")
-        await _play_uris(tc, uris)
-    except Exception as e:
-        return ToolResult(output="", error=f"couldn't play that {noun}: {_human_err(e)}")
-    await _hold_ambient(ctx)
-    return ToolResult(output=f"Playing the {noun} {label} on TIDAL." if label
-                      else f"Playing that {noun} on TIDAL.")
+            return ToolResult(output="", error=f"couldn't play that {noun}: {_human_err(e)}")
+        _h = time.monotonic()
+        await _hold_ambient(ctx)
+        _play_timing(ctx, phase="play_container", search_ms=search_ms, expand_ms=expand_ms, **timings,
+                     hold_ms=int((time.monotonic() - _h) * 1000),
+                     total_ms=int((time.monotonic() - t0) * 1000))
+        return ToolResult(output=f"Playing the {noun} {label} on TIDAL." if label
+                          else f"Playing that {noun} on TIDAL.")
+
+
+_TRANSPORT_RESULT = {
+    "core.playback.pause": "paused", "core.playback.resume": "playing",
+    "core.playback.next": "playing", "core.playback.previous": "playing",
+    "core.playback.stop": "stopped",
+}
 
 
 async def _transport(ctx, method: str, said: str) -> ToolResult:
     try:
-        await _rpc(ctx.config.tidal, method)
+        async with _tidal_op(ctx, result=_TRANSPORT_RESULT.get(method)):
+            await _rpc(ctx.config.tidal, method)
     except Exception as e:
         return ToolResult(output="", error=f"couldn't do that: {_human_err(e)}")
     return ToolResult(output=said)
@@ -423,10 +525,35 @@ async def now_playing(ctx) -> ToolResult:
     if not track:
         return ToolResult(output=json.dumps({"playing": False}))
     artist = _artist_names(track)
-    return ToolResult(output=json.dumps({
+    info = {
         "playing": True, "title": track.get("name"), "artist": artist,
         "album": (track.get("album") or {}).get("name", ""),
-    }))
+    }
+    # A loaded track is NOT proof the user can hear it: the music sink-input can be muted, at 0%, or routed
+    # to another device while the player still reports "playing". Probe the real output so the brain answers
+    # "is it playing?" honestly instead of asserting playback into silence (the "I verified it's playing —
+    # check your sound settings" over-claim, which sends the user chasing their own audio). Best-effort: if
+    # the probe can't tell, leave the field off so grounding stays neutral.
+    try:
+        from gabagent.voice.ducking import mopidy_audibility
+        aud = await mopidy_audibility()
+        if aud.get("checked"):
+            info["audible"] = bool(aud.get("audible"))
+            if not aud.get("audible") and aud.get("reason"):
+                info["not_audible_reason"] = aud["reason"]
+        # Capture the verdict in voice_debug.jsonl: the verify path's audibility (mute/volume/routing) is
+        # otherwise invisible in the brain log — this is what proves the honesty fix fired AND captures the
+        # mute-vs-wrong-sink-routing distinction for the silence root-cause (VAC's diagnostic ask).
+        try:
+            from gabagent.voice.debuglog import dlog
+            dlog(ctx, "audibility", **{k: aud[k] for k in
+                 ("checked", "present", "audible", "muted", "volume", "sink",
+                  "default_sink", "on_default", "reason") if k in aud})
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return ToolResult(output=json.dumps(info))
 
 
 async def playlists(ctx) -> ToolResult:

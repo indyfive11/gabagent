@@ -89,6 +89,32 @@ async def test_tidal_source_none_when_stopped():
     assert await tidal.sources(_ctx()) == []
 
 
+@respx.mock
+async def test_tidal_source_serves_cache_in_flight_without_rpc():
+    """While a TIDAL op is in flight, sources() must serve the cached state and NOT issue a get_state RPC
+    (which would queue behind the op in Mopidy and block the gate's poll ~30s)."""
+    from gabagent.commands.providers.tidal import PROVIDER as tidal, _pb_cache, _cache_playback
+    ctx = _ctx()
+    c = _pb_cache(ctx)
+    c["inflight"] = 1
+    _cache_playback(ctx, "playing")          # optimistic state an in-flight play() would have set
+    route = respx.post(RPC).mock(return_value=httpx.Response(500))
+    srcs = await tidal.sources(ctx)
+    assert not route.called                  # served from cache — no blocking RPC
+    assert len(srcs) == 1 and srcs[0].state == "playing"
+
+
+@respx.mock
+async def test_tidal_source_serves_fresh_cache_without_rpc():
+    """A fresh cache (within TTL) is served without an RPC even when idle."""
+    from gabagent.commands.providers.tidal import PROVIDER as tidal, _pb_cache, _cache_playback
+    ctx = _ctx()
+    _cache_playback(ctx, "playing")          # ts = now → fresh
+    route = respx.post(RPC).mock(return_value=httpx.Response(500))
+    srcs = await tidal.sources(ctx)
+    assert not route.called and len(srcs) == 1 and srcs[0].state == "playing"
+
+
 # -- jellyfin sources -----------------------------------------------------------------------------
 
 class _FakeVideoPage:

@@ -13,10 +13,15 @@ RPC = "http://mopidy.test:6680/mopidy/rpc"
 @pytest.fixture(autouse=True)
 def _no_ambient_cap(monkeypatch):
     """Don't let play's ambient-cap hook touch real system audio (pactl) or perturb the asserted RPC
-    sequence — stub it. The ambient cap's own behavior is covered in test_ducking."""
+    sequence — stub it. The ambient cap's own behavior is covered in test_ducking. Also stub the
+    now_playing audibility probe (its own behavior is covered in test_ducking) so it never shells out
+    to a real pactl — tests that assert the enriched output override it."""
     async def _noop(ctx):
         return None
     monkeypatch.setattr("gabagent.voice.ducking.apply_ambient_cap", _noop)
+    async def _unchecked():
+        return {"checked": False}
+    monkeypatch.setattr("gabagent.voice.ducking.mopidy_audibility", _unchecked)
 
 _TRACK = {
     "__model__": "Track", "uri": "tidal:track:1", "name": "So What",
@@ -79,11 +84,23 @@ async def test_play_searches_then_queues_and_plays():
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
 
     respx.post(RPC).mock(side_effect=_resp)
-    res = await td.play(_ctx(), query="kind of blue")
+    logged = []
+    ctx = _ctx()
+    ctx.voice_debug_path = "/dev/null"
+    import gabagent.voice.debuglog as _dl
+    _orig = _dl.dlog
+    _dl.dlog = lambda c, ev, **f: logged.append((ev, f)) if ev == "tidal_timing" else None
+    try:
+        res = await td.play(ctx, query="kind of blue")
+    finally:
+        _dl.dlog = _orig
     assert res.success and "So What" in res.output and "Miles Davis" in res.output
     # search -> (F2 current-track check; not current here) -> clear -> add -> play, in order
     assert seen == ["core.library.search", "core.playback.get_current_track",
                     "core.tracklist.clear", "core.tracklist.add", "core.playback.play"]
+    # latency sub-timing emitted with per-phase ms so a slow tidal turn can be localized
+    assert logged and logged[0][0] == "tidal_timing"
+    assert {"phase", "search_ms", "queue_ms", "play_ms", "hold_ms", "total_ms"} <= set(logged[0][1])
 
 
 @respx.mock
@@ -139,11 +156,67 @@ async def test_transport_and_now_playing():
     assert np["playing"] and np["title"] == "So What" and np["artist"] == "Miles Davis"
 
 
+async def test_pb_cache_default():
+    c = td._pb_cache(_ctx())
+    assert c == {"state": None, "ts": 0.0, "inflight": 0}
+
+
+async def test_tidal_op_marks_inflight_and_caches_result():
+    ctx = _ctx()
+    async with td._tidal_op(ctx, optimistic="playing", result="playing"):
+        c = td._pb_cache(ctx)
+        assert c["inflight"] == 1 and c["state"] == "playing"   # optimistic applied at entry
+    c = td._pb_cache(ctx)
+    assert c["inflight"] == 0 and c["state"] == "playing"       # result applied on success
+
+
+async def test_tidal_op_skips_result_on_exception_but_clears_inflight():
+    ctx = _ctx()
+    td._cache_playback(ctx, "stopped")
+    with pytest.raises(ValueError):
+        async with td._tidal_op(ctx, result="playing"):
+            raise ValueError("boom")
+    c = td._pb_cache(ctx)
+    assert c["state"] == "stopped"    # a failed op does NOT cache "playing" (self-heals via idle poll)
+    assert c["inflight"] == 0         # but the in-flight mark is always released
+
+
+@respx.mock
+async def test_transport_caches_resulting_state():
+    respx.post(RPC).mock(side_effect=_rpc_router({"core.playback.pause": None}))
+    ctx = _ctx()
+    await td.pause(ctx)
+    assert td._pb_cache(ctx)["state"] == "paused"
+
+
 @respx.mock
 async def test_now_playing_nothing():
     respx.post(RPC).mock(side_effect=_rpc_router({"core.playback.get_current_track": None}))
     np = json.loads((await td.now_playing(_ctx())).output)
     assert np == {"playing": False}
+
+
+@respx.mock
+async def test_now_playing_reports_inaudible(monkeypatch):
+    """A loaded track whose music sink is muted/misrouted must report audible:false + a reason, so the
+    brain doesn't assert 'it's playing' into silence (the false-verify over-claim)."""
+    respx.post(RPC).mock(side_effect=_rpc_router({"core.playback.get_current_track": _TRACK}))
+    async def _muted():
+        return {"checked": True, "present": True, "audible": False, "reason": "the music output is muted"}
+    monkeypatch.setattr("gabagent.voice.ducking.mopidy_audibility", _muted)
+    np = json.loads((await td.now_playing(_ctx())).output)
+    assert np["playing"] is True and np["audible"] is False
+    assert np["not_audible_reason"] == "the music output is muted"
+
+
+@respx.mock
+async def test_now_playing_audible_sets_flag(monkeypatch):
+    respx.post(RPC).mock(side_effect=_rpc_router({"core.playback.get_current_track": _TRACK}))
+    async def _ok():
+        return {"checked": True, "present": True, "audible": True}
+    monkeypatch.setattr("gabagent.voice.ducking.mopidy_audibility", _ok)
+    np = json.loads((await td.now_playing(_ctx())).output)
+    assert np["audible"] is True and "not_audible_reason" not in np
 
 
 @respx.mock

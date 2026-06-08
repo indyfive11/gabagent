@@ -47,6 +47,13 @@ def _state(ctx) -> dict:
     s.setdefault("tidal_sink_prior", None)       # (sink-input index, prior volume %) when ducked
     s.setdefault("muted", False)                 # the active duck has been DEEPENED to a full mute (vol 0)
     s.setdefault("local_sink_priors", None)      # {sink-input idx: prior %} for the universal local-duck
+    # Duck-WINDOW lifecycle: the authoritative "is a speech-duck currently on" flag (set on duck on, cleared
+    # on duck off), independent of the prior tuples. The mid-duck reconcile keys its level decision off this
+    # so it can't strand a new track at the duck level when the window has actually closed (the reconcile-vs-
+    # off race). seq + opened_mono let us log each window's duration to spot a window stuck open (missing off).
+    s.setdefault("duck_window_open", False)
+    s.setdefault("duck_window_seq", 0)
+    s.setdefault("duck_window_opened_mono", None)
     return s
 
 
@@ -63,6 +70,19 @@ async def duck_media(ctx, on: bool, session_id: str | None = None, mute: bool = 
     # (e.g. a page-eval on a dead movie page). dlog is self-guarding, so these never raise.
     _t0 = time.monotonic()
     dlog(ctx, "duck_begin", session=session_id, on=bool(on), mute=bool(mute))
+    # Track the duck-window lifecycle so the reconcile knows whether a duck is genuinely open and so a
+    # window's open-duration is visible (a 30s+ window = a missing off, the real strand trigger).
+    st0 = _state(ctx)
+    win_ms = None
+    if on:
+        if not st0.get("duck_window_open"):
+            st0["duck_window_seq"] = st0.get("duck_window_seq", 0) + 1
+            st0["duck_window_opened_mono"] = _t0
+            st0["duck_window_open"] = True
+    else:
+        if st0.get("duck_window_opened_mono") is not None:
+            win_ms = int((_t0 - st0["duck_window_opened_mono"]) * 1000)
+        st0["duck_window_open"] = False
     ducked = []
     if await _duck_tidal(ctx, on, mute):
         ducked.append("tidal")
@@ -83,7 +103,8 @@ async def duck_media(ctx, on: bool, session_id: str | None = None, mute: bool = 
         st = _state(ctx)
         dlog(ctx, "duck", session=session_id, on=bool(on), mute=bool(mute), muted=st.get("muted"),
              ducked=ducked, jellyfin_saved=st.get("jellyfin_video_volume"),
-             tidal_prior=st.get("tidal_prior"), dur_ms=int((time.monotonic() - _t0) * 1000))
+             tidal_prior=st.get("tidal_prior"), dur_ms=int((time.monotonic() - _t0) * 1000),
+             win=st.get("duck_window_seq"), win_open=st.get("duck_window_open"), win_ms=win_ms)
     except Exception:
         pass
     return {"ok": True, "ducked": ducked}
@@ -179,6 +200,96 @@ async def _mopidy_sink_input() -> tuple[str, int | None] | None:
     if rc != 0 or not out:
         return None
     return _parse_mopidy_sink_input(out)
+
+
+def _parse_mopidy_sink_full(out: str) -> dict | None:
+    """Richer Mopidy sink-input parse for the audibility probe: index, volume %, the MUTE flag, and the
+    sink index it's routed to. A loaded track reads "playing" from the player even when this stream is
+    muted / at 0% / on a non-default sink, so the verify path needs these fields to tell whether the user
+    can actually HEAR it. Returns None when no Mopidy stream is at the sink."""
+    for block in out.split("Sink Input #")[1:]:
+        if 'application.name = "Mopidy"' not in block and 'node.name = "Mopidy"' not in block:
+            continue
+        idx = block.splitlines()[0].strip()
+        if not idx.isdigit():
+            continue
+        vm = re.search(r"Volume:.*?(\d+)%", block)
+        mm = re.search(r"Mute:\s*(yes|no)", block)
+        sm = re.search(r"^\s*Sink:\s*(\d+)", block, re.MULTILINE)
+        return {
+            "idx": idx,
+            "volume": int(vm.group(1)) if vm else None,
+            "muted": (mm.group(1) == "yes") if mm else None,
+            "sink_idx": sm.group(1) if sm else None,
+        }
+    return None
+
+
+async def _default_sink_name() -> str | None:
+    rc, out = await _run_pactl("get-default-sink")
+    name = out.strip()
+    return name if rc == 0 and name else None
+
+
+async def _sink_name_by_index(sink_idx: str | None) -> str | None:
+    if not sink_idx:
+        return None
+    rc, out = await _run_pactl("list", "short", "sinks")
+    if rc != 0 or not out:
+        return None
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0] == sink_idx:
+            return parts[1]
+    return None
+
+
+async def _unmute_sink_input(idx: str) -> None:
+    """Clear a stray MUTE flag on a music sink-input. Our duck scheme attenuates by VOLUME only and never
+    sets the mute flag, so on the audible-restore/play paths the music stream should never carry one; if
+    something else (stream-restore replay, a stray toggle) set it, a volume restore alone leaves the stream
+    silent at a healthy level — the 'set it to 50% and still nothing' signature. Best-effort; never raises."""
+    await _run_pactl("set-sink-input-mute", idx, "0")
+
+
+async def mopidy_audibility() -> dict:
+    """Probe whether the Mopidy music stream is actually AUDIBLE — present, unmuted, >0 volume, AND routed
+    to the current default sink — rather than just "a track is loaded" (which the player reports even into
+    total silence). Used by tidal.now_playing so the brain grounds "is it playing?" in real output state and
+    stops asserting playback the user can't hear (the "I verified it's playing, check your sound settings"
+    over-claim). Conservative: only reports inaudible on POSITIVE evidence (muted / 0% / provably off the
+    default sink); when it can't tell, it does not claim silence. Best-effort — on any probe failure returns
+    {"checked": False} so callers stay neutral. Never raises."""
+    try:
+        if not shutil.which("pactl"):
+            return {"checked": False}
+        rc, out = await _run_pactl("list", "sink-inputs")
+        if rc != 0 or not out:
+            return {"checked": False}
+        si = _parse_mopidy_sink_full(out)
+        if si is None:
+            return {"checked": True, "present": False, "audible": False,
+                    "reason": "there's no music stream at the audio output"}
+        default_sink = await _default_sink_name()
+        sink_name = await _sink_name_by_index(si["sink_idx"])
+        vol, muted = si["volume"], si["muted"]
+        off_default = bool(sink_name and default_sink and sink_name != default_sink)
+        reasons = []
+        if muted:
+            reasons.append("the music output is muted")
+        if vol == 0:
+            reasons.append("its volume is at zero")
+        if off_default:
+            reasons.append(f"it's routed to '{sink_name}', not your active output")
+        audible = not (muted or vol == 0 or off_default)
+        res = {"checked": True, "present": True, "audible": audible,
+               "volume": vol, "muted": muted, "sink": sink_name, "default_sink": default_sink,
+               "on_default": (not off_default)}
+        if reasons:
+            res["reason"] = "; ".join(reasons)
+        return res
+    except Exception:
+        return {"checked": False}
 
 
 def _parse_sink_inputs(out: str) -> list[dict]:
@@ -306,13 +417,28 @@ async def apply_ambient_cap(ctx, new_track: bool = True) -> None:
                     break
                 await asyncio.sleep(_AMBIENT_SETTLE_DELAY)   # new sink not up yet — wait for it
             if new is not None:
-                duck_target = 0 if _state(ctx).get("muted") else _SINK_DUCK_PCT
-                await _run_pactl("set-sink-input-volume", new[0], f"{duck_target}%")
-                _state(ctx)["tidal_sink_prior"] = (new[0], prior)
-                _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer,
-                            reconciled_sink=new[0], duck_target=duck_target)
+                # Duck the new sink to the active level ONLY if a speech-duck window is genuinely OPEN. If it
+                # has closed (the saved prior is a stale leftover of the reconcile-vs-off race), ducking here
+                # would strand the new track quiet with no off to follow — the "I don't hear anything" bug.
+                # In that case restore it to the real (mixer/prior) level and clear the stale prior instead.
+                if _state(ctx).get("duck_window_open"):
+                    duck_target = 0 if _state(ctx).get("muted") else _SINK_DUCK_PCT
+                    await _run_pactl("set-sink-input-volume", new[0], f"{duck_target}%")
+                    _state(ctx)["tidal_sink_prior"] = (new[0], prior)
+                    _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer,
+                                reconciled_sink=new[0], duck_target=duck_target,
+                                window_open=True, chose="duck")
+                else:
+                    restore = min(int(mixer) if mixer is not None else int(prior), cap)
+                    await _run_pactl("set-sink-input-volume", new[0], f"{restore}%")
+                    await _unmute_sink_input(new[0])
+                    _state(ctx)["tidal_sink_prior"] = None
+                    _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer,
+                                reconciled_sink=new[0], restored_to=restore,
+                                window_open=False, chose="restore_mixer")
             else:
-                _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer, skipped="ducking")
+                _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer, skipped="ducking",
+                            window_open=bool(_state(ctx).get("duck_window_open")))
             return
         # Mirror the (capped) mixer onto the sink-input — fall back to the cap if the mixer is unknown.
         # This RAISES a stranded-low sink-input (stream-restore replayed a duck) back to the real level, and
@@ -330,6 +456,8 @@ async def apply_ambient_cap(ctx, new_track: bool = True) -> None:
             idx, svol = found
             if svol != target:
                 await _run_pactl("set-sink-input-volume", idx, f"{target}%")
+            if target > 0:                    # bringing a (new) track to an audible level — clear any stray mute
+                await _unmute_sink_input(idx)
         _tidal_dlog(ctx, phase="ambient_cap", cap=cap, mixer=mixer, settled=bool(found))
     except Exception:
         pass
@@ -409,6 +537,7 @@ async def _duck_tidal_sink(ctx, on: bool, mute: bool = False, mixer_vol: int | N
         cur = await _mopidy_sink_input()      # re-find: the stream/index may have changed
         tgt_idx = cur[0] if cur else idx
         await _run_pactl("set-sink-input-volume", tgt_idx, f"{target}%")
+        await _unmute_sink_input(tgt_idx)     # restore to an AUDIBLE level — clear any stray mute flag
         _tidal_dlog(ctx, phase="sink_off", sink_idx=tgt_idx, restored_to=target)
         st["tidal_sink_prior"] = None
     except Exception:

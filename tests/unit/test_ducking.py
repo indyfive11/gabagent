@@ -98,6 +98,22 @@ async def test_duck_noop_when_nothing_configured():
     assert await duck_media(ctx, True) == {"ok": True, "ducked": []}
 
 
+async def test_duck_window_lifecycle_flag_and_seq():
+    """The duck-window flag opens on the first duck-on, stays open across repeat ons, and closes on duck-off
+    — and the window sequence advances per window. This is what the mid-duck reconcile keys its level
+    decision off (and what surfaces a window stuck open)."""
+    ctx = _ctx(tidal=False, jellyfin=False)
+    st = _dk._state(ctx)
+    await duck_media(ctx, True)
+    assert st["duck_window_open"] is True and st["duck_window_seq"] == 1
+    await duck_media(ctx, True)                       # a second onset within the same window
+    assert st["duck_window_open"] is True and st["duck_window_seq"] == 1   # same window, not a new one
+    await duck_media(ctx, False)
+    assert st["duck_window_open"] is False
+    await duck_media(ctx, True)                       # a fresh window
+    assert st["duck_window_open"] is True and st["duck_window_seq"] == 2
+
+
 # -- browser-played movie: duck VOLUME, never pause (no REST, no Space toggle to fight) ----------
 
 class _FakeVideoPage:
@@ -258,6 +274,81 @@ async def test_duck_tidal_sink_ducks_then_restores(monkeypatch):
     await _dk._duck_tidal_sink(ctx, False)
     assert st["tidal_sink_prior"] is None
     assert ("set-sink-input-volume", "7", "90%") in calls     # restored to the saved prior
+    assert ("set-sink-input-mute", "7", "0") in calls         # and cleared any stray mute (silence guard)
+
+
+def test_parse_mopidy_sink_full():
+    from gabagent.voice.ducking import _parse_mopidy_sink_full
+    out = (
+        'Sink Input #5\n\tVolume: front-left: 65536 / 100%\n'
+        '\tMute: no\n\tProperties:\n\t\tapplication.name = "Firefox"\n'
+        'Sink Input #12\n\tVolume: front-left: 45000 / 69% / -3.00 dB\n'
+        '\tMute: yes\n\tSink: 3\n\tProperties:\n\t\tapplication.name = "Mopidy"\n'
+    )
+    assert _parse_mopidy_sink_full(out) == {"idx": "12", "volume": 69, "muted": True, "sink_idx": "3"}
+    assert _parse_mopidy_sink_full("nothing here") is None
+
+
+def _pactl_router(monkeypatch, *, sink_inputs="", default_sink="", sinks_short=""):
+    """Stub pactl + shutil.which for the audibility probe: route by the pactl subcommand."""
+    monkeypatch.setattr(_dk.shutil, "which", lambda _name: "/usr/bin/pactl")
+    async def fake_pactl(*args, **k):
+        if args[:1] == ("get-default-sink",):
+            return (0, default_sink)
+        if args[:3] == ("list", "short", "sinks"):
+            return (0, sinks_short)
+        if args[:2] == ("list", "sink-inputs"):
+            return (0, sink_inputs)
+        return (0, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+
+
+_AUDIBLE_BLOCK = ('Sink Input #12\n\tVolume: front-left: 45000 / 69%\n'
+                  '\tMute: no\n\tSink: 3\n\tProperties:\n\t\tapplication.name = "Mopidy"\n')
+
+
+async def test_mopidy_audibility_true_when_unmuted_nonzero_on_default(monkeypatch):
+    _pactl_router(monkeypatch, sink_inputs=_AUDIBLE_BLOCK,
+                  default_sink="alsa.spk", sinks_short="3\talsa.spk\tmod\trun\n")
+    res = await _dk.mopidy_audibility()
+    assert res["checked"] and res["present"] and res["audible"] is True
+    assert "reason" not in res
+
+
+async def test_mopidy_audibility_false_when_muted(monkeypatch):
+    blk = _AUDIBLE_BLOCK.replace("Mute: no", "Mute: yes")
+    _pactl_router(monkeypatch, sink_inputs=blk, default_sink="alsa.spk",
+                  sinks_short="3\talsa.spk\tmod\trun\n")
+    res = await _dk.mopidy_audibility()
+    assert res["audible"] is False and "muted" in res["reason"]
+
+
+async def test_mopidy_audibility_false_when_zero_volume(monkeypatch):
+    blk = _AUDIBLE_BLOCK.replace("69%", "0%")
+    _pactl_router(monkeypatch, sink_inputs=blk, default_sink="alsa.spk",
+                  sinks_short="3\talsa.spk\tmod\trun\n")
+    res = await _dk.mopidy_audibility()
+    assert res["audible"] is False and "zero" in res["reason"]
+
+
+async def test_mopidy_audibility_false_when_off_default_sink(monkeypatch):
+    # Mopidy is on sink 3 (hdmi) but the default sink is the speakers → routed elsewhere → inaudible.
+    _pactl_router(monkeypatch, sink_inputs=_AUDIBLE_BLOCK, default_sink="alsa.spk",
+                  sinks_short="3\talsa.hdmi\tmod\trun\n9\talsa.spk\tmod\trun\n")
+    res = await _dk.mopidy_audibility()
+    assert res["audible"] is False and "alsa.hdmi" in res["reason"]
+
+
+async def test_mopidy_audibility_present_false_when_no_stream(monkeypatch):
+    _pactl_router(monkeypatch, sink_inputs='Sink Input #5\n\tProperties:\n\t\tapplication.name = "Firefox"\n')
+    res = await _dk.mopidy_audibility()
+    assert res["checked"] and res["present"] is False and res["audible"] is False
+
+
+async def test_mopidy_audibility_unchecked_when_no_pactl(monkeypatch):
+    monkeypatch.setattr(_dk.shutil, "which", lambda _name: None)
+    res = await _dk.mopidy_audibility()
+    assert res == {"checked": False}
 
 
 async def test_duck_tidal_sink_noop_when_no_mopidy_stream(monkeypatch):
@@ -410,6 +501,7 @@ async def test_apply_ambient_cap_reconciles_new_track_mid_duck(monkeypatch):
     monkeypatch.setattr(td, "_rpc", fake_rpc)
     ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=90))
     _dk._state(ctx)["tidal_sink_prior"] = ("4", 70)              # duck active, saved at the OLD index
+    _dk._state(ctx)["duck_window_open"] = True                   # the speech-duck window is genuinely open
     await _dk.apply_ambient_cap(ctx)
     assert ("set-sink-input-volume", "9", f"{_dk._SINK_DUCK_PCT}%") in calls   # new sink ducked, not stranded
     assert _dk._state(ctx)["tidal_sink_prior"] == ("9", 70)      # tuple re-pointed; prior preserved
@@ -436,6 +528,7 @@ async def test_apply_ambient_cap_reconcile_polls_for_late_new_sink(monkeypatch):
     monkeypatch.setattr(td, "_rpc", fake_rpc)
     ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=90))
     _dk._state(ctx)["tidal_sink_prior"] = ("4", 70)             # duck active, on the OLD sink
+    _dk._state(ctx)["duck_window_open"] = True                  # window genuinely open → duck the new sink
     await _dk.apply_ambient_cap(ctx)                            # new_track defaults True → polls
     assert attempts["n"] == 3                                   # polled until the new sink appeared
     assert ("set-sink-input-volume", "9", f"{_dk._SINK_DUCK_PCT}%") in calls
@@ -481,8 +574,34 @@ async def test_apply_ambient_cap_reconciles_new_track_to_zero_when_muted(monkeyp
     ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=90))
     _dk._state(ctx)["tidal_sink_prior"] = ("4", 70)
     _dk._state(ctx)["muted"] = True
+    _dk._state(ctx)["duck_window_open"] = True
     await _dk.apply_ambient_cap(ctx)
     assert ("set-sink-input-volume", "9", "0%") in calls         # muted window → full 0, not the duck pct
+
+
+async def test_apply_ambient_cap_reconcile_restores_when_window_closed(monkeypatch):
+    """THE reconcile-vs-off race (the recurring 'I don't hear anything'): a new track is reconciled but the
+    speech-duck window has CLOSED (stale prior lingered). Ducking it to 18% would strand it quiet with no off
+    to follow. With the window flag False, the reconcile must RESTORE the new sink to the mixer level (50) and
+    clear the stale prior — not leave it at the duck level."""
+    async def fake_sink():
+        return ("9", 18)                                         # new track's sink, came up stranded-quiet
+    calls = []
+    async def fake_pactl(*a, **k):
+        calls.append(a); return (0, "")
+    monkeypatch.setattr(_dk, "_mopidy_sink_input", fake_sink)
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    import gabagent.commands.providers.tidal as td
+    async def fake_rpc(tc, method, params=None, timeout=2.0):
+        return 50 if method == "core.mixer.get_volume" else None
+    monkeypatch.setattr(td, "_rpc", fake_rpc)
+    ctx = types.SimpleNamespace(config=GabAgentConfig(api_key="t", media_ambient_cap=90))
+    _dk._state(ctx)["tidal_sink_prior"] = ("4", 50)             # stale prior left by the race
+    _dk._state(ctx)["duck_window_open"] = False                 # ...but the window has actually closed
+    await _dk.apply_ambient_cap(ctx)
+    assert ("set-sink-input-volume", "9", "50%") in calls        # restored to the real level, NOT 18
+    assert ("set-sink-input-mute", "9", "0") in calls            # and unmuted (stray-mute guard)
+    assert _dk._state(ctx)["tidal_sink_prior"] is None           # stale prior cleared
 
 
 async def test_apply_ambient_cap_disabled_at_100(monkeypatch):
