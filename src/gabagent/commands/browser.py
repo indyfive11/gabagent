@@ -12,15 +12,32 @@ if TYPE_CHECKING:
     from gabagent.agent.context import AgentContext
 
 
+async def _context_alive(bctx) -> bool:
+    """True if the persistent context is still usable.
+
+    A real protocol round-trip (`cookies()`) raises on a dead context — unlike the cached `.pages`
+    property, which returns stale data on a CLOSED context and so reported a false "alive". That false
+    positive is exactly what stranded us on a dead browser: the closed context passed the check, got
+    reused, then `new_page()`/`goto()` raised "browser context is closed", and the stale ref was never
+    cleared — so every retry hit the same corpse ("still getting the same error—still closed")."""
+    try:
+        await bctx.cookies()
+        return True
+    except Exception:
+        return False
+
+
 async def ensure_browser(ctx: AgentContext, profile: str = "default"):
-    """Return a live persistent BrowserContext, launching a headed one if needed."""
+    """Return a live persistent BrowserContext, launching a headed one if needed.
+
+    Self-heals a dead browser: if the held context fails the liveness probe (window closed, browser
+    crashed, shutdown race), tear it down cleanly and relaunch — so the FIRST play after a death
+    recovers, with no error and no manual retry."""
     existing = ctx.persistent_browser
     if existing is not None:
-        try:
-            _ = existing.pages  # raises if the context was closed
+        if await _context_alive(existing):
             return existing
-        except Exception:
-            ctx.persistent_browser = None
+        await close_browser(ctx)   # dead — stop its playwright + clear refs before relaunching
 
     from playwright.async_api import async_playwright
 
@@ -30,6 +47,12 @@ async def ensure_browser(ctx: AgentContext, profile: str = "default"):
     bctx = await pw.chromium.launch_persistent_context(
         str(profile_dir), headless=False, no_viewport=True, args=["--start-maximized"]
     )
+    # Proactively drop the ref the moment the context closes (user shuts the window, browser exits) so a
+    # later ensure_browser doesn't even probe a corpse — it just relaunches.
+    try:
+        bctx.on("close", lambda _bctx: setattr(ctx, "persistent_browser", None))
+    except Exception:
+        pass
     ctx.persistent_browser = bctx
     ctx.persistent_browser_pw = pw
     return bctx
@@ -48,3 +71,6 @@ async def close_browser(ctx: AgentContext) -> None:
         pass
     ctx.persistent_browser = None
     ctx.persistent_browser_pw = None
+    # A dead/closed context means its pages are dead too — drop the movie page ref so _live_jellyfin_page
+    # doesn't hand a stale page to a control command.
+    ctx.jellyfin_playing_page = None
