@@ -104,7 +104,18 @@ class ClaudetteClient:
                     out.append({"role": "assistant", "content": blocks})
                 continue
 
-        return "\n\n".join(system_parts), ClaudetteClient._pair_tool_blocks(out)
+        paired = ClaudetteClient._pair_tool_blocks(out)
+        if not paired:
+            # Anthropic requires >=1 message. Conversion empties the list when the windowed history was
+            # system-only, or only an orphan tool block the pairing pass culled (e.g. a tool follow-up
+            # turn whose tool_use was trimmed by the recent-tail slice). Recover the most recent usable
+            # content so the turn degrades gracefully instead of 400ing the whole turn.
+            fallback = next(
+                (m.content for m in reversed(messages) if m.role != "system" and m.content),
+                "(continue)",
+            )
+            paired = [{"role": "user", "content": fallback}]
+        return "\n\n".join(system_parts), paired
 
     @staticmethod
     def _pair_tool_blocks(out: list[dict]) -> list[dict]:

@@ -83,9 +83,34 @@ def test_system_extraction_and_tool_result_coalescing():
 
 
 def test_empty_assistant_turn_skipped():
+    # The wholly-empty assistant turn is still skipped (no assistant block), but the empty-array guard
+    # then injects a placeholder user message — Anthropic requires >=1 message, so out is never empty.
     msgs = [ChatMessage(role="assistant", content=None)]
     _, out = ClaudetteClient._convert_messages(msgs)
-    assert out == []
+    assert out == [{"role": "user", "content": "(continue)"}]
+    assert all(m["role"] != "assistant" for m in out)
+
+
+def test_orphan_tool_result_only_recovers_content():
+    # A tool follow-up turn whose tool_use was trimmed by the window slice: the lone orphan tool_result
+    # is culled by the pairing pass, which would empty the list. The guard recovers its content as a
+    # user message so the turn degrades gracefully instead of sending messages=[] (Anthropic 400).
+    msgs = [
+        ChatMessage(role="system", content="sys"),
+        ChatMessage(role="tool", content="VOL=70", tool_call_id="toolu_x"),
+    ]
+    system, out = ClaudetteClient._convert_messages(msgs)
+    assert system == "sys"
+    assert out == [{"role": "user", "content": "VOL=70"}]
+
+
+def test_system_only_input_gets_placeholder():
+    # Degenerate system-only window: no usable content to recover, so the guard falls back to a neutral
+    # placeholder rather than an empty (400-ing) message list.
+    msgs = [ChatMessage(role="system", content="just instructions")]
+    system, out = ClaudetteClient._convert_messages(msgs)
+    assert system == "just instructions"
+    assert out == [{"role": "user", "content": "(continue)"}]
 
 
 def test_orphan_leading_tool_result_dropped():
