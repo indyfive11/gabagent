@@ -294,6 +294,40 @@ async def test_browser_seek_forward_and_back_set_currenttime():
     assert r.success and abs(page.currentTime - 50.0) < 1e-9 and "back" in r.output     # -30s
 
 
+async def test_browser_next_aliases_to_skip_ahead():
+    # A movie has no "next track" — "can you skip?" used to hard-error. Now bare next = skip ahead 30s.
+    page = _FakePlayPage(current_time=50.0, duration=100.0)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page
+    r = await jf.control(ctx, action="next")
+    assert r.success and abs(page.currentTime - 80.0) < 1e-9 and "ahead" in r.output
+
+
+async def test_fullscreen_owned_page_presses_f_and_kwin(monkeypatch):
+    # Enter-fullscreen mirrors exit: press the player's own 'f' shortcut AND raise the KWin window.
+    import gabagent.commands.providers.desktop as _desktop
+    seen = {"kwin": False}
+    async def _fake_fs(_ctx):
+        seen["kwin"] = True
+        return jf.ToolResult(output="kwin ok")
+    monkeypatch.setattr(_desktop, "fullscreen", _fake_fs)
+    page = _FakePlayPage()
+    ctx = _ctx(); ctx.jellyfin_playing_page = page
+    r = await jf.control(ctx, action="fullscreen")
+    assert r.success and page.keyboard.keys == ["f"] and seen["kwin"] is True
+    assert "full screen" in r.output.lower()
+
+
+async def test_fullscreen_unowned_window_is_honest_about_player_layer(monkeypatch):
+    # No owned page → KWin fullscreen only; be honest the player's own HTML5 layer may need a manual F.
+    import gabagent.commands.providers.desktop as _desktop
+    async def _fake_fs(_ctx):
+        return jf.ToolResult(output="kwin ok")
+    monkeypatch.setattr(_desktop, "fullscreen", _fake_fs)
+    ctx = _ctx()  # no jellyfin_playing_page
+    r = await jf.control(ctx, action="fullscreen")
+    assert r.success and "press F" in r.output
+
+
 @respx.mock
 async def test_remote_volume_uses_general_command():
     # No owned page → a native controllable session takes VolumeUp via the GeneralCommand endpoint.

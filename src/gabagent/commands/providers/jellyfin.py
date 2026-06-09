@@ -20,7 +20,7 @@ _CONTROL = {"pause": "Pause", "resume": "Unpause", "stop": "Stop", "next": "Next
 _REMOTE_VOLUME = {"volume_up": "VolumeUp", "volume_down": "VolumeDown"}  # GeneralCommand for native clients
 _BROWSER_ONLY = {"close"}                                # only meaningful on the page we own
 _SEEK = {"forward": 30, "back": -30}                     # ±seconds; owned page via currentTime, REST via ticks
-_SPECIAL = {"exit_fullscreen"}                           # handled directly (two fullscreen layers)
+_SPECIAL = {"fullscreen", "exit_fullscreen"}             # handled directly (two fullscreen layers)
 _ACTIONS = set(_CONTROL) | set(_REMOTE_VOLUME) | _BROWSER_ONLY | set(_SEEK) | _SPECIAL
 _PLAY_POLL_TRIES = 24   # ~12s waiting for the opened web client to register a session
 
@@ -105,18 +105,18 @@ class JellyfinProvider:
             ),
             Command(
                 id="jellyfin.control", domain="media", tier=1, featured=True,
-                summary="Control the movie — pause, resume, stop, fast-forward or rewind, leave full screen, close the window, or turn the movie volume up/down",
+                summary="Control the movie — pause, resume, stop, fast-forward or rewind, enter or leave full screen, close the window, or turn the movie volume up/down",
                 backend=PyBackend(ref="gabagent.commands.providers.jellyfin:control"),
                 params=[Slot("action", "enum", True,
                              enum=("pause", "resume", "stop", "next", "forward", "back",
-                                   "exit_fullscreen", "close", "volume_up", "volume_down"),
+                                   "fullscreen", "exit_fullscreen", "close", "volume_up", "volume_down"),
                              description="required — one of pause/resume/stop/next/forward/back/"
-                             "exit_fullscreen/close/volume_up/volume_down (forward/back = skip ±30s, "
-                             "exit_fullscreen = leave the movie's full screen)")],
+                             "fullscreen/exit_fullscreen/close/volume_up/volume_down (forward/back/next = "
+                             "skip ±30s, fullscreen = put the movie full screen, exit_fullscreen = leave it)")],
                 examples=["pause", "resume", "stop the movie", "fast forward", "skip ahead",
-                          "rewind", "go back thirty seconds", "leave full screen", "exit fullscreen",
-                          "get out of full screen", "close the movie window",
-                          "turn up the movie", "louder on the movie", "movie volume down"],
+                          "rewind", "go back thirty seconds", "full screen the movie", "go fullscreen",
+                          "leave full screen", "exit fullscreen", "get out of full screen",
+                          "close the movie window", "turn up the movie", "louder on the movie", "movie volume down"],
             ),
             Command(
                 id="jellyfin.now_playing", domain="media", tier=1,
@@ -220,6 +220,27 @@ async def search(ctx, genre=None, min_rating=None, query=None, unwatched=False) 
     return ToolResult(output=json.dumps(results))
 
 
+async def _enter_fullscreen(ctx) -> ToolResult:
+    """Enter full screen — the mirror of _exit_fullscreen, across the same two stacked layers. Owned page:
+    press the player's own fullscreen shortcut ('f' — a TRUSTED key gesture, like Space for pause;
+    video.requestFullscreen() via evaluate is blocked without user activation) and raise the window to KWin
+    fullscreen. Unowned window: KWin fullscreen only, and be honest the player's own layer may need a manual 'f'."""
+    from gabagent.commands.providers.desktop import fullscreen as _kwin_fullscreen
+    page = _live_jellyfin_page(ctx)
+    if page is not None:
+        try:
+            await page.keyboard.press("f")
+        except Exception:
+            pass
+        await _kwin_fullscreen(ctx)   # also raise the window to KWin fullscreen
+        return ToolResult(output="Set the movie to full screen.")
+    res = await _kwin_fullscreen(ctx)
+    if not res.error:
+        return ToolResult(output="I've put the movie window in full screen. If the player itself isn't "
+                          "full screen, press F — I can't drive a window I didn't open.")
+    return res
+
+
 async def _exit_fullscreen(ctx) -> ToolResult:
     """Leave full screen — two stacked layers: the Jellyfin web player's own (HTML5) fullscreen and the
     KWin window fullscreen. Owned page: exit both reliably. Unowned window: drop the KWin fullscreen and
@@ -244,6 +265,8 @@ async def control(ctx, action="") -> ToolResult:
     jc = ctx.config.jellyfin
     if action not in _ACTIONS:
         return ToolResult(output="", error=f"unknown action: {action}")
+    if action == "fullscreen":
+        return await _enter_fullscreen(ctx)
     if action == "exit_fullscreen":
         return await _exit_fullscreen(ctx)
     # The Jellyfin web client ignores remote-control API commands (returns 204, does nothing — a
@@ -533,8 +556,10 @@ async def _browser_control(ctx, page, action) -> ToolResult:
             if not ok:
                 return ToolResult(output="", error="I couldn't read the movie volume.")
             return ToolResult(output="Turned the movie up." if action == "volume_up" else "Turned the movie down.")
-        if action in _SEEK:
-            secs = _SEEK[action]
+        if action in _SEEK or action == "next":
+            # A movie has no "next track", so bare "next"/"skip" means skip AHEAD (the live intent —
+            # "can you skip?" used to hard-error "nothing to skip to"). forward/back carry an explicit sign.
+            secs = _SEEK["forward"] if action == "next" else _SEEK[action]
             await _page_eval(
                 page,
                 "(s) => { const v = document.querySelector('video');"
@@ -542,8 +567,6 @@ async def _browser_control(ctx, page, action) -> ToolResult:
                 secs)
             return ToolResult(output=f"Skipped ahead {secs} seconds." if secs > 0
                               else f"Skipped back {abs(secs)} seconds.")
-        if action == "next":
-            return ToolResult(output="", error="There's nothing to skip to in a movie.")
         # Idempotent: read the REAL play state, then press Space (a toggle — but a *trusted* user
         # gesture, unlike video.play() via evaluate which can be autoplay-blocked) only if the state
         # actually needs to change. cur is None when we can't read it → best-effort single press.
