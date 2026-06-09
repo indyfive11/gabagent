@@ -137,9 +137,15 @@ async def media_state(ctx) -> dict:
     # a "nothing local playing" snapshot and surface a remote source that's correctly being ignored.
     try:
         from gabagent.voice.debuglog import dlog
+        # Per-source breakdown ("provider:state:L|R") so an idle⇄playing flap is attributable to the exact
+        # provider that dropped/reappeared — the 06-05 schema only logged opaque counts, which couldn't
+        # root-cause VAC's gate flap. With this, a transient (e.g. a Mopidy album-gap "stopped" read, or an
+        # MPRIS source blinking out) names itself in the log.
+        srcs_brief = [f"{s.provider}:{s.state}:{'L' if s.is_local else 'R'}" for s in srcs]
         dlog(ctx, "media_state", playing=playing, state=state, kind=kind,
              local=len(local), total=len(srcs),
-             remote=sum(1 for s in srcs if s.locality == "remote"), ms=int((_t1 - _t0) * 1000))
+             remote=sum(1 for s in srcs if s.locality == "remote"),
+             srcs=srcs_brief, ms=int((_t1 - _t0) * 1000))
     except Exception:
         pass
     return {"playing": playing, "state": state, "kind": kind}
