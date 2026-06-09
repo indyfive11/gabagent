@@ -67,6 +67,26 @@ def test_fast_verdict_real_command_without_self_label_still_fastpasses():
     assert _fast_verdict("play that album") is True
 
 
+@pytest.mark.parametrize("text", [
+    "aria what time is it",          # leading name
+    "hey aria play something",       # filler + leading name
+    "okay aria, pause",
+])
+def test_fast_verdict_vocative_aria_fastpasses(text):
+    assert _fast_verdict(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "you have to say hey aria and then give her a second",  # 3rd-person MENTION (live leak, round-1 gap a)
+    "the voice of aria sounds really nice",                 # mention, not address
+    "i think aria misheard that",                           # commentary about her
+])
+def test_fast_verdict_aria_mention_defers_not_fastpass(text):
+    # A bare "aria" mid-utterance is a mention, not vocative address — must defer to the LLM (None),
+    # not fast-pass. (The old aria-anywhere rule leaked these as answered.)
+    assert _fast_verdict(text) is None
+
+
 def _ctx(tag, *, raises=False, seen=None, provider="gab"):
     class _Client:
         async def complete_simple(self, messages, model=None):

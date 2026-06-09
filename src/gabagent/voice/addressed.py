@@ -120,13 +120,18 @@ def _fast_verdict(text: str) -> bool | None:
     # are asides, so anything question-shaped but not led by a question word goes to the classifier.
     # Genuine questions still fast-pass via their leading question word (what/how/is/are/can…) below.
     words = [w.strip(".,!?;:\"'") for w in t.split()]
-    if "aria" in words:                         # naming the assistant is addressed
-        return True
     # Skip leading filler/politeness to read the real lead word.
     i = 0
     while i < len(words) and words[i] in _FILLER_LEADS:
         i += 1
-    if i < len(words) and words[i] in _COMMAND_LEADS:
+    lead = words[i] if i < len(words) else ""
+    # Vocative address ONLY: "Aria …" / "hey Aria …" — the name in the lead position. A bare MENTION
+    # elsewhere ("you have to say hey Aria and then…", 3rd-person commentary about her) is NOT vocative
+    # and defers to the classifier. The old aria-anywhere fast-pass leaked exactly such asides live
+    # (round-1 gap a, recurred 2026-06-08: "you have to say, hey, Aria, and then give her a second").
+    if lead == "aria":
+        return True
+    if lead in _COMMAND_LEADS:
         return True
     return None
 
