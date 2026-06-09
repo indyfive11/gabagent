@@ -39,18 +39,64 @@ def test_fast_verdict_ambiguous_defers_to_model(text):
     assert _fast_verdict(text) is None
 
 
-def _ctx(tag, *, raises=False):
+# ---- ROUND 2: explicit dictation / "don't respond" self-labels block the fast-pass (→ defer to LLM) ----
+
+@pytest.mark.parametrize("text", [
+    "make a note for your Claude overseers that the volume is off",  # leads with "make" — must NOT fast-pass
+    "Aria, you don't need to respond to me",                         # mentions Aria — must NOT fast-pass
+    "the music is fine, you don't need to do anything, I'm just dictating",
+    "I'm gonna dictate something so it's on the record",
+    "set this aside, for the record I'm only dictating",
+    "no need to respond, just making a note",
+])
+def test_fast_verdict_self_labeled_asides_defer_not_fastpass(text):
+    # These carry an explicit non-command self-label; the heuristic must defer (None), NOT fast-pass True
+    # on a leading command word or an Aria mention. (Deferring is safe — the LLM still answers real commands.)
+    assert _fast_verdict(text) is None
+
+
+async def test_self_labeled_command_lead_reaches_llm_and_suppresses():
+    # "make a note for your overseers" used to fast-pass on "make"; now it reaches the LLM, which asides it.
+    addressed, via = await is_addressed(_ctx("[ASIDE]"), "make a note for your Claude overseers")
+    assert addressed is False and via == "llm:aside"
+
+
+def test_fast_verdict_real_command_without_self_label_still_fastpasses():
+    # Regression: an ordinary "make"/"play" command (no self-label) must still fast-pass with zero latency.
+    assert _fast_verdict("make a playlist of jazz") is True
+    assert _fast_verdict("play that album") is True
+
+
+def _ctx(tag, *, raises=False, seen=None, provider="gab"):
     class _Client:
         async def complete_simple(self, messages, model=None):
+            if seen is not None:
+                seen.append(model)
             if raises:
                 raise RuntimeError("classifier down")
             return tag
+    cfg = GabAgentConfig(api_key="t")
+    cfg.provider = provider
     return types.SimpleNamespace(
-        config=GabAgentConfig(api_key="t"),
+        config=cfg,
         client=_Client(),
         local_mode=False,
         local_client=None,
     )
+
+
+async def test_classifier_uses_backend_appropriate_model():
+    # The LIVE 2026-06-08 bug: the filter hardcoded the Gab simple_model ("arya") and shipped it to the
+    # Claude backend, which 400s → fails open → whole filter bypassed. On Claude it must use the ladder's
+    # bottom rung (haiku); on Gab it stays arya.
+    seen_claude: list = []
+    await is_addressed(_ctx("[ASIDE]", seen=seen_claude, provider="claude"), "some aside here")
+    assert seen_claude == [GabAgentConfig(api_key="t").claude.ladder[0].model]
+    assert seen_claude[0].startswith("claude-")
+
+    seen_gab: list = []
+    await is_addressed(_ctx("[ASIDE]", seen=seen_gab, provider="gab"), "some aside here")
+    assert seen_gab == [GabAgentConfig(api_key="t").router.simple_model]
 
 
 async def test_is_addressed_fast_path_skips_llm():
@@ -76,8 +122,10 @@ async def test_is_addressed_unknown_tag_fails_open():
 
 
 async def test_is_addressed_classifier_error_fails_open():
+    # Fails open (never eats a command) and surfaces the exception class in `via` so a systemic
+    # classifier failure (e.g. a Gab model name sent to the Claude backend) isn't silently hidden.
     addressed, via = await is_addressed(_ctx("[ASIDE]", raises=True), "some aside here")
-    assert addressed is True and via == "error"
+    assert addressed is True and via.startswith("error:")
 
 
 # ---- turn-level: a not-addressed utterance closes silently, never reaching the LLM ----

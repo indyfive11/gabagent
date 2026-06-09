@@ -49,6 +49,29 @@ _FILLER_LEADS = frozenset((
     "alright", "hi", "hello",
 ))
 
+# ROUND 2 (per VAC's Jun 6–7 mining: ~40/48 of the 15s runaway-turn cap-hits were Rob dictating long
+# asides he EXPLICITLY marks as non-commands). These self-labels — the user declaring "I'm just
+# dictating" or "you don't need to respond" — are strong NOT-addressed signals. When one is present we
+# must NOT fast-pass on a leading command word ("MAKE a note for your overseers" otherwise fast-passes on
+# "make") or an Aria mention — we defer to the LLM, which then classifies it as an aside. Deferring is
+# SAFE: a false match only costs one LLM call (the model still answers a genuine command), so this set
+# can be generous without ever eating a command. Substring match on the lowercased, filler-kept text.
+_ASIDE_SELF_LABELS = (
+    "dictating", "dictate this", "dictate something", "gonna dictate", "going to dictate",
+    "want to dictate", "let me dictate", "i'll dictate", "i will dictate", "just dictation",
+    "you don't need to respond", "you dont need to respond", "you don't have to respond",
+    "you dont have to respond", "no need to respond", "don't respond to", "dont respond to",
+    "you don't need to do anything", "you dont need to do anything", "you don't have to do anything",
+    "nothing for you to do", "you don't need to act", "for the record", "on the record",
+    "for your overseers", "claude overseers", "your overseers", "my overseers", "the overseers",
+)
+
+
+def _has_aside_self_label(t: str) -> bool:
+    """True if the (lowercased) text carries an explicit non-command self-label — Rob telling the
+    assistant he's just dictating / it needn't respond. Blocks the heuristic fast-pass; the LLM decides."""
+    return any(p in t for p in _ASIDE_SELF_LABELS)
+
 _ADDRESSED_PROMPT = """\
 You decide whether the user is speaking TO a voice assistant named Aria, or NOT.
 Aria's wake-word window is open, so speech NOT meant for her can leak in.
@@ -61,12 +84,19 @@ commentary ABOUT Aria rather than a request to her.
 
 Decisive rule: speech that REFERS TO Aria but is aimed at someone else is an ASIDE, even when it uses
 "you" or sounds like a question. Addressed means the user wants Aria herself to respond NOW.
+
+Also an ASIDE: the user explicitly DICTATING or narrating for the record — saying he's "just dictating",
+that "you don't need to respond / do anything", or noting something "for your overseers" / "for the
+record". These are declarations, NOT requests for Aria to act NOW, even if phrased like "make a note…".
 Examples:
 - "that was a false positive" → [ASIDE] (commentary about her)
 - "the goal is it doesn't trip when I'm just talking" → [ASIDE]
 - "he still hasn't bothered to respond, if you noticed" → [ASIDE] (narrating to someone else, "you" is about her)
 - "isn't that incredible?" → [ASIDE] (rhetorical, not a request)
 - "Mel, tell me something interesting" → [ASIDE] (addressed to Mel)
+- "make a note for your Claude overseers that the volume is off" → [ASIDE] (dictating for the record, not a live request)
+- "the music is… you don't need to do anything, I'm just dictating" → [ASIDE] (explicit non-command)
+- "I'm gonna dictate something so it's on the record, you don't need to respond" → [ASIDE]
 - "turn it up" / "what's the weather" / "it's too quiet in here" → [ADDRESSED]
 
 When genuinely unsure, return [ADDRESSED].
@@ -80,6 +110,11 @@ def _fast_verdict(text: str) -> bool | None:
     NEVER returns False: the heuristic alone can never suppress a turn."""
     t = text.strip().lower()
     if not t:
+        return None
+    # An explicit dictation / "don't respond" self-label blocks every fast-pass below (command lead AND
+    # Aria mention) and defers to the LLM — otherwise "make a note for your overseers" fast-passes on
+    # "make" and an "...Aria..." aside fast-passes on the mention. (Safe: deferring never eats a command.)
+    if _has_aside_self_label(t):
         return None
     # NB: a trailing "?" is deliberately NOT a fast-pass — rhetoricals ("isn't that wild?", "really?")
     # are asides, so anything question-shaped but not led by a question word goes to the classifier.
@@ -105,11 +140,18 @@ async def is_addressed(ctx: AgentContext, user_text: str) -> tuple[bool, str]:
         return True, "fast"
     try:
         from gabagent.agent.loop import _active_client
-        model = ctx.config.router.simple_model
+        # Backend-appropriate cheap model. On the Claude backend the simple model is the ladder's bottom
+        # rung (haiku) — passing the Gab `simple_model` ("arya") to Anthropic 400s, which is caught below
+        # and silently fails OPEN, bypassing the whole filter (the LIVE 2026-06-08 Claude-backend bug:
+        # 28 asides leaked because every deferred classify errored). Mirrors turn.py's `simple` pick.
+        is_claude = ctx.config.provider == "claude"
+        model = ctx.config.claude.ladder[0].model if is_claude else ctx.config.router.simple_model
         messages = [ChatMessage(role="user", content=_ADDRESSED_PROMPT.format(text=user_text.strip()))]
         tag = await _active_client(ctx).complete_simple(messages, model=model)
         if "[ASIDE]" in tag.upper() and "[ADDRESSED]" not in tag.upper():
             return False, "llm:aside"
         return True, "llm:addressed"
-    except Exception:
-        return True, "error"
+    except Exception as exc:
+        # Fail OPEN (never eat a command) but surface WHY in `via` — a bare "error" hid the model-mismatch
+        # bug above through a whole live session. The class name is enough to spot a systemic failure.
+        return True, f"error:{type(exc).__name__}"
