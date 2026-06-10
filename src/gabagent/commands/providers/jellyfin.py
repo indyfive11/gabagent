@@ -225,7 +225,9 @@ async def _enter_fullscreen(ctx) -> ToolResult:
     press the player's own fullscreen shortcut ('f' — a TRUSTED key gesture, like Space for pause;
     video.requestFullscreen() via evaluate is blocked without user activation) and raise the window to KWin
     fullscreen. Unowned window: KWin fullscreen only, and be honest the player's own layer may need a manual 'f'."""
-    from gabagent.commands.providers.desktop import fullscreen as _kwin_fullscreen
+    from gabagent.commands.providers.desktop import fullscreen as _kwin_fullscreen, to_movie_screen
+    moved = await to_movie_screen(ctx)   # put it on the configured movie screen (DP-1) first, if it's connected
+    where = f" on {moved}" if moved else ""
     page = _live_jellyfin_page(ctx)
     if page is not None:
         try:
@@ -233,10 +235,10 @@ async def _enter_fullscreen(ctx) -> ToolResult:
         except Exception:
             pass
         await _kwin_fullscreen(ctx)   # also raise the window to KWin fullscreen
-        return ToolResult(output="Set the movie to full screen.")
+        return ToolResult(output=f"Set the movie to full screen{where}.")
     res = await _kwin_fullscreen(ctx)
     if not res.error:
-        return ToolResult(output="I've put the movie window in full screen. If the player itself isn't "
+        return ToolResult(output=f"I've put the movie window in full screen{where}. If the player itself isn't "
                           "full screen, press F — I can't drive a window I didn't open.")
     return res
 
@@ -426,6 +428,15 @@ async def _play_in_browser(ctx, jc, item_id) -> ToolResult:
         # Start at full volume — the persistent browser reuses the same <video> element, so a duck
         # that got stranded low in a prior session shouldn't leave a freshly-played movie quiet.
         await _set_video_volume(page, 1.0)
+        # Movies open full screen on the configured movie screen (default DP-1). Best-effort: if it
+        # doesn't take, the user can still ask for full screen, and can leave it by asking. Fold the
+        # outcome into the result so the spoken confirmation is grounded — narrating a fullscreen we
+        # never performed was the honesty miss this replaces.
+        if getattr(getattr(ctx.config, "desktop", None), "auto_fullscreen_movie", True):
+            await asyncio.sleep(1.5)   # let the player view mount so the fullscreen gesture lands
+            fs = await _enter_fullscreen(ctx)
+            if fs.success and fs.output:
+                result = ToolResult(output=f"{result.output} {fs.output}")
     return result
 
 

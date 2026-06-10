@@ -328,6 +328,72 @@ async def test_fullscreen_unowned_window_is_honest_about_player_layer(monkeypatc
     assert r.success and "press F" in r.output
 
 
+async def test_fullscreen_reports_configured_movie_screen(monkeypatch):
+    # When the movie window is moved to the configured screen, the spoken line names it ("on DP-1").
+    import gabagent.commands.providers.desktop as _desktop
+    async def _fake_fs(_ctx): return jf.ToolResult(output="kwin ok")
+    async def _to_dp1(_ctx): return "DP-1"
+    monkeypatch.setattr(_desktop, "fullscreen", _fake_fs)
+    monkeypatch.setattr(_desktop, "to_movie_screen", _to_dp1)
+    page = _FakePlayPage()
+    ctx = _ctx(); ctx.jellyfin_playing_page = page
+    r = await jf.control(ctx, action="fullscreen")
+    assert r.success and "on DP-1" in r.output
+
+
+@respx.mock
+async def test_play_auto_fullscreens_on_play(monkeypatch):
+    # A movie that starts in a window we own is put full screen automatically (the default), and the
+    # fullscreen outcome is folded into the result so the spoken confirmation is grounded.
+    respx.get(f"{BASE}/Sessions").mock(side_effect=[
+        httpx.Response(200, json=[]),                                       # play(): controllable check
+        httpx.Response(200, json=[]),                                       # _play_in_browser: `before`
+        httpx.Response(200, json=[{"Id": "web1", "Client": "Jellyfin Web"}]),  # poll: new web session
+    ])
+    respx.post(f"{BASE}/Sessions/web1/Playing").mock(return_value=httpx.Response(204))
+    monkeypatch.setattr(jf, "_PLAY_POLL_TRIES", 1)
+    monkeypatch.setattr("gabagent.commands.browser.ensure_browser", _browser_with(_FakePage()))
+    async def _no_login(_p): return False
+    monkeypatch.setattr(jf, "_browser_needs_login", _no_login)
+    async def _no_sleep(*a, **k): ...
+    monkeypatch.setattr(jf.asyncio, "sleep", _no_sleep)
+    called = {"fs": False}
+    async def _fake_enter(_ctx):
+        called["fs"] = True
+        return jf.ToolResult(output="Set the movie to full screen on DP-1.")
+    monkeypatch.setattr(jf, "_enter_fullscreen", _fake_enter)
+
+    res = await jf.play(_ctx(), item_id="abc")
+    assert res.success and called["fs"] is True
+    assert "full screen on DP-1" in res.output     # grounded — narration matches the action taken
+
+
+@respx.mock
+async def test_play_respects_auto_fullscreen_off(monkeypatch):
+    # With auto_fullscreen_movie disabled, a freshly-played movie stays windowed (no fullscreen call).
+    respx.get(f"{BASE}/Sessions").mock(side_effect=[
+        httpx.Response(200, json=[]),
+        httpx.Response(200, json=[]),
+        httpx.Response(200, json=[{"Id": "web1", "Client": "Jellyfin Web"}]),
+    ])
+    respx.post(f"{BASE}/Sessions/web1/Playing").mock(return_value=httpx.Response(204))
+    monkeypatch.setattr(jf, "_PLAY_POLL_TRIES", 1)
+    monkeypatch.setattr("gabagent.commands.browser.ensure_browser", _browser_with(_FakePage()))
+    async def _no_login(_p): return False
+    monkeypatch.setattr(jf, "_browser_needs_login", _no_login)
+    async def _no_sleep(*a, **k): ...
+    monkeypatch.setattr(jf.asyncio, "sleep", _no_sleep)
+    called = {"fs": False}
+    async def _fake_enter(_ctx):
+        called["fs"] = True
+        return jf.ToolResult(output="x")
+    monkeypatch.setattr(jf, "_enter_fullscreen", _fake_enter)
+
+    ctx = _ctx(); ctx.config.desktop.auto_fullscreen_movie = False
+    res = await jf.play(ctx, item_id="abc")
+    assert res.success and called["fs"] is False
+
+
 @respx.mock
 async def test_remote_volume_uses_general_command():
     # No owned page → a native controllable session takes VolumeUp via the GeneralCommand endpoint.

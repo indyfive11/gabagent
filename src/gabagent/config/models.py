@@ -109,6 +109,13 @@ class DesktopConfig(BaseModel):
     # exposed by kscreen-doctor, so this lets a user say "move it to the Hisense" and have it resolve.
     # Keys are matched case-insensitively. Host-specific → set in your settings.json, not in source.
     screen_aliases: dict[str, str] = Field(default_factory=dict)
+    # When a movie starts in a window we own, put it full screen on this output. Default "largest"
+    # picks the highest-resolution display (the usual TV / main viewing screen) with no host-specific
+    # config — keying on size, not a connector, so it travels to any machine. Override with a connector
+    # name (DP-1), a `screen_aliases` key, an index, or "" to keep it where it opened. Case-insensitive.
+    movie_screen: str = "largest"
+    # Auto-fullscreen a movie on play. Turn off to leave movies windowed until you ask for full screen.
+    auto_fullscreen_movie: bool = True
 
 
 class GabAgentConfig(BaseSettings):

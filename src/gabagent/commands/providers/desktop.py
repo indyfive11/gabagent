@@ -250,6 +250,30 @@ async def to_screen(ctx, screen="") -> ToolResult:
     return await _move_to_target(ctx, target)
 
 
+async def to_movie_screen(ctx) -> str:
+    """Move the movie window to the user's configured movie screen (`desktop.movie_screen`, default
+    DP-1) before fullscreening it. Best-effort: returns the output name it targeted, or "" when there's
+    no movie window, no display info, the setting is blank, or the configured screen isn't currently
+    connected — so auto-fullscreen-on-play degrades quietly instead of erroring the play."""
+    if ctx is None:
+        return ""
+    want = (getattr(getattr(ctx.config, "desktop", None), "movie_screen", "") or "").strip()
+    if not want:
+        return ""
+    screens = await _kscreen_outputs()
+    if not screens:
+        return ""
+    target = _resolve_screen(want, screens, _screen_aliases(ctx))
+    if target is None:
+        return ""
+    hint = await _movie_window_hint(ctx)
+    if not hint:
+        return ""
+    js = _JS_MOVE_NAMED.replace("%NAME%", json.dumps(hint.lower())) \
+                       .replace("%TNAME%", json.dumps(target["name"]))
+    return target["name"] if await _run_kwin_script(js) else ""
+
+
 async def fullscreen(ctx) -> ToolResult:
     """Fullscreen the MOVIE window by caption when a movie is playing (even in an unowned Chrome) —
     otherwise the active window via the global shortcut. The old active-window-only path fullscreened
