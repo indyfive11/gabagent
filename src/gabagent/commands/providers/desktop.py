@@ -254,24 +254,37 @@ async def to_movie_screen(ctx) -> str:
     """Move the movie window to the user's configured movie screen (`desktop.movie_screen`, default
     DP-1) before fullscreening it. Best-effort: returns the output name it targeted, or "" when there's
     no movie window, no display info, the setting is blank, or the configured screen isn't currently
-    connected — so auto-fullscreen-on-play degrades quietly instead of erroring the play."""
+    connected — so auto-fullscreen-on-play degrades quietly instead of erroring the play.
+
+    Emits a `movie_screen` debug event with a `reason` at every exit so a live verify run can see WHY a
+    move did or didn't happen (the prior version was invisible in the brain log — we could only infer it
+    from what the bot said)."""
+    from gabagent.voice.debuglog import dlog
     if ctx is None:
         return ""
     want = (getattr(getattr(ctx.config, "desktop", None), "movie_screen", "") or "").strip()
     if not want:
+        dlog(ctx, "movie_screen", reason="blank_setting", moved="")
         return ""
     screens = await _kscreen_outputs()
     if not screens:
+        dlog(ctx, "movie_screen", reason="no_display_info", want=want, moved="")
         return ""
     target = _resolve_screen(want, screens, _screen_aliases(ctx))
     if target is None:
+        dlog(ctx, "movie_screen", reason="screen_not_connected", want=want,
+             have=[s["name"] for s in screens], moved="")
         return ""
     hint = await _movie_window_hint(ctx)
     if not hint:
+        dlog(ctx, "movie_screen", reason="no_movie_window", want=want, target=target["name"], moved="")
         return ""
     js = _JS_MOVE_NAMED.replace("%NAME%", json.dumps(hint.lower())) \
                        .replace("%TNAME%", json.dumps(target["name"]))
-    return target["name"] if await _run_kwin_script(js) else ""
+    ok = await _run_kwin_script(js)
+    dlog(ctx, "movie_screen", reason="moved" if ok else "kwin_move_failed",
+         want=want, target=target["name"], window=hint, moved=target["name"] if ok else "")
+    return target["name"] if ok else ""
 
 
 async def fullscreen(ctx) -> ToolResult:

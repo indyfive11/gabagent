@@ -226,6 +226,7 @@ async def _enter_fullscreen(ctx) -> ToolResult:
     video.requestFullscreen() via evaluate is blocked without user activation) and raise the window to KWin
     fullscreen. Unowned window: KWin fullscreen only, and be honest the player's own layer may need a manual 'f'."""
     from gabagent.commands.providers.desktop import fullscreen as _kwin_fullscreen, to_movie_screen
+    from gabagent.voice.debuglog import dlog
     moved = await to_movie_screen(ctx)   # put it on the configured movie screen (DP-1) first, if it's connected
     where = f" on {moved}" if moved else ""
     page = _live_jellyfin_page(ctx)
@@ -234,9 +235,11 @@ async def _enter_fullscreen(ctx) -> ToolResult:
             await page.keyboard.press("f")
         except Exception:
             pass
-        await _kwin_fullscreen(ctx)   # also raise the window to KWin fullscreen
+        kwin = await _kwin_fullscreen(ctx)   # also raise the window to KWin fullscreen
+        dlog(ctx, "fullscreen", path="owned", moved=moved, kwin_ok=kwin.success)
         return ToolResult(output=f"Set the movie to full screen{where}.")
     res = await _kwin_fullscreen(ctx)
+    dlog(ctx, "fullscreen", path="unowned", moved=moved, kwin_ok=res.success)
     if not res.error:
         return ToolResult(output=f"I've put the movie window in full screen{where}. If the player itself isn't "
                           "full screen, press F — I can't drive a window I didn't open.")

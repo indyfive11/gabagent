@@ -3,8 +3,17 @@ import pytest
 
 from gabagent.config.models import GabAgentConfig
 from gabagent.commands.providers import desktop as dk
+from gabagent.voice import debuglog
 
 pytestmark = pytest.mark.asyncio
+
+
+def _capture_dlog(monkeypatch):
+    """Capture the `movie_screen` debug events to_movie_screen emits (it imports dlog locally, so we
+    patch it at the source module)."""
+    events = []
+    monkeypatch.setattr(debuglog, "dlog", lambda ctx, ev, **f: events.append((ev, f)))
+    return events
 
 _SCREENS = [
     {"name": "DP-1", "width": 3072, "height": 1728, "primary": True},
@@ -68,3 +77,26 @@ async def test_to_movie_screen_no_movie_window(monkeypatch):
     seen = _wire(monkeypatch, hint="")       # nothing playing → nothing to move
     assert await dk.to_movie_screen(_ctx("DP-1")) == ""
     assert seen["js"] is None
+
+
+async def test_to_movie_screen_logs_reason_on_success(monkeypatch):
+    events = _capture_dlog(monkeypatch)
+    _wire(monkeypatch)
+    await dk.to_movie_screen(_ctx("DP-1"))
+    ev, f = events[-1]
+    assert ev == "movie_screen"
+    assert f["reason"] == "moved" and f["target"] == "DP-1" and f["window"] == "wayne's world"
+
+
+@pytest.mark.parametrize("movie_screen,hint,reason", [
+    ("", "wayne's world", "blank_setting"),          # setting off → never resolved a screen
+    ("DP-9", "wayne's world", "screen_not_connected"),  # configured output isn't attached
+    ("DP-1", "", "no_movie_window"),                  # nothing playing to move
+])
+async def test_to_movie_screen_logs_reason_on_skip(monkeypatch, movie_screen, hint, reason):
+    events = _capture_dlog(monkeypatch)
+    _wire(monkeypatch, hint=hint)
+    assert await dk.to_movie_screen(_ctx(movie_screen)) == ""
+    assert events[-1] == ("movie_screen", events[-1][1])
+    assert events[-1][1]["reason"] == reason
+    assert events[-1][1]["moved"] == ""
