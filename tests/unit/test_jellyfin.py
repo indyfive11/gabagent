@@ -582,6 +582,24 @@ async def test_now_playing_nothing():
 
 
 @respx.mock
+async def test_now_playing_summarizes_all_devices():
+    # Every session across devices is reported — with device, state, and position — not just the first.
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "a", "DeviceName": "Living Room TV",
+         "NowPlayingItem": {"Name": "Dune", "RunTimeTicks": 3600 * 10_000_000},
+         "PlayState": {"IsPaused": False, "PositionTicks": 600 * 10_000_000}},
+        {"Id": "b", "DeviceName": "Bedroom",
+         "NowPlayingItem": {"Name": "Edge of Tomorrow"},
+         "PlayState": {"IsPaused": True}},
+        {"Id": "c", "DeviceName": "Idle Phone"},   # no NowPlayingItem → skipped
+    ]))
+    res = await jf.now_playing(_ctx(api_key="k"))
+    assert "Living Room TV: Playing — Dune (10:00 of 1:00:00)" in res.output
+    assert "Bedroom: Paused — Edge of Tomorrow" in res.output
+    assert "Idle Phone" not in res.output           # nothing playing there
+
+
+@respx.mock
 async def test_play_existing_session_stores_title_for_window_targeting():
     respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
         {"Id": "tv1", "SupportsRemoteControl": True, "DeviceName": "Chrome"},

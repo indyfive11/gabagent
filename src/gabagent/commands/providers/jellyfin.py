@@ -120,9 +120,14 @@ class JellyfinProvider:
             ),
             Command(
                 id="jellyfin.now_playing", domain="media", tier=1,
-                summary="What movie is currently playing in Jellyfin",
+                summary="What Jellyfin is playing on EVERY device — title, playing/paused, position, and "
+                        "which device. Use this to check playback anywhere (other rooms/TVs), and before "
+                        "saying nothing is playing.",
                 backend=PyBackend(ref="gabagent.commands.providers.jellyfin:now_playing"),
-                examples=["what are we watching", "what movie is this", "what's playing on Jellyfin"],
+                examples=["what are we watching", "what movie is this", "what's playing on Jellyfin",
+                          "is the movie still playing", "is anything playing in the bedroom",
+                          "what's playing on my other devices", "is the TV still going",
+                          "did the movie actually start"],
             ),
         ]
 
@@ -140,20 +145,57 @@ def _client(jc) -> httpx.AsyncClient:
     )
 
 
+def _fmt_ticks(ticks) -> str:
+    """Jellyfin position/runtime ticks (100ns units) → 'h:mm:ss' or 'm:ss'."""
+    s = int((ticks or 0) // 10_000_000)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+_NOW_PLAYING_CAP = 8   # plenty for a household; cap so a runaway session list can't bloat the model's context
+
+
 async def now_playing(ctx) -> ToolResult:
-    """The currently-playing Jellyfin movie title (the model kept inventing this id; now it's real)."""
+    """A compact summary of EVERY Jellyfin session across ALL devices — title, playing/paused, position,
+    and which device — so the brain can answer "is the movie still on in the bedroom?" not just "what am I
+    watching here". On-demand only: the always-on media_state stays LOCAL-scoped to avoid cross-device
+    flap, and this summary is a few short lines, so it never bloats the model's context."""
     jc = ctx.config.jellyfin
     if not jc.enabled or not jc.api_key:
         return ToolResult(output="", error="Jellyfin isn't set up.")
+    lines: list[str] = []
+    owned_title = (getattr(ctx, "jellyfin_playing_title", "") or "").strip()
+    # The movie in the window WE own reads its REAL <video> state (more accurate than the session API,
+    # which reports "playing" even when the element is autoplay-paused on the library).
+    page = _live_jellyfin_page(ctx)
+    if page is not None:
+        paused = await _video_paused(page)
+        lines.append(f"Here (this machine): {'Paused' if paused is True else 'Playing'} — "
+                     f"{owned_title or 'the movie'}")
     try:
-        for s in await _sessions(jc):
-            item = s.get("NowPlayingItem")
-            if item and item.get("Name"):
-                paused = (s.get("PlayState") or {}).get("IsPaused")
-                return ToolResult(output=f"{'Paused' if paused else 'Playing'}: {item['Name']}")
+        sessions = await _sessions(jc)
     except Exception:
         return ToolResult(output="", error="I couldn't reach Jellyfin.")
-    return ToolResult(output="Nothing is playing in Jellyfin right now.")
+    others = []
+    for s in sessions:
+        item = s.get("NowPlayingItem")
+        if not item or not item.get("Name"):
+            continue
+        # Skip the session that IS our owned window (already reported above from the live element).
+        if page is not None and (item["Name"]).strip().lower() == owned_title.lower():
+            continue
+        ps = s.get("PlayState") or {}
+        pos, dur = _fmt_ticks(ps.get("PositionTicks")), _fmt_ticks(item.get("RunTimeTicks"))
+        at = f" ({pos} of {dur})" if dur != "0:00" else (f" ({pos})" if pos != "0:00" else "")
+        where = s.get("DeviceName") or s.get("Client") or "a device"
+        others.append(f"{where}: {'Paused' if ps.get('IsPaused') else 'Playing'} — {item['Name']}{at}")
+    lines.extend(others[:_NOW_PLAYING_CAP])
+    if len(others) > _NOW_PLAYING_CAP:                 # no silent truncation
+        lines.append(f"(+{len(others) - _NOW_PLAYING_CAP} more session(s) not shown)")
+    if not lines:
+        return ToolResult(output="Nothing is playing in Jellyfin right now, on any device.")
+    return ToolResult(output="\n".join(lines))
 
 
 async def _sessions(jc) -> list[dict]:
