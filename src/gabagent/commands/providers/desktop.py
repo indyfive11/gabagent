@@ -46,28 +46,39 @@ _JS_ACTIVE_TO_SCREEN = (
     "var s=workspace.screens;for(var i=0;i<s.length;i++){"
     "if(s[i].name===tn){workspace.sendClientToScreen(w,s[i]);return;}}})();"
 )
-# Move the window whose caption OR app class contains %NAME% (lowercased substring) to output
-# %TNAME%. This targets the *movie* window by title even when it isn't focused — the activeWindow
-# approach silently moved the wrong window (the focused terminal/voice UI) and still reported success.
+# A window only counts as a movie host if it's a BROWSER. We always play into Chromium (the owned
+# path) or the user's open Chrome (the unowned path), so every movie-window matcher is gated on the
+# resourceClass looking like a browser. Matching by caption substring ALONE moved+fullscreened the
+# wrong window: Jellyfin's page title reads the SERVER NAME for a beat after play (here "EndeavorMain"
+# — the hostname), and a Conky/desktop window whose caption also carries the hostname matched first,
+# so KWin relocated Conky instead of the movie while still reporting success.
+_JS_IS_BROWSER = (
+    "function _isB(k){k=(k||'').toLowerCase();return k.indexOf('chrom')>=0||k.indexOf('chrome')>=0"
+    "||k.indexOf('firefox')>=0||k.indexOf('brave')>=0||k.indexOf('vivaldi')>=0;}"
+)
+# Move the BROWSER window whose caption contains %NAME% (lowercased substring) to output %TNAME%.
+# This targets the *movie* window by title even when it isn't focused.
 _JS_MOVE_NAMED = (
-    "(function(){var n=%NAME%;var tn=%TNAME%;var ws=workspace.windowList();var w=null;"
+    "(function(){" + _JS_IS_BROWSER +
+    "var n=%NAME%;var tn=%TNAME%;var ws=workspace.windowList();var w=null;"
     "for(var i=0;i<ws.length;i++){var c=(ws[i].caption||'').toLowerCase();"
-    "var k=(ws[i].resourceClass||'').toLowerCase();"
-    "if(c.indexOf(n)>=0||k.indexOf(n)>=0){w=ws[i];break;}}"
+    "if(_isB(ws[i].resourceClass)&&c.indexOf(n)>=0){w=ws[i];break;}}"
     "if(!w)return;var s=workspace.screens;for(var j=0;j<s.length;j++){"
     "if(s[j].name===tn){workspace.sendClientToScreen(w,s[j]);return;}}})();"
 )
-# Fullscreen the first window whose caption OR app class contains %NAME% (lowercased substring).
+# Fullscreen the first BROWSER window whose caption contains %NAME% (lowercased substring).
 _JS_FULLSCREEN_NAMED = (
-    "(function(){var n=%NAME%;var ws=workspace.windowList();for(var i=0;i<ws.length;i++){"
-    "var c=(ws[i].caption||'').toLowerCase();var k=(ws[i].resourceClass||'').toLowerCase();"
-    "if(c.indexOf(n)>=0||k.indexOf(n)>=0){ws[i].fullScreen=true;return;}}})();"
+    "(function(){" + _JS_IS_BROWSER +
+    "var n=%NAME%;var ws=workspace.windowList();for(var i=0;i<ws.length;i++){"
+    "var c=(ws[i].caption||'').toLowerCase();"
+    "if(_isB(ws[i].resourceClass)&&c.indexOf(n)>=0){ws[i].fullScreen=true;return;}}})();"
 )
-# Drop that window OUT of KWin fullscreen (and raise+activate it so a synthetic key can reach it).
+# Drop that BROWSER window OUT of KWin fullscreen (and raise+activate it so a synthetic key can reach it).
 _JS_UNFULLSCREEN_NAMED = (
-    "(function(){var n=%NAME%;var ws=workspace.windowList();for(var i=0;i<ws.length;i++){"
-    "var c=(ws[i].caption||'').toLowerCase();var k=(ws[i].resourceClass||'').toLowerCase();"
-    "if(c.indexOf(n)>=0||k.indexOf(n)>=0){ws[i].fullScreen=false;workspace.activeWindow=ws[i];return;}}})();"
+    "(function(){" + _JS_IS_BROWSER +
+    "var n=%NAME%;var ws=workspace.windowList();for(var i=0;i<ws.length;i++){"
+    "var c=(ws[i].caption||'').toLowerCase();"
+    "if(_isB(ws[i].resourceClass)&&c.indexOf(n)>=0){ws[i].fullScreen=false;workspace.activeWindow=ws[i];return;}}})();"
 )
 # Close the first window whose caption OR app class contains %NAME% (lowercased substring). Plasma 6
 # KWin scripting: workspace.windowList() + window.closeWindow() (verified on the host).
@@ -194,19 +205,32 @@ def _clean_title(t: str) -> str:
 
 async def _movie_window_hint(ctx) -> str:
     """Caption hint for the movie window, so a move/fullscreen targets it instead of whatever is
-    focused. Works for a page WE own (live title) AND for a movie played into an UNOWNED window (the
-    title stored at play time) — that unowned-Chrome case was moving the wrong window before. Empty if
-    no movie is in play."""
+    focused. Works for a page WE own AND for a movie played into an UNOWNED window (the title stored at
+    play time). Empty if no movie is in play.
+
+    Prefer the KNOWN movie title (the one we searched for) over the page's live document.title: Jellyfin
+    reads the server name — here "EndeavorMain", the hostname — into document.title for a beat after play,
+    and that hostname-bearing title matched the Conky window's caption, so the move/fullscreen hit Conky.
+    For a page WE own we also re-stamp document.title to the known title, so OUR browser window carries a
+    self-named caption that disambiguates it from any other Chrome the user has open (the window caption
+    is invisible in fullscreen anyway). Only fall back to the live title when we have no known title."""
     if ctx is None:
         return ""
+    known = _clean_title(getattr(ctx, "jellyfin_playing_title", None) or "")
     page = getattr(ctx, "jellyfin_playing_page", None)
     if page is not None:
         try:
             if not page.is_closed():
+                if known:
+                    try:
+                        await page.evaluate("(t) => { document.title = t; }", known)
+                    except Exception:
+                        pass
+                    return known
                 return _clean_title(await page.title() or "")
         except Exception:
             pass
-    return _clean_title(getattr(ctx, "jellyfin_playing_title", None) or "")
+    return known
 
 
 async def _move_to_target(ctx, target: dict) -> ToolResult:

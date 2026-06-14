@@ -100,3 +100,52 @@ async def test_to_movie_screen_logs_reason_on_skip(monkeypatch, movie_screen, hi
     assert events[-1] == ("movie_screen", events[-1][1])
     assert events[-1][1]["reason"] == reason
     assert events[-1][1]["moved"] == ""
+
+
+# -- window-targeting matchers are scoped to a BROWSER window (the Conky/wrong-window fix) ----------
+
+@pytest.mark.parametrize("js", [dk._JS_MOVE_NAMED, dk._JS_FULLSCREEN_NAMED, dk._JS_UNFULLSCREEN_NAMED])
+async def test_movie_matchers_are_browser_scoped(js):
+    # Every movie-window matcher gates on the browser-class predicate, so a Conky/desktop window whose
+    # caption carries the hostname can never be the one moved/fullscreened.
+    assert "_isB(" in js and "resourceClass" in js
+    assert "chrom" in js                       # at least Chromium/Chrome is recognised as a browser
+    # the old loose "class contains the hint" branch is gone — class is only consulted via _isB
+    assert "k.indexOf(n)" not in js
+
+
+# -- _movie_window_hint prefers the known title and self-names the owned window --------------------
+
+class _FakePage:
+    def __init__(self, title="server-name", closed=False):
+        self._title, self._closed, self.stamped = title, closed, None
+    def is_closed(self): return self._closed
+    async def title(self): return self._title
+    async def evaluate(self, fn, arg=None): self.stamped = arg
+
+
+def _hint_ctx(playing_title=None, page=None):
+    return types.SimpleNamespace(jellyfin_playing_title=playing_title, jellyfin_playing_page=page)
+
+
+async def test_hint_prefers_known_title_and_stamps_owned_page():
+    page = _FakePage(title="EndeavorMain")   # Jellyfin's lagging server-name title — must NOT win
+    ctx = _hint_ctx(playing_title="The Martian (2015)", page=page)
+    assert await dk._movie_window_hint(ctx) == "the martian"   # known title, cleaned
+    assert page.stamped == "the martian"                       # owned window self-named to match
+
+
+async def test_hint_falls_back_to_live_title_when_no_known_title():
+    page = _FakePage(title="The Matrix [1080p]")
+    ctx = _hint_ctx(playing_title="", page=page)
+    assert await dk._movie_window_hint(ctx) == "the matrix"
+    assert page.stamped is None                                # nothing to stamp without a known title
+
+
+async def test_hint_uses_stored_title_when_page_is_gone():
+    ctx = _hint_ctx(playing_title="Dune (2021)", page=_FakePage(closed=True))
+    assert await dk._movie_window_hint(ctx) == "dune"
+
+
+async def test_hint_empty_when_nothing_playing():
+    assert await dk._movie_window_hint(_hint_ctx()) == ""

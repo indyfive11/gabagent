@@ -225,8 +225,13 @@ async def _enter_fullscreen(ctx) -> ToolResult:
     press the player's own fullscreen shortcut ('f' — a TRUSTED key gesture, like Space for pause;
     video.requestFullscreen() via evaluate is blocked without user activation) and raise the window to KWin
     fullscreen. Unowned window: KWin fullscreen only, and be honest the player's own layer may need a manual 'f'."""
-    from gabagent.commands.providers.desktop import fullscreen as _kwin_fullscreen, to_movie_screen
+    from gabagent.commands.providers.desktop import (
+        fullscreen as _kwin_fullscreen, to_movie_screen, _movie_window_hint)
     from gabagent.voice.debuglog import dlog
+    # The caption we'll target. `kwin_ok` only reports that the KWin script RAN (KWin scripting gives no
+    # readable match result), so log the hint too: a movie title means we aimed at the self-named movie
+    # window; an empty/server-name hint is the signature of the wrong-window bug this path replaced.
+    hint = await _movie_window_hint(ctx)
     moved = await to_movie_screen(ctx)   # put it on the configured movie screen (DP-1) first, if it's connected
     where = f" on {moved}" if moved else ""
     page = _live_jellyfin_page(ctx)
@@ -236,10 +241,10 @@ async def _enter_fullscreen(ctx) -> ToolResult:
         except Exception:
             pass
         kwin = await _kwin_fullscreen(ctx)   # also raise the window to KWin fullscreen
-        dlog(ctx, "fullscreen", path="owned", moved=moved, kwin_ok=kwin.success)
+        dlog(ctx, "fullscreen", path="owned", moved=moved, kwin_ok=kwin.success, hint=hint)
         return ToolResult(output=f"Set the movie to full screen{where}.")
     res = await _kwin_fullscreen(ctx)
-    dlog(ctx, "fullscreen", path="unowned", moved=moved, kwin_ok=res.success)
+    dlog(ctx, "fullscreen", path="unowned", moved=moved, kwin_ok=res.success, hint=hint)
     if not res.error:
         return ToolResult(output=f"I've put the movie window in full screen{where}. If the player itself isn't "
                           "full screen, press F — I can't drive a window I didn't open.")
@@ -369,7 +374,7 @@ async def play(ctx, item_id="", title="") -> ToolResult:
 
     if emit:
         await emit(events.status("Opening the player…"))  # narrate before the slow launch
-    res = await _play_in_browser(ctx, jc, item_id)
+    res = await _play_in_browser(ctx, jc, item_id, title)
     if res.success and title:
         ctx.jellyfin_playing_title = title
     return res
@@ -384,7 +389,7 @@ async def _play_to_session(jc, session_id, item_id, label) -> ToolResult:
     return ToolResult(output=f"Playing on {label}.") if r.is_success else ToolResult(output="", error=f"play failed: HTTP {r.status_code}")
 
 
-async def _play_in_browser(ctx, jc, item_id) -> ToolResult:
+async def _play_in_browser(ctx, jc, item_id, title="") -> ToolResult:
     from gabagent.commands.browser import ensure_browser
     from gabagent.voice import events
     emit = getattr(ctx, "voice_emit", None)
@@ -428,17 +433,39 @@ async def _play_in_browser(ctx, jc, item_id) -> ToolResult:
         # the remote-control API).
         ctx.jellyfin_playing_page = page
         ctx.jellyfin_paused = False
+        # Self-name the window NOW (well before the 1.5s fullscreen settle) so KWin can target THIS
+        # browser window by its caption. Jellyfin's own document.title reads the server name (the
+        # hostname) for a beat after play, which collided with Conky's caption and sent the move +
+        # fullscreen to the wrong window. Stamping early lets the title propagate to the WM caption
+        # before we act, and disambiguates our window from any other Chrome the user has open.
+        if title:
+            ctx.jellyfin_playing_title = title
+            try:
+                await page.evaluate("(t) => { document.title = t; }", title)
+            except Exception:
+                pass
         # Start at full volume — the persistent browser reuses the same <video> element, so a duck
         # that got stranded low in a prior session shouldn't leave a freshly-played movie quiet.
         await _set_video_volume(page, 1.0)
-        # Movies open full screen on the configured movie screen (default DP-1). Best-effort: if it
-        # doesn't take, the user can still ask for full screen, and can leave it by asking. Fold the
-        # outcome into the result so the spoken confirmation is grounded — narrating a fullscreen we
-        # never performed was the honesty miss this replaces.
-        if getattr(getattr(ctx.config, "desktop", None), "auto_fullscreen_movie", True):
-            await asyncio.sleep(1.5)   # let the player view mount so the fullscreen gesture lands
+        # Verify the movie ACTUALLY started instead of trusting the session API's "playing" (which lies
+        # when PlayNow didn't navigate to the player, or the browser autoplay-paused the element — the
+        # "library came up full screen but the movie didn't play" bug). Nudge a paused player, and emit
+        # a `playback` event so a verify run sees the real <video> state, not the server's claim.
+        from gabagent.voice.debuglog import dlog
+        pb = await _await_playback(page)
+        dlog(ctx, "playback", has_video=pb["has_video"], paused=pb["paused"],
+             started=pb["started"], nudged=pb["nudged"], t=pb["t"], ready=pb["ready"])
+        if not pb["started"]:
+            # Don't claim it's playing when the element says otherwise.
+            result = ToolResult(output=(
+                "I opened and full-screened the window, but the movie isn't actually playing yet — say "
+                "'play' and I'll start it." if pb["has_video"] else
+                "I opened the Jellyfin window but the player didn't come up — ask me to play again."))
+        # Fullscreen only once a player is up (never fullscreen the bare library). Append the fullscreen
+        # line only when playback is real, so the spoken confirmation stays grounded.
+        if pb["has_video"] and getattr(getattr(ctx.config, "desktop", None), "auto_fullscreen_movie", True):
             fs = await _enter_fullscreen(ctx)
-            if fs.success and fs.output:
+            if fs.success and fs.output and pb["started"]:
                 result = ToolResult(output=f"{result.output} {fs.output}")
     return result
 
@@ -520,6 +547,44 @@ async def _page_eval(page, script: str, arg=None, *, default=None, timeout: floa
 async def _video_paused(page) -> bool | None:
     return await _page_eval(
         page, "() => { const v = document.querySelector('video'); return v ? v.paused : null; }")
+
+
+# How long to wait for the web client to ACTUALLY start the <video> after a PlayNow command. The
+# session API reports "playing" the instant the web client accepts the command, but the real element
+# can still be on the library (PlayNow never navigated) or held paused by the browser's autoplay
+# policy (a fresh window has no user-gesture grant, and v.play() from evaluate can't earn one) — so we
+# verify the element itself and nudge a paused player. Constants (not literals) so tests stay fast.
+_PLAYBACK_POLL_TRIES = 12       # ~6s
+_PLAYBACK_POLL_INTERVAL = 0.5
+_JS_VIDEO_STATE = (
+    "() => { const v = document.querySelector('video');"
+    " return { has_video: !!v, paused: v ? v.paused : null,"
+    " t: v ? v.currentTime : null, ready: v ? v.readyState : null }; }"
+)
+
+
+async def _await_playback(page) -> dict:
+    """Wait for the owned page's <video> to be genuinely playing; if the player mounted but autoplay
+    left it paused, nudge it ONCE with a trusted key gesture (Space toggles play/pause in the Jellyfin
+    web player, and a real keypress satisfies the autoplay user-gesture requirement). Returns the final
+    {has_video, paused, t, ready, started, nudged} for logging and an honest spoken line."""
+    nudged = False
+    st: dict = {}
+    for _ in range(_PLAYBACK_POLL_TRIES):
+        st = await _page_eval(page, _JS_VIDEO_STATE, default=None) or {}
+        if st.get("has_video"):
+            if st.get("paused") is False:
+                break                                    # genuinely playing — done
+            if not nudged:                               # mounted but paused → autoplay block; nudge
+                try:
+                    await page.keyboard.press("Space")
+                except Exception:
+                    pass
+                nudged = True
+        await asyncio.sleep(_PLAYBACK_POLL_INTERVAL)
+    started = bool(st.get("has_video") and st.get("paused") is False)
+    return {"has_video": bool(st.get("has_video")), "paused": st.get("paused"),
+            "t": st.get("t"), "ready": st.get("ready"), "started": started, "nudged": nudged}
 
 
 async def _video_volume(page) -> float | None:

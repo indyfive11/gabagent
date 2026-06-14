@@ -125,13 +125,29 @@ async def test_play_uses_existing_session_when_user_says_yes():
 
 
 class _FakePage:
-    """Stand-in for a Playwright page; `url`/password-field count drive the login check."""
-    def __init__(self, url="http://jf.test/web/#/home.html", pw_count=0):
+    """Stand-in for a Playwright page; `url`/password-field count drive the login check. Also models the
+    HTML5 <video> the play path introspects after PlayNow (so _await_playback sees a real element):
+    `has_video=False` models the library/home view, `paused=True` a player held by autoplay policy."""
+    def __init__(self, url="http://jf.test/web/#/home.html", pw_count=0, has_video=True, paused=False):
         self.url = url
         self._pw = pw_count
+        self.has_video = has_video; self.paused = paused
+        self.keyboard = _FakeKbd(self); self._closed = False
 
+    def is_closed(self): return self._closed
+    async def close(self): self._closed = True
     async def goto(self, *a, **k): ...
     async def wait_for_timeout(self, *a, **k): ...
+
+    async def evaluate(self, expr, arg=None):
+        if "has_video" in expr:
+            if not self.has_video:
+                return {"has_video": False, "paused": None, "t": None, "ready": None}
+            return {"has_video": True, "paused": self.paused, "t": 1.0, "ready": 4}
+        if "document.title = t" in expr: return None     # window self-naming stamp
+        if "v.volume = vol" in expr: return True          # volume set succeeds
+        if "v.paused" in expr: return self.paused
+        return None
 
     def locator(self, sel):
         page = self
@@ -199,14 +215,21 @@ class _FakeKbd:
 
 
 class _FakePlayPage:
-    """Models the HTML5 <video> we introspect via page.evaluate (paused + volume + seek) and can close."""
-    def __init__(self, paused=False, volume=1.0, current_time=50.0, duration=100.0):
+    """Models the HTML5 <video> we introspect via page.evaluate (paused + volume + seek) and can close.
+    `has_video=False` models the library/home view where no <video> element exists yet."""
+    def __init__(self, paused=False, volume=1.0, current_time=50.0, duration=100.0, has_video=True):
         self.paused = paused; self.volume = volume
         self.currentTime = current_time; self.duration = duration
+        self.has_video = has_video
         self.keyboard = _FakeKbd(self); self._closed = False
     def is_closed(self): return self._closed
     async def close(self): self._closed = True
     async def evaluate(self, expr, arg=None):
+        if "has_video" in expr:               # the _await_playback state probe
+            if not self.has_video:
+                return {"has_video": False, "paused": None, "t": None, "ready": None}
+            return {"has_video": True, "paused": self.paused, "t": self.currentTime, "ready": 4}
+        if "document.title = t" in expr: return None              # window self-naming stamp
         if "v.pause()" in expr: self.paused = True; return None   # reliable pause (no gesture)
         if "v.currentTime =" in expr and arg is not None:         # relative seek
             self.currentTime = max(0, min(self.duration, self.currentTime + arg)); return None
@@ -215,6 +238,31 @@ class _FakePlayPage:
         if "v.paused" in expr: return self.paused
         if "v.volume" in expr: return self.volume
         return None
+
+
+async def test_await_playback_already_playing(monkeypatch):
+    monkeypatch.setattr(jf, "_PLAYBACK_POLL_INTERVAL", 0)
+    page = _FakePlayPage(paused=False)
+    pb = await jf._await_playback(page)
+    assert pb["started"] is True and pb["nudged"] is False
+    assert page.keyboard.keys == []                     # no nudge needed
+
+
+async def test_await_playback_nudges_autoplay_paused(monkeypatch):
+    monkeypatch.setattr(jf, "_PLAYBACK_POLL_INTERVAL", 0)
+    page = _FakePlayPage(paused=True)                   # player mounted but autoplay-blocked
+    pb = await jf._await_playback(page)
+    assert pb["started"] is True and pb["nudged"] is True
+    assert page.keyboard.keys == ["Space"]              # one trusted gesture, then it played
+
+
+async def test_await_playback_library_never_starts(monkeypatch):
+    monkeypatch.setattr(jf, "_PLAYBACK_POLL_INTERVAL", 0)
+    monkeypatch.setattr(jf, "_PLAYBACK_POLL_TRIES", 3)
+    page = _FakePlayPage(has_video=False)               # still on the library — no <video> at all
+    pb = await jf._await_playback(page)
+    assert pb["started"] is False and pb["has_video"] is False and pb["nudged"] is False
+    assert page.keyboard.keys == []                     # nothing to nudge
 
 
 async def test_browser_control_pause_resume_stop():
@@ -366,6 +414,34 @@ async def test_play_auto_fullscreens_on_play(monkeypatch):
     res = await jf.play(_ctx(), item_id="abc")
     assert res.success and called["fs"] is True
     assert "full screen on DP-1" in res.output     # grounded — narration matches the action taken
+
+
+@respx.mock
+async def test_play_is_honest_when_player_never_comes_up(monkeypatch):
+    # PlayNow succeeded at the API level but the <video> never mounted (still on the library): don't
+    # claim it's playing, and don't fullscreen the bare library.
+    respx.get(f"{BASE}/Sessions").mock(side_effect=[
+        httpx.Response(200, json=[]),
+        httpx.Response(200, json=[]),
+        httpx.Response(200, json=[{"Id": "web1", "Client": "Jellyfin Web"}]),
+    ])
+    respx.post(f"{BASE}/Sessions/web1/Playing").mock(return_value=httpx.Response(204))
+    monkeypatch.setattr(jf, "_PLAY_POLL_TRIES", 1)
+    monkeypatch.setattr(jf, "_PLAYBACK_POLL_TRIES", 2)
+    monkeypatch.setattr(jf, "_PLAYBACK_POLL_INTERVAL", 0)
+    monkeypatch.setattr("gabagent.commands.browser.ensure_browser",
+                        _browser_with(_FakePage(has_video=False)))
+    async def _no_login(_p): return False
+    monkeypatch.setattr(jf, "_browser_needs_login", _no_login)
+    called = {"fs": False}
+    async def _fake_enter(_ctx):
+        called["fs"] = True
+        return jf.ToolResult(output="Set the movie to full screen on DP-1.")
+    monkeypatch.setattr(jf, "_enter_fullscreen", _fake_enter)
+
+    res = await jf.play(_ctx(), item_id="abc")
+    assert called["fs"] is False                    # never fullscreen the library
+    assert "didn't come up" in res.output and "full screen" not in res.output
 
 
 @respx.mock
