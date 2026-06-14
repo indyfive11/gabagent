@@ -81,6 +81,24 @@ def home(tmp_path, monkeypatch):
     return tmp_path
 
 
+async def test_aside_emits_addressed_false_then_done(home, monkeypatch):
+    """A suppressed aside emits a standalone `addressed:false` event (the A1 movie-duck-release signal
+    the voice client acts on) immediately before `done`, with no reply token and no history append."""
+    import gabagent.voice.addressed as addr
+    async def _aside(ctx, text):
+        return False, "llm:aside"
+    monkeypatch.setattr(addr, "is_addressed", _aside)
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [["should never speak"]])
+    evs = await run_turn(ctx, "the voice of Aria is nice")
+    types_ = [e.type for e in evs]
+    assert types_ == ["addressed", "done"]                       # exactly the signal + close, nothing else
+    a = next(e for e in evs if e.type == "addressed")
+    assert a.to_dict() == {"type": "addressed", "addressed": False}   # VAC wire shape, false present
+    assert not any(e.type == "token" for e in evs)               # no spoken reply for an aside
+    assert ctx.session.messages() == []                          # not appended to history
+
+
 async def test_tier1_scratch_write_streams_and_writes(home):
     proj = home / "proj"
     proj.mkdir()

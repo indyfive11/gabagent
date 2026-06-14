@@ -304,6 +304,12 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             addressed, via = await is_addressed(ctx, user_text)
             dlog(ctx, "addressed", match=addressed, via=via)
             if not addressed:
+                # A1 movie-duck release: tell the voice client this turn is an aside the instant the
+                # classifier returns, so a movie duck its VAD-onset pre-duck opened can be released now
+                # rather than lingering until the voice-side 8s idle grace (~13s of the movie sitting at
+                # 18% on ambient speech — the bug Rob dictated 2026-06-14). Emitted only on suppression;
+                # the client treats addressed:true as a no-op. This is the earliest possible point.
+                await emit(events.addressed(False))
                 await emit(events.done())
                 return
 
