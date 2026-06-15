@@ -262,15 +262,25 @@ def _pid_matched_sinks(out: str, pids: set[str]) -> list[dict]:
     return res
 
 
+def _sink_is_active(si: dict) -> bool:
+    """Is this sink-input the actively-playing stream (vs a paused/idle leftover)? `corked` is authoritative
+    where present (PipeWire: Corked:no = playing); `state==RUNNING` is the PulseAudio fallback. Unknown on
+    both → not treated as active, so it never out-ranks a known-active sibling."""
+    if si.get("corked") is not None:
+        return si["corked"] is False
+    return si.get("state") == "RUNNING"
+
+
 def _choose_sink(cands: list[dict]) -> tuple[str, int | None] | None:
     """Pick the AUDIBLE stream among our browser's sink-inputs. When the tree owns more than one — a
-    stale/corked sibling (a prior attempt / a closed tab) alongside the live movie — prefer the one that's
-    actually RUNNING over pactl's list order, which can put the silent leftover first. That ordering bug
-    ducked the wrong sink for a whole movie window (the live stream stayed at full volume). Falls back to the
-    first match only when none is RUNNING (e.g. the movie is paused, so every candidate is corked)."""
+    stale/corked sibling (a prior attempt / a still-open older window) alongside the live movie — prefer the
+    one that's actually PLAYING (uncorked) over pactl's list order, which can put the silent leftover first.
+    That ordering bug ducked the wrong sink for a whole movie window (the live stream stayed at full volume).
+    Falls back to the first match only when none looks active (e.g. the movie is paused, so every candidate is
+    corked — restore/seek still need a target)."""
     if not cands:
         return None
-    chosen = next((c for c in cands if c["state"] == "RUNNING"), cands[0])
+    chosen = next((c for c in cands if _sink_is_active(c)), cands[0])
     return chosen["idx"], chosen["volume"]
 
 
@@ -311,7 +321,8 @@ async def _jellyfin_sink_input(ctx) -> tuple[str, int | None] | None:
         # Stash the candidate set (idx/app/state/vol) so the sink_on dlog can show WHY a sink was chosen —
         # a stale-sibling mispick is then visible in one line instead of needing a re-mine.
         _state(ctx)["jellyfin_sink_cands"] = [
-            {"idx": c["idx"], "app": c["app"], "state": c["state"], "vol": c["volume"]} for c in cands]
+            {"idx": c["idx"], "app": c["app"], "state": c["state"], "corked": c["corked"],
+             "vol": c["volume"]} for c in cands]
         hit = _choose_sink(cands)
         if hit:
             return hit
@@ -410,10 +421,14 @@ async def mopidy_audibility() -> dict:
 
 
 def _parse_sink_inputs(out: str) -> list[dict]:
-    """Every sink-input in `pactl list sink-inputs` as {idx, volume %, app, state, block text} — the block is
-    kept so callers can test it for exclusion markers (TTS property / Mopidy ownership). `state` is the
-    PipeWire stream state (RUNNING|IDLE|CORKED) — a corked/idle leftover from a prior play attempt is silent,
-    so the duck must prefer the RUNNING one when our browser owns several."""
+    """Every sink-input in `pactl list sink-inputs` as {idx, volume %, app, state, corked, block text} — the
+    block is kept so callers can test it for exclusion markers (TTS property / Mopidy ownership).
+
+    Activity discriminator: `corked` is the reliable one. PipeWire's pactl (17.x) emits `Corked: no` for the
+    actively-playing stream and `Corked: yes` for a paused/idle leftover, but — unlike PulseAudio — emits NO
+    per-sink-input `State:` line at all (only *sinks* carry State), so `state` reads None on PipeWire. The duck
+    must therefore prefer the UNCORKED stream when our browser owns several; `state==RUNNING` is kept only as a
+    PulseAudio-portability fallback (see _choose_sink)."""
     items = []
     for block in out.split("Sink Input #")[1:]:
         idx = block.splitlines()[0].strip()
@@ -422,9 +437,11 @@ def _parse_sink_inputs(out: str) -> list[dict]:
         m = re.search(r"Volume:.*?(\d+)%", block)
         am = re.search(r'application\.name = "([^"]+)"', block)
         stm = re.search(r"^\s*State:\s*(\w+)", block, re.MULTILINE)
+        cm = re.search(r"^\s*Corked:\s*(yes|no)", block, re.MULTILINE)
         items.append({"idx": idx, "volume": int(m.group(1)) if m else None,
                       "app": am.group(1) if am else None,
-                      "state": stm.group(1) if stm else None, "block": block})
+                      "state": stm.group(1) if stm else None,
+                      "corked": (cm.group(1) == "yes") if cm else None, "block": block})
     return items
 
 
@@ -813,21 +830,39 @@ async def _duck_jellyfin_sink(ctx, page, on: bool, mute: bool = False, found=Non
 
 async def adjust_movie_volume(ctx, page, up: bool, step_pct: int = 15) -> bool:
     """Manual movie volume ±step. Drives the browser sink-input if it can be identified (robust), else the
-    <video>.volume element. Updates whichever duck prior is active so a mid-duck manual change survives the
-    speech-end restore. Returns True if it acted, False if it couldn't read a level. Never raises."""
+    <video>.volume element. Returns True if it acted, False if it couldn't read a level. Never raises.
+
+    Duck-aware: a volume command is itself spoken, so the speech-onset duck has ALREADY pulled the sink down
+    to the duck level (~18%) before this tool runs. Reading that live value and stepping from it is wrong — it
+    muted the movie ("down ×2" → 18→3→0) and the speech-end restore then wrote the corrupted value back as the
+    new baseline. So while a duck is active we step the SAVED un-ducked baseline (what the movie returns to)
+    and leave the ducked sink untouched; the restore brings it to the adjusted baseline. Only when no duck is
+    active do we read/write the live level directly."""
     from gabagent.commands.providers.jellyfin import _video_volume, _set_video_volume
     st = _state(ctx)
     try:
         found = await _jellyfin_sink_input(ctx)
         if found is not None:
-            idx, cur = found
-            cur = cur if cur is not None else 100
+            idx, live = found
+            saved = st.get("jellyfin_sink_prior")
+            if saved is not None:
+                # Duck active: step the baseline, NOT the ducked sink reading; restore will apply it.
+                base = saved[1] if saved[1] is not None else 100
+                new = min(100, base + step_pct) if up else max(0, base - step_pct)
+                st["jellyfin_sink_prior"] = (saved[0], new)
+                _jf_dlog(ctx, phase="manual_sink_ducked", sink_idx=saved[0], baseline=base, set_to=new, up=up)
+                return True
+            cur = live if live is not None else 100
             new = min(100, cur + step_pct) if up else max(0, cur - step_pct)
             await _run_pactl("set-sink-input-volume", idx, f"{new}%")
-            saved = st.get("jellyfin_sink_prior")
-            if saved is not None:                 # mid-duck: keep the restore level in step with the manual change
-                st["jellyfin_sink_prior"] = (saved[0], new)
             _jf_dlog(ctx, phase="manual_sink", sink_idx=idx, prev=cur, set_to=new, up=up)
+            return True
+        saved_v = st.get("jellyfin_video_volume")
+        if saved_v is not None:
+            # Same baseline logic on the <video> fallback path (value is 0.0–1.0).
+            new = min(1.0, saved_v + step_pct / 100.0) if up else max(0.0, saved_v - step_pct / 100.0)
+            st["jellyfin_video_volume"] = new
+            _jf_dlog(ctx, phase="manual_video_ducked", baseline=saved_v, set_to=new, up=up)
             return True
         cur = await _video_volume(page)
         if cur is None:
@@ -835,8 +870,6 @@ async def adjust_movie_volume(ctx, page, up: bool, step_pct: int = 15) -> bool:
         step = step_pct / 100.0
         new = min(1.0, cur + step) if up else max(0.0, cur - step)
         await _set_video_volume(page, new)
-        if st.get("jellyfin_video_volume") is not None:
-            st["jellyfin_video_volume"] = new
         _jf_dlog(ctx, phase="manual_video", prev=cur, set_to=new, up=up)
         return True
     except Exception:

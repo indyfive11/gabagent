@@ -320,11 +320,13 @@ async def test_browser_control_movie_volume_adjusts_video_and_duck_prior():
     assert r.success and abs(page.volume - 0.65) < 1e-9      # drives <video>.volume by the ±0.15 step
     await jf.control(ctx, action="volume_down")
     assert abs(page.volume - 0.5) < 1e-9
-    # While ducked, a manual change updates the saved restore level so it survives speech-end.
-    st = _state(ctx); st["jellyfin_video_volume"] = 1.0
-    page.volume = 0.2
+    # While ducked, a manual change steps the SAVED baseline (what the movie restores to) and leaves the
+    # ducked <video> element alone — reading the ducked live value would corrupt the restore level.
+    st = _state(ctx); st["jellyfin_video_volume"] = 0.6
+    page.volume = 0.2                                       # the ducked live level
     await jf.control(ctx, action="volume_up")
-    assert abs(page.volume - 0.35) < 1e-9 and abs(st["jellyfin_video_volume"] - 0.35) < 1e-9
+    assert abs(st["jellyfin_video_volume"] - 0.75) < 1e-9   # baseline stepped 0.6→0.75
+    assert abs(page.volume - 0.2) < 1e-9                    # ducked element untouched
 
 
 async def test_browser_only_actions_need_owned_page():

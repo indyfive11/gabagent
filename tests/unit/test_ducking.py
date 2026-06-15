@@ -258,49 +258,70 @@ def test_parse_mopidy_sink_input():
 # Our browser owns TWO sink-inputs (PID 12345): a stale/corked sibling from a prior play attempt at full
 # volume, plus the live RUNNING movie. This is the exact shape of the bug where a whole movie window ducked
 # the silent leftover (4545) while the audible stream (4551) stayed at 100%.
+# Real PipeWire (pactl 17.x) shape: sink-inputs carry `Corked: yes/no` but NO per-input `State:` line, so
+# `state` parses to None and the duck must discriminate on `corked`. This is the exact data from the live
+# failure (two Chromium streams: 4545 the paused/idle leftover window, 4551 the actually-playing movie) —
+# the bug ducked the corked leftover while the audible stream stayed at 100%.
 _TWO_BROWSER_SINKS = (
     'Sink Input #4545\n\tCorked: yes\n'
-    '\tVolume: front-left: 65536 / 100% / 0 dB\n\tState: IDLE\n'
+    '\tVolume: front-left: 65536 / 100% / 0 dB\n'
     '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "12345"\n'
     'Sink Input #4551\n\tCorked: no\n'
-    '\tVolume: front-left: 65536 / 100% / 0 dB\n\tState: RUNNING\n'
+    '\tVolume: front-left: 65536 / 100% / 0 dB\n'
     '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "12345"\n'
 )
 
 
-def test_parse_sink_inputs_captures_state_and_app():
+def test_parse_sink_inputs_captures_corked_and_app():
     from gabagent.voice.ducking import _parse_sink_inputs
     items = {si["idx"]: si for si in _parse_sink_inputs(_TWO_BROWSER_SINKS)}
-    assert items["4545"]["state"] == "IDLE" and items["4545"]["app"] == "Chromium"
-    assert items["4551"]["state"] == "RUNNING"
+    # PipeWire: no State line → state is None; corked is the populated signal.
+    assert items["4545"]["corked"] is True and items["4545"]["state"] is None
+    assert items["4545"]["app"] == "Chromium"
+    assert items["4551"]["corked"] is False
 
 
-def test_pid_match_prefers_running_sink_over_corked_sibling():
-    # The fix: among our browser's sink-inputs, duck the RUNNING (audible) one, not whichever pactl lists
-    # first. Without the state preference this returned 4545 (the silent leftover) and the movie never ducked.
+def test_pid_match_prefers_uncorked_sink_over_corked_sibling():
+    # The fix: among our browser's sink-inputs, duck the UNCORKED (playing) one, not whichever pactl lists
+    # first. With State null on PipeWire, the old RUNNING-only preference no-opped and returned 4545 (the
+    # silent leftover) → the movie never ducked. Corked discriminates where State can't.
     from gabagent.voice.ducking import _parse_sink_input_by_pid
     assert _parse_sink_input_by_pid(_TWO_BROWSER_SINKS, {"12345"}) == ("4551", 100)
 
 
-def test_pid_match_falls_back_to_first_when_none_running():
-    # Movie paused → every candidate is corked/idle. No RUNNING one to prefer, so take the first match
-    # rather than declining (restore/seek still need a target).
+def test_pid_match_falls_back_to_first_when_all_corked():
+    # Movie paused → every candidate is corked. Nothing looks active, so take the first match rather than
+    # declining (restore/seek still need a target).
     from gabagent.voice.ducking import _parse_sink_input_by_pid
-    both_idle = _TWO_BROWSER_SINKS.replace("State: RUNNING", "State: IDLE")
-    assert _parse_sink_input_by_pid(both_idle, {"12345"}) == ("4545", 100)
+    both_corked = _TWO_BROWSER_SINKS.replace("Corked: no", "Corked: yes")
+    assert _parse_sink_input_by_pid(both_corked, {"12345"}) == ("4545", 100)
+
+
+def test_pid_match_prefers_running_state_on_pulseaudio():
+    # Portability: on PulseAudio (which DOES emit State: and no useful Corked) the RUNNING fallback still
+    # picks the audible stream.
+    from gabagent.voice.ducking import _parse_sink_input_by_pid
+    pulse = (
+        'Sink Input #10\n\tVolume: front-left: 65536 / 100% / 0 dB\n\tState: IDLE\n'
+        '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "12345"\n'
+        'Sink Input #11\n\tVolume: front-left: 65536 / 100% / 0 dB\n\tState: RUNNING\n'
+        '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "12345"\n'
+    )
+    assert _parse_sink_input_by_pid(pulse, {"12345"}) == ("11", 100)
 
 
 def test_pid_match_single_sink_unaffected():
     from gabagent.voice.ducking import _parse_sink_input_by_pid
-    one = ('Sink Input #4551\n\tVolume: front-left: 65536 / 100% / 0 dB\n\tState: RUNNING\n'
+    one = ('Sink Input #4551\n\tCorked: no\n\tVolume: front-left: 65536 / 100% / 0 dB\n'
            '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "12345"\n')
     assert _parse_sink_input_by_pid(one, {"12345"}) == ("4551", 100)
     assert _parse_sink_input_by_pid(one, {"99999"}) is None    # not our PID → no match
 
 
-async def test_jellyfin_sink_input_resolves_running_and_stashes_candidates(monkeypatch):
-    # End to end: our browser owns the stale sibling + the live movie; the resolver returns the RUNNING one
-    # and stashes the candidate set on state so the sink_on dlog can show why (a stale mispick is visible).
+async def test_jellyfin_sink_input_resolves_uncorked_and_stashes_candidates(monkeypatch):
+    # End to end: our browser owns the corked leftover + the live movie; the resolver returns the UNCORKED
+    # one and stashes the candidate set (incl. corked) on state so the sink_on dlog shows why a sink was
+    # chosen — a stale mispick is then visible in one line.
     monkeypatch.setattr(_dk.shutil, "which", lambda _: "/usr/bin/pactl")
     async def fake_pactl(*args, **k):
         return (0, _TWO_BROWSER_SINKS) if args[:2] == ("list", "sink-inputs") else (0, "")
@@ -313,7 +334,7 @@ async def test_jellyfin_sink_input_resolves_running_and_stashes_candidates(monke
     ctx = types.SimpleNamespace()
     assert await _dk._jellyfin_sink_input(ctx) == ("4551", 100)
     cands = _dk._state(ctx)["jellyfin_sink_cands"]
-    assert {c["idx"]: c["state"] for c in cands} == {"4545": "IDLE", "4551": "RUNNING"}
+    assert {c["idx"]: c["corked"] for c in cands} == {"4545": True, "4551": False}
 
 
 async def test_duck_tidal_sink_ducks_then_restores(monkeypatch):
@@ -1032,11 +1053,25 @@ async def test_adjust_movie_volume_uses_sink_when_found(monkeypatch):
     page = _FakeVideoPage(volume=1.0)
     ok = await _dk.adjust_movie_volume(ctx, page, up=True)
     assert ok and ("12", "85%") in sets and page.volume == 1.0   # sink moved by +15; <video> untouched
-    # mid-duck: a manual change keeps the saved restore level in step
-    _dk._state(ctx)["jellyfin_sink_prior"] = ("12", 70)
-    sets.clear()
-    await _dk.adjust_movie_volume(ctx, page, up=False)
-    assert ("12", "55%") in sets and _dk._state(ctx)["jellyfin_sink_prior"] == ("12", 55)
+
+
+async def test_adjust_movie_volume_mid_duck_steps_baseline_not_ducked_sink(monkeypatch):
+    # The bug: a volume command is spoken, so the onset-duck has already pulled the live sink to 18 before this
+    # runs. Reading that and stepping down muted the movie (18→3→0) and the restore wrote the mute back as the
+    # baseline. Fix: while ducked, step the SAVED baseline (104), leave the ducked sink untouched.
+    sets = []
+    monkeypatch.setattr(_dk, "_run_pactl", _fake_pactl("", sets))
+    async def ducked_sink(_ctx): return ("12", 18)        # live reads the DUCKED level
+    monkeypatch.setattr(_dk, "_jellyfin_sink_input", ducked_sink)
+    ctx = _ctx(tidal=False, jellyfin=True)
+    page = _FakeVideoPage(volume=1.0)
+    st = _dk._state(ctx)
+    st["jellyfin_sink_prior"] = ("12", 104)               # movie's real pre-duck baseline
+    await _dk.adjust_movie_volume(ctx, page, up=False)     # "turn it down"
+    assert st["jellyfin_sink_prior"] == ("12", 89)         # baseline stepped 104→89, NOT 18→3
+    assert not sets                                        # ducked sink left alone — restore applies the baseline
+    await _dk.adjust_movie_volume(ctx, page, up=True)      # "turn it up" → 89+15 capped at 100
+    assert st["jellyfin_sink_prior"] == ("12", 100) and not sets
 
 
 async def test_adjust_movie_volume_falls_back_to_video(monkeypatch):
