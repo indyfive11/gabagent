@@ -447,3 +447,37 @@ async def test_rpc_resilient_retries_once_on_timeout_then_succeeds():
     res = await td.search(_ctx(), query="miles")
     assert res.success and json.loads(res.output)[0]["uri"] == "tidal:track:1"
     assert calls["n"] == 2     # timed out once, retried, succeeded
+
+
+@respx.mock
+async def test_play_playlist_timeout_reconciles_to_playing():
+    """A slow tracklist.add blows the RPC timeout AFTER Mopidy started streaming — reconcile against
+    get_state and report success, not 'it timed out' over music that is actually playing."""
+    def resp(request):
+        m = json.loads(request.content)["method"]
+        if m == "core.tracklist.add":
+            raise httpx.ReadTimeout("")                       # the slow per-track resolve
+        result = {"core.playlists.get_items": [{"uri": "tidal:track:1"}],
+                  "core.playback.get_state": "playing"}.get(m)   # but playback already began
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), uri="tidal:playlist:a")
+    assert res.success and "playlist" in res.output.lower()
+    assert "timed out" not in res.output.lower() and "trouble" not in res.output.lower()
+
+
+@respx.mock
+async def test_play_playlist_timeout_real_failure_when_not_playing():
+    """If the play timed out AND nothing is actually playing, it's a genuine failure — keep the error."""
+    def resp(request):
+        m = json.loads(request.content)["method"]
+        if m == "core.tracklist.add":
+            raise httpx.ReadTimeout("")
+        result = {"core.playlists.get_items": [{"uri": "tidal:track:1"}],
+                  "core.playback.get_state": "stopped"}.get(m)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), uri="tidal:playlist:a")
+    assert not res.success and "timed out" in res.error.lower()

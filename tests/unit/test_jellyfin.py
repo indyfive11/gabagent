@@ -142,10 +142,12 @@ class _FakePage:
     async def evaluate(self, expr, arg=None):
         if "has_video" in expr:
             if not self.has_video:
-                return {"has_video": False, "paused": None, "t": None, "ready": None}
-            return {"has_video": True, "paused": self.paused, "t": 1.0, "ready": 4}
+                return {"has_video": False, "paused": None, "t": None, "ready": None,
+                        "muted": None, "vol": None}
+            return {"has_video": True, "paused": self.paused, "t": 1.0, "ready": 4,
+                    "muted": False, "vol": 1.0}
         if "document.title = t" in expr: return None     # window self-naming stamp
-        if "v.volume = vol" in expr: return True          # volume set succeeds
+        if "v.volume = vol" in expr: return True          # volume set succeeds (also clears muted)
         if "v.paused" in expr: return self.paused
         return None
 
@@ -182,6 +184,62 @@ async def test_play_not_signed_in_emits_blocked(monkeypatch):
     assert any(e.type == "blocked" for e in emitted)   # surfaced as blocked, not a failed play
 
 
+def test_strip_vocative():
+    assert jf._strip_vocative("play the movie Aria") == "play the movie"
+    assert jf._strip_vocative("Aria play the matrix") == "play the matrix"
+    assert jf._strip_vocative("hey Aria, the godfather") == "the godfather"
+    assert jf._strip_vocative("the matrix") == "the matrix"           # untouched
+    assert jf._strip_vocative("Aria") == "Aria"                       # bare vocative left for the caller
+    assert jf._strip_vocative("") == ""
+    # STT variants of the name (live transcripts): clipped "Ari", spelled "R.A.", "Arya"
+    assert jf._strip_vocative("Ari play the matrix") == "play the matrix"
+    assert jf._strip_vocative("hey R.A., the godfather") == "the godfather"
+    assert jf._strip_vocative("R.A. play the matrix") == "play the matrix"
+    assert jf._strip_vocative("Arya play the matrix") == "play the matrix"
+    assert jf._strip_vocative("play the movie Ari") == "play the movie"
+    # near-misses that merely START with the vocative letters must NOT be stripped
+    assert jf._strip_vocative("Arizona Robbins") == "Arizona Robbins"
+    assert jf._strip_vocative("Arrival") == "Arrival"
+
+
+@respx.mock
+async def test_search_strips_trailing_vocative_from_query():
+    cap = {}
+    def _resp(request):
+        cap["term"] = request.url.params.get("SearchTerm")
+        return httpx.Response(200, json={"Items": []})
+    respx.get(f"{BASE}/Items").mock(side_effect=_resp)
+    ctx = _ctx()
+    await jf.search(ctx, query="the matrix Aria")
+    assert cap["term"] == "the matrix"                                # vocative dropped before the search
+
+
+@respx.mock
+async def test_play_confirm_cancel_aborts_without_playing(monkeypatch):
+    # Wrong movie: at the "play here / new window" confirm the user cancels → abort, don't play anywhere.
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "c1", "SupportsRemoteControl": True, "DeviceName": "Living Room TV"}]))
+    opened = {"browser": False}
+    async def _no_browser(*a, **k):
+        opened["browser"] = True
+        return jf.ToolResult(output="opened")
+    monkeypatch.setattr(jf, "_play_in_browser", _no_browser)
+    async def _wait_for(fut, timeout=None): return (False, "cancel")   # front-end signalled cancel
+    monkeypatch.setattr(jf.asyncio, "wait_for", _wait_for)
+
+    ctx = _ctx()
+    emitted = []
+    async def emit(ev): emitted.append(ev)
+    ctx.voice_emit = emit
+    ctx.voice_session = VoiceSession("s", None)
+    res = await jf.play(ctx, item_id="abc", title="Aria")
+    # Cancel is a deliberate choice — a clean abort the model won't read as a playback failure.
+    assert res.success and "cancel" in res.output.lower()
+    assert "fail" not in res.output.lower() and "didn't" not in res.output.lower()
+    assert opened["browser"] is False                                 # cancel did NOT fall through to a new window
+    assert any(e.type == "confirm" for e in emitted)
+
+
 @respx.mock
 async def test_play_signed_in_browser_path_does_not_crash(monkeypatch):
     # Regression: `events` was imported only inside the controllable-session branch, so the browser
@@ -204,6 +262,35 @@ async def test_play_signed_in_browser_path_does_not_crash(monkeypatch):
     assert any(e.type == "status" for e in emitted)    # "Opening the player…" reached the emit
 
 
+@respx.mock
+async def test_play_web_client_skips_confirm_and_opens_owned_window(monkeypatch):
+    # An open Jellyfin WEB client (Chrome) reports SupportsRemoteControl but can't be REST-controlled, so
+    # "play there" would strand an uncontrollable movie. play() must NOT offer it / PlayNow to it — it
+    # skips the confirm and opens our owned, controllable window, naming it so the new window isn't a
+    # silent surprise. (Rob, live 2026-06-15.)
+    web_play = respx.post(f"{BASE}/Sessions/web1/Playing").mock(return_value=httpx.Response(204))
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "web1", "SupportsRemoteControl": True, "DeviceName": "Chrome", "Client": "Jellyfin Web"},
+    ]))
+    monkeypatch.setattr(jf, "_PLAY_POLL_TRIES", 1)
+    monkeypatch.setattr("gabagent.commands.browser.ensure_browser", _browser_with(_FakePage()))
+    async def _no_sleep(*a, **k): ...
+    monkeypatch.setattr(jf.asyncio, "sleep", _no_sleep)
+
+    ctx = _ctx()
+    emitted = []
+    async def emit(ev): emitted.append(ev)
+    ctx.voice_emit = emit
+    ctx.voice_session = VoiceSession("s", None)
+
+    res = await jf.play(ctx, item_id="abc", title="Hot Fuzz")
+    assert res.output                                              # opened, no crash
+    assert not any(e.type == "confirm" for e in emitted)          # web client → no "play there?" confirm
+    assert not web_play.called                                    # and NO PlayNow to the web client (no double-play)
+    status = next((e for e in emitted if e.type == "status"), None)
+    assert status is not None and "controllable window" in status.text   # caveat (b): narrated
+
+
 # -- browser-path control via Playwright (web client ignores remote-control API) ----
 
 class _FakeKbd:
@@ -217,24 +304,29 @@ class _FakeKbd:
 class _FakePlayPage:
     """Models the HTML5 <video> we introspect via page.evaluate (paused + volume + seek) and can close.
     `has_video=False` models the library/home view where no <video> element exists yet."""
-    def __init__(self, paused=False, volume=1.0, current_time=50.0, duration=100.0, has_video=True):
-        self.paused = paused; self.volume = volume
+    def __init__(self, paused=False, volume=1.0, current_time=50.0, duration=100.0, has_video=True,
+                 muted=False):
+        self.paused = paused; self.volume = volume; self.muted = muted
         self.currentTime = current_time; self.duration = duration
         self.has_video = has_video
         self.keyboard = _FakeKbd(self); self._closed = False
     def is_closed(self): return self._closed
     async def close(self): self._closed = True
     async def evaluate(self, expr, arg=None):
-        if "has_video" in expr:               # the _await_playback state probe
+        if "has_video" in expr:               # the _await_playback / audible state probe
             if not self.has_video:
-                return {"has_video": False, "paused": None, "t": None, "ready": None}
-            return {"has_video": True, "paused": self.paused, "t": self.currentTime, "ready": 4}
+                return {"has_video": False, "paused": None, "t": None, "ready": None,
+                        "muted": None, "vol": None}
+            return {"has_video": True, "paused": self.paused, "t": self.currentTime, "ready": 4,
+                    "muted": self.muted, "vol": self.volume}
         if "document.title = t" in expr: return None              # window self-naming stamp
         if "v.pause()" in expr: self.paused = True; return None   # reliable pause (no gesture)
-        if "v.currentTime =" in expr and arg is not None:         # relative seek
-            self.currentTime = max(0, min(self.duration, self.currentTime + arg)); return None
-        if "v.volume = vol" in expr:          # setter
-            self.volume = arg; return None
+        if "v.currentTime =" in expr and arg is not None:
+            if "v.currentTime + s" in expr:                       # relative seek (forward/back)
+                self.currentTime = max(0, min(self.duration, self.currentTime + arg)); return None
+            self.currentTime = max(0, min(self.duration, arg)); return True   # absolute seek_to
+        if "v.volume = vol" in expr:          # setter also clears muted (make it audible); JS returns true
+            self.volume = arg; self.muted = False; return True
         if "v.paused" in expr: return self.paused
         if "v.volume" in expr: return self.volume
         return None
@@ -276,6 +368,33 @@ async def test_browser_control_pause_resume_stop():
     r = await jf.control(ctx, action="stop")
     assert r.success and page.paused is True and page.keyboard.keys[-1] == "Escape"
     assert ctx.jellyfin_playing_page is page and ctx.jellyfin_paused is True
+
+
+async def test_resume_unmutes_a_stranded_muted_element():
+    # The muted-on-resume bug: a browser resume can come back with <video>.muted=true while the PipeWire
+    # sink is at a normal level, so the movie plays silently. Resume must clear the mute so audio returns.
+    page = _FakePlayPage(paused=True, muted=True, volume=0.85)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page; ctx.jellyfin_paused = True
+    r = await jf.control(ctx, action="resume")
+    assert r.success and ctx.jellyfin_paused is False
+    assert page.muted is False                    # unmuted → audible again
+    assert abs(page.volume - 0.85) < 1e-9         # a real user level is preserved, not blown to full
+
+
+async def test_resume_lifts_zero_volume_to_full():
+    # If a resume strands the element at volume 0 (not just muted), bring it back to full so it's audible.
+    page = _FakePlayPage(paused=True, muted=True, volume=0.0)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page; ctx.jellyfin_paused = True
+    r = await jf.control(ctx, action="resume")
+    assert r.success and page.muted is False and abs(page.volume - 1.0) < 1e-9
+
+
+async def test_set_video_volume_clears_muted():
+    # A volume set means "make it audible at this level" — it must also clear the muted flag, else the
+    # sink/video stay silent (the play-path _set_video_volume(1.0) relied on this to un-strand a mute).
+    page = _FakePlayPage(muted=True, volume=0.3)
+    ok = await jf._set_video_volume(page, 0.7)
+    assert ok is True and page.muted is False and abs(page.volume - 0.7) < 1e-9
 
 
 @respx.mock
@@ -576,6 +695,69 @@ async def test_remote_seek_uses_position_ticks():
     res = await jf.control(ctx, action="forward")
     assert res.success and route.called
     assert route.calls.last.request.url.params["seekPositionTicks"] == str(100_000_000 + 30 * 10_000_000)
+
+
+def test_coerce_secs_and_fmt_hms():
+    assert jf._coerce_secs(None) is None and jf._coerce_secs("") is None and jf._coerce_secs("oops") is None
+    assert jf._coerce_secs(2700) == 2700 and jf._coerce_secs("4800") == 4800 and jf._coerce_secs(-5) == 0
+    assert jf._coerce_secs(90.7) == 90
+    assert jf._fmt_hms(4800) == "1 hour 20 minutes"
+    assert jf._fmt_hms(2700) == "45 minutes"
+    assert jf._fmt_hms(150) == "2 minutes 30 seconds"
+    assert jf._fmt_hms(3600) == "1 hour"
+    assert jf._fmt_hms(45) == "45 seconds"
+
+
+async def test_seek_to_owned_page_jumps_to_absolute_time():
+    page = _FakePlayPage(paused=False, current_time=10.0, duration=7200.0)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page
+    r = await jf.control(ctx, action="seek_to", position=2700)
+    assert r.success and abs(page.currentTime - 2700) < 1e-9 and "45 minutes" in r.output
+
+
+async def test_seek_to_owned_page_clamps_to_duration():
+    page = _FakePlayPage(paused=False, current_time=10.0, duration=7200.0)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page
+    r = await jf.control(ctx, action="seek_to", position=99999)
+    assert r.success and abs(page.currentTime - 7200) < 1e-9
+
+
+async def test_seek_to_without_position_asks_for_a_time():
+    page = _FakePlayPage(paused=False)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page
+    r = await jf.control(ctx, action="seek_to")
+    assert not r.success and "time" in (r.error or "").lower()
+
+
+@respx.mock
+async def test_seek_to_remote_uses_absolute_position_ticks():
+    # No owned page → absolute seek on a native client: seekPositionTicks = target seconds × 1e7.
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "s1", "Client": "Jellyfin Android", "NowPlayingItem": {"Name": "X"},
+         "PlayState": {"IsPaused": False}}]))
+    route = respx.post(f"{BASE}/Sessions/s1/Playing/Seek").mock(return_value=httpx.Response(204))
+    ctx = _ctx()
+    res = await jf.control(ctx, action="seek_to", position=2700)
+    assert res.success and route.called
+    assert route.calls.last.request.url.params["seekPositionTicks"] == str(2700 * 10_000_000)
+
+
+@respx.mock
+async def test_play_to_session_passes_start_position_ticks():
+    route = respx.post(f"{BASE}/Sessions/s1/Playing").mock(return_value=httpx.Response(204))
+    jc = _ctx().config.jellyfin
+    res = await jf._play_to_session(jc, "s1", "item1", "your TV", 4800)
+    assert res.success and route.called
+    assert route.calls.last.request.url.params["startPositionTicks"] == str(4800 * 10_000_000)
+    assert "1 hour 20 minutes" in res.output
+
+
+@respx.mock
+async def test_play_to_session_no_position_omits_ticks():
+    route = respx.post(f"{BASE}/Sessions/s1/Playing").mock(return_value=httpx.Response(204))
+    jc = _ctx().config.jellyfin
+    res = await jf._play_to_session(jc, "s1", "item1", "your TV")
+    assert res.success and "startPositionTicks" not in route.calls.last.request.url.params
 
 
 async def test_browser_control_idempotent_reads_real_state():

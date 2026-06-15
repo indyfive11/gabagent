@@ -5,6 +5,7 @@ unlike third-party declarative skills.
 from __future__ import annotations
 import asyncio
 import json
+import re
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -20,13 +21,67 @@ _CONTROL = {"pause": "Pause", "resume": "Unpause", "stop": "Stop", "next": "Next
 _REMOTE_VOLUME = {"volume_up": "VolumeUp", "volume_down": "VolumeDown"}  # GeneralCommand for native clients
 _BROWSER_ONLY = {"close"}                                # only meaningful on the page we own
 _SEEK = {"forward": 30, "back": -30}                     # ±seconds; owned page via currentTime, REST via ticks
+_SEEK_TO = "seek_to"                                     # ABSOLUTE seek to `position` seconds from the start
 _SPECIAL = {"fullscreen", "exit_fullscreen"}             # handled directly (two fullscreen layers)
-_ACTIONS = set(_CONTROL) | set(_REMOTE_VOLUME) | _BROWSER_ONLY | set(_SEEK) | _SPECIAL
+_ACTIONS = set(_CONTROL) | set(_REMOTE_VOLUME) | _BROWSER_ONLY | set(_SEEK) | {_SEEK_TO} | _SPECIAL
+_TICKS = 10_000_000                                      # Jellyfin position unit: 1 second = 10,000,000 ticks
 # Actions whose target is "whatever is PLAYING" — so an owned-but-PAUSED page must not swallow them when a
 # DIFFERENT session is the one actually going (the live miss Rob hit 2026-06-14). `resume` is excluded: it
 # targets the PAUSED movie, which is the owned page; `close`/fullscreen are owned-only and handled separately.
-_DIVERTABLE = set(_SEEK) | set(_REMOTE_VOLUME) | {"pause", "stop", "next"}
+_DIVERTABLE = set(_SEEK) | set(_REMOTE_VOLUME) | {"pause", "stop", "next", _SEEK_TO}
 _PLAY_POLL_TRIES = 24   # ~12s waiting for the opened web client to register a session
+
+
+def _coerce_secs(position) -> int | None:
+    """A spoken position arrives as a number of SECONDS from the start (the model converts '1h20m' → 4800).
+    Coerce defensively (str/float/None) to a non-negative int; None if absent/unparseable."""
+    if position is None or position == "":
+        return None
+    try:
+        return max(0, int(float(position)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_hms(secs: int) -> str:
+    """A spoken time phrase: 4800 → '1 hour 20 minutes', 2700 → '45 minutes', 150 → '2 minutes 30 seconds'."""
+    secs = max(0, int(secs))
+    h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+    parts = []
+    if h:
+        parts.append(f"{h} hour" + ("s" if h != 1 else ""))
+    if m:
+        parts.append(f"{m} minute" + ("s" if m != 1 else ""))
+    if s and not h:                                   # drop trailing seconds once we're past an hour
+        parts.append(f"{s} second" + ("s" if s != 1 else ""))
+    return " ".join(parts) or "the start"
+
+
+# The user can cancel the "play here / new window" confirm outright (wrong movie). The voice front-end
+# signals it through the existing confirm `passphrase` field, so this needs no new protocol surface.
+_CONFIRM_CANCEL = {"cancel", "cancelled", "canceled", "__cancel__"}
+
+# The wake vocative is the assistant's name; a leading/trailing "Aria"/"Arya" in a play/search request is the
+# user addressing the assistant, NOT part of the movie title (live: "play the movie Aria" → searched "Aria").
+# STT renders the name several ways in live transcripts — "Aria", "Arya", clipped "Ari", and spelled "R.A."
+# (e.g. "Hey R.A., pause the movie"); cover them all. Longest forms first so "Aria" wins over "Ari".
+_VOCATIVE_ALT = r"(?:aria|arya|ari|r\.\s*a\.?)"
+_VOCATIVE_RE = re.compile(
+    rf"^(?:hey\s+|ok(?:ay)?\s+)?{_VOCATIVE_ALT}[\s,]+|[\s,]+{_VOCATIVE_ALT}[\s,.!?]*$", re.I
+)
+
+
+def _strip_vocative(text) -> str:
+    """Drop a leading/trailing wake vocative ('Aria'/'Arya', optional 'hey/ok') so it isn't taken as part of
+    a movie title. Strips repeatedly (both ends), and only when something else remains — a bare 'Aria' is
+    left as-is for the caller to handle (it carries no title)."""
+    s = (text or "").strip()
+    while True:
+        stripped = _VOCATIVE_RE.sub(" ", s).strip(" ,.!?")
+        if stripped == s or not stripped:
+            break
+        s = stripped
+    return s
 
 
 class JellyfinProvider:
@@ -104,21 +159,31 @@ class JellyfinProvider:
                     Slot("item_id", "string", True, description="Jellyfin item id from jellyfin.search"),
                     Slot("title", "string", False,
                          description="human movie title from jellyfin.search, for the spoken confirmation"),
+                    Slot("position", "number", False,
+                         description="optional — START position in SECONDS from the beginning (convert spoken "
+                         "times: '1 hour 20 minutes' → 4800, 'forty-five minutes in' → 2700). Omit to start "
+                         "from the beginning / resume point."),
                 ],
-                examples=["play that one", "play the first movie"],
+                examples=["play that one", "play the first movie",
+                          "play it starting at an hour and ten minutes", "start the movie twenty minutes in"],
             ),
             Command(
                 id="jellyfin.control", domain="media", tier=1, featured=True,
-                summary="Control the movie — pause, resume, stop, fast-forward or rewind, enter or leave full screen, close the window, or turn the movie volume up/down",
+                summary="Control the movie — pause, resume, stop, fast-forward/rewind ±30s, jump to a specific time, enter or leave full screen, close the window, or turn the movie volume up/down",
                 backend=PyBackend(ref="gabagent.commands.providers.jellyfin:control"),
                 params=[Slot("action", "enum", True,
-                             enum=("pause", "resume", "stop", "next", "forward", "back",
+                             enum=("pause", "resume", "stop", "next", "forward", "back", "seek_to",
                                    "fullscreen", "exit_fullscreen", "close", "volume_up", "volume_down"),
-                             description="required — one of pause/resume/stop/next/forward/back/"
+                             description="required — one of pause/resume/stop/next/forward/back/seek_to/"
                              "fullscreen/exit_fullscreen/close/volume_up/volume_down (forward/back/next = "
-                             "skip ±30s, fullscreen = put the movie full screen, exit_fullscreen = leave it)")],
+                             "skip ±30s, seek_to = jump to an ABSOLUTE time given in `position`, "
+                             "fullscreen = put the movie full screen, exit_fullscreen = leave it)"),
+                        Slot("position", "number", False,
+                             description="for seek_to only — the target time in SECONDS from the start "
+                             "(convert spoken times: 'forty-five minutes' → 2700, 'an hour in' → 3600)")],
                 examples=["pause", "resume", "stop the movie", "fast forward", "skip ahead",
-                          "rewind", "go back thirty seconds", "full screen the movie", "go fullscreen",
+                          "rewind", "go back thirty seconds", "jump to the forty-five minute mark",
+                          "skip to one hour ten", "go to two hours in", "full screen the movie", "go fullscreen",
                           "leave full screen", "exit fullscreen", "get out of full screen",
                           "close the movie window", "turn up the movie", "louder on the movie", "movie volume down"],
             ),
@@ -234,6 +299,10 @@ async def search(ctx, genre=None, min_rating=None, query=None, unwatched=False) 
     jc = ctx.config.jellyfin
     if not jc.api_key:
         return ToolResult(output="", error="Jellyfin API key not set (settings: jellyfin.api_key).")
+    if query:
+        # "play the movie Aria" carries a trailing wake vocative, not a title — strip it so the search
+        # term is the real title (a bare vocative collapses to no query → a normal browse, not "Aria").
+        query = _strip_vocative(query) or None
     params = {
         "IncludeItemTypes": "Movie,Series", "Recursive": "true",
         "Fields": "Genres,CommunityRating,ProductionYear", "SortBy": "Random", "Limit": "20",
@@ -341,7 +410,7 @@ def _other_playing_session(ctx, sessions: list[dict]) -> dict | None:
     return next((s for s in playing if not _is_web_client(s)), playing[0])
 
 
-async def _rest_control(ctx, jc, session: dict, action: str) -> ToolResult:
+async def _rest_control(ctx, jc, session: dict, action: str, secs: int | None = None) -> ToolResult:
     """Drive a non-owned Jellyfin session over the Sessions REST API. Honest about web clients, which
     accept the command (HTTP 204) but do nothing — so we refuse rather than falsely claim success."""
     if _is_web_client(session):
@@ -351,6 +420,8 @@ async def _rest_control(ctx, jc, session: dict, action: str) -> ToolResult:
                           "web players can't be remote-controlled. I can only control a movie I opened here.")
     if action in _REMOTE_VOLUME:
         return await _rest_general_command(jc, session["Id"], _REMOTE_VOLUME[action])
+    if action == _SEEK_TO:
+        return await _rest_seek_to(jc, session, secs or 0)
     if action in _SEEK:
         return await _rest_seek(jc, session, _SEEK[action])
     try:
@@ -361,7 +432,7 @@ async def _rest_control(ctx, jc, session: dict, action: str) -> ToolResult:
     return ToolResult(output=f"{action} sent.") if r.is_success else ToolResult(output="", error=f"control failed: HTTP {r.status_code}")
 
 
-async def control(ctx, action="") -> ToolResult:
+async def control(ctx, action="", position=None) -> ToolResult:
     jc = ctx.config.jellyfin
     if action not in _ACTIONS:
         return ToolResult(output="", error=f"unknown action: {action}")
@@ -369,6 +440,9 @@ async def control(ctx, action="") -> ToolResult:
         return await _enter_fullscreen(ctx)
     if action == "exit_fullscreen":
         return await _exit_fullscreen(ctx)
+    secs = _coerce_secs(position)
+    if action == _SEEK_TO and secs is None:
+        return ToolResult(output="", error="Tell me a time to jump to — like 'skip to forty-five minutes'.")
     # The Jellyfin web client ignores remote-control API commands (returns 204, does nothing — a
     # known upstream issue), so when WE launched the movie in our own browser, control it through
     # the page instead. Native/controllable clients still go through the Sessions API below.
@@ -385,8 +459,8 @@ async def control(ctx, action="") -> ToolResult:
         if action in _DIVERTABLE and (await _video_paused(page)) is not False:
             target = _other_playing_session(ctx, await _sessions(jc))
             if target is not None:
-                return await _rest_control(ctx, jc, target, action)
-        return await _browser_control(ctx, page, action)
+                return await _rest_control(ctx, jc, target, action, secs)
+        return await _browser_control(ctx, page, action, secs)
     # No owned page → drive a native/controllable Jellyfin client over REST (prefer what's actually playing).
     sessions = await _sessions(jc)
     target = _other_playing_session(ctx, sessions) \
@@ -396,7 +470,7 @@ async def control(ctx, action="") -> ToolResult:
         return ToolResult(output="", error="No active playback session to control.")
     if action in ("stop", "close"):
         ctx.jellyfin_playing_title = None
-    return await _rest_control(ctx, jc, target, action)
+    return await _rest_control(ctx, jc, target, action, secs)
 
 
 async def _rest_general_command(jc, session_id, name) -> ToolResult:
@@ -426,19 +500,43 @@ async def _rest_seek(jc, session, secs) -> ToolResult:
                       else f"Skipped back {abs(secs)} seconds.")
 
 
-async def play(ctx, item_id="", title="") -> ToolResult:
+async def _rest_seek_to(jc, session, secs: int) -> ToolResult:
+    """Absolute seek on a native client: jump to `secs` from the start (seconds → ticks)."""
+    try:
+        async with _client(jc) as c:
+            r = await c.post(f"/Sessions/{session['Id']}/Playing/Seek",
+                             params={"seekPositionTicks": max(0, int(secs)) * _TICKS})
+    except Exception as e:
+        return ToolResult(output="", error=f"seek failed: {e}")
+    if not r.is_success:
+        return ToolResult(output="", error=f"seek failed: HTTP {r.status_code}")
+    return ToolResult(output=f"Jumped to {_fmt_hms(secs)}.")
+
+
+async def play(ctx, item_id="", title="", position=None) -> ToolResult:
     # `title` is carried for the spoken confirmation only; playback uses item_id.
     from gabagent.voice import events  # used by both the surface-confirm and the browser path
     jc = ctx.config.jellyfin
     if not item_id:
         return ToolResult(output="", error="no item to play")
+    start_secs = _coerce_secs(position)            # optional "start N seconds in"
     emit = getattr(ctx, "voice_emit", None)
     vs = getattr(ctx, "voice_session", None)
 
     sessions = await _sessions(jc)
-    controllable = [s for s in sessions if s.get("SupportsRemoteControl") and s.get("DeviceName")]
+    # Only offer "play there" for a client we can actually CONTROL afterward. A web client (e.g. the user's
+    # own Chrome) reports SupportsRemoteControl but IGNORES REST control — it 204-noops pause/stop (the
+    # upstream lie, see _is_web_client) — so "play there" would strand a movie we can't stop by voice (Rob
+    # hit this live 2026-06-15: played Hot Fuzz in his Chrome, then couldn't stop it). Exclude web clients
+    # and open our OWNED window instead, which we drive via the <video> element → controllable.
+    controllable = [s for s in sessions
+                    if s.get("SupportsRemoteControl") and s.get("DeviceName") and not _is_web_client(s)]
+    # An open-but-WEB client we're deliberately bypassing → narrate the new window so it isn't a silent
+    # surprise (a second window appearing wordlessly reads as a glitch).
+    bypassing_web = any(_is_web_client(s) for s in sessions
+                        if s.get("SupportsRemoteControl") and s.get("DeviceName"))
 
-    # Ask-if-ambiguous: a client is already open — use it, or open a new window?
+    # Ask-if-ambiguous: a CONTROLLABLE client is already open — use it, or open a new window?
     if controllable and vs is not None and emit is not None:
         # Dedup identical device names so two browser windows don't read as "Chrome or Chrome".
         names = " or ".join(dict.fromkeys(s.get("DeviceName", "a device") for s in controllable))
@@ -449,15 +547,22 @@ async def play(ctx, item_id="", title="") -> ToolResult:
         # complete spoken line — the client must not append the standard yes/no tail.
         await emit(events.confirm(
             cid, 2, "spoken_yesno",
-            f"Play {what}on your open {names}? Say yes to play there, or no to open a new window.",
+            f"Play {what}on your open {names}? Say yes to play there, no to open a new window, "
+            "or cancel if it's the wrong one.",
             "", prompt_complete=True))
         try:
-            approved, _ = await asyncio.wait_for(fut, timeout=60)
+            approved, choice = await asyncio.wait_for(fut, timeout=60)
         except Exception:
-            approved = False
+            approved, choice = False, None
+        # A third outcome: the user cancels (wrong movie). The front-end signals it via the confirm
+        # passphrase field — abort entirely instead of falling through to a new-window play.
+        if (choice or "").strip().lower() in _CONFIRM_CANCEL:
+            # Deliberate user cancel — frame it as a completed choice, not a failure, or the model
+            # editorializes it into "playback didn't start, want me to retry?" (live 2026-06-15).
+            return ToolResult(output="Okay, cancelled — what would you like to watch instead?")
         if approved:
             res = await _play_to_session(jc, controllable[0]["Id"], item_id,
-                                         controllable[0].get("DeviceName", "your client"))
+                                         controllable[0].get("DeviceName", "your client"), start_secs)
             if res.success and title:
                 # Remember the title even though we DON'T own this page (existing Chrome): it's the only
                 # handle window-ops have to target the movie window by caption (vs. the active window).
@@ -465,23 +570,32 @@ async def play(ctx, item_id="", title="") -> ToolResult:
             return res
 
     if emit:
-        await emit(events.status("Opening the player…"))  # narrate before the slow launch
-    res = await _play_in_browser(ctx, jc, item_id, title)
+        # Narrate before the slow launch; name it a "controllable window" when we're bypassing an open
+        # web client so the user knows why a fresh window is appearing.
+        await emit(events.status(
+            "Opening a controllable window…" if bypassing_web else "Opening the player…"))
+    res = await _play_in_browser(ctx, jc, item_id, title, start_secs)
     if res.success and title:
         ctx.jellyfin_playing_title = title
     return res
 
 
-async def _play_to_session(jc, session_id, item_id, label) -> ToolResult:
+async def _play_to_session(jc, session_id, item_id, label, start_secs: int | None = None) -> ToolResult:
+    params = {"itemIds": item_id, "playCommand": "PlayNow"}
+    if start_secs:
+        params["startPositionTicks"] = int(start_secs) * _TICKS     # begin N seconds in
     try:
         async with _client(jc) as c:
-            r = await c.post(f"/Sessions/{session_id}/Playing", params={"itemIds": item_id, "playCommand": "PlayNow"})
+            r = await c.post(f"/Sessions/{session_id}/Playing", params=params)
     except Exception as e:
         return ToolResult(output="", error=f"play failed: {e}")
-    return ToolResult(output=f"Playing on {label}.") if r.is_success else ToolResult(output="", error=f"play failed: HTTP {r.status_code}")
+    if not r.is_success:
+        return ToolResult(output="", error=f"play failed: HTTP {r.status_code}")
+    at = f" from {_fmt_hms(start_secs)}" if start_secs else ""
+    return ToolResult(output=f"Playing on {label}{at}.")
 
 
-async def _play_in_browser(ctx, jc, item_id, title="") -> ToolResult:
+async def _play_in_browser(ctx, jc, item_id, title="", start_secs: int | None = None) -> ToolResult:
     from gabagent.commands.browser import ensure_browser
     from gabagent.voice import events
     emit = getattr(ctx, "voice_emit", None)
@@ -546,13 +660,21 @@ async def _play_in_browser(ctx, jc, item_id, title="") -> ToolResult:
         from gabagent.voice.debuglog import dlog
         pb = await _await_playback(page)
         dlog(ctx, "playback", has_video=pb["has_video"], paused=pb["paused"],
-             started=pb["started"], nudged=pb["nudged"], t=pb["t"], ready=pb["ready"])
+             started=pb["started"], nudged=pb["nudged"], t=pb["t"], ready=pb["ready"],
+             muted=pb["muted"], vol=pb["vol"])
         if not pb["started"]:
             # Don't claim it's playing when the element says otherwise.
             result = ToolResult(output=(
                 "I opened and full-screened the window, but the movie isn't actually playing yet — say "
                 "'play' and I'll start it." if pb["has_video"] else
                 "I opened the Jellyfin window but the player didn't come up — ask me to play again."))
+        # Start-at-position: once the element is genuinely playing, jump to the requested point. We seek the
+        # <video> directly (deterministic for the owned browser) rather than trust the web client to honor a
+        # PlayNow startPositionTicks, and fold it into the spoken line so the confirmation stays grounded.
+        elif start_secs:
+            if await _browser_seek_to(page, start_secs):
+                base = (result.output or "Playing.").rstrip(".")
+                result = ToolResult(output=f"{base} — starting at {_fmt_hms(start_secs)}.")
         # Fullscreen only once a player is up (never fullscreen the bare library). Append the fullscreen
         # line only when playback is real, so the spoken confirmation stays grounded.
         if pb["has_video"] and getattr(getattr(ctx.config, "desktop", None), "auto_fullscreen_movie", True):
@@ -651,7 +773,8 @@ _PLAYBACK_POLL_INTERVAL = 0.5
 _JS_VIDEO_STATE = (
     "() => { const v = document.querySelector('video');"
     " return { has_video: !!v, paused: v ? v.paused : null,"
-    " t: v ? v.currentTime : null, ready: v ? v.readyState : null }; }"
+    " t: v ? v.currentTime : null, ready: v ? v.readyState : null,"
+    " muted: v ? v.muted : null, vol: v ? v.volume : null }; }"
 )
 
 
@@ -676,7 +799,8 @@ async def _await_playback(page) -> dict:
         await asyncio.sleep(_PLAYBACK_POLL_INTERVAL)
     started = bool(st.get("has_video") and st.get("paused") is False)
     return {"has_video": bool(st.get("has_video")), "paused": st.get("paused"),
-            "t": st.get("t"), "ready": st.get("ready"), "started": started, "nudged": nudged}
+            "t": st.get("t"), "ready": st.get("ready"), "started": started, "nudged": nudged,
+            "muted": st.get("muted"), "vol": st.get("vol")}
 
 
 async def _video_volume(page) -> float | None:
@@ -685,15 +809,54 @@ async def _video_volume(page) -> float | None:
 
 
 async def _set_video_volume(page, vol: float) -> bool:
-    # The JS returns true on success so a timeout/error (default False) is distinguishable from a real set.
+    # Setting a volume means "make the movie audible at this level", so also clear the element's muted
+    # flag. A browser autoplay/resume can leave <video>.muted=true (autoplay policy), and a muted element
+    # stays silent no matter the volume OR the PipeWire sink level — that's the movie-stuck-muted-on-resume
+    # bug, where a sink-level "turn it up" couldn't recover the audio. The JS returns true on success so a
+    # timeout/error (default False) is distinguishable from a real set.
     ok = await _page_eval(
         page,
-        "(vol) => { const v = document.querySelector('video'); if (v) { v.volume = vol; return true; } return false; }",
+        "(vol) => { const v = document.querySelector('video');"
+        " if (v) { v.muted = false; v.volume = vol; return true; } return false; }",
         vol, default=False)
     return bool(ok)
 
 
-async def _browser_control(ctx, page, action) -> ToolResult:
+async def _ensure_video_audible(ctx, page, where="") -> None:
+    """Clear a stranded mute on the owned <video> so audio actually returns on resume/play. A browser
+    autoplay/resume can leave the element muted (or at volume 0) while the PipeWire sink sits at a normal
+    level — the movie then plays silently and a sink-level "turn it up" can't recover it (the
+    muted-on-resume bug Rob hit). Best-effort and instrumented: logs before/after so a silent resume is
+    provable. Unmutes; lifts a 0/unknown volume to full; leaves a real user-set level alone."""
+    try:
+        st = await _page_eval(page, _JS_VIDEO_STATE, default=None) or {}
+    except Exception:
+        st = {}
+    if not st.get("has_video"):
+        return
+    was_muted, was_vol = st.get("muted"), st.get("vol")
+    target = 1.0 if (was_vol is None or was_vol <= 0.0) else was_vol
+    ok = await _set_video_volume(page, target)            # also clears muted
+    try:
+        from gabagent.voice.debuglog import dlog
+        dlog(ctx, "video_audible", where=where, was_muted=was_muted, was_vol=was_vol,
+             set_to=target, ok=ok)
+    except Exception:
+        pass
+
+
+async def _browser_seek_to(page, secs: int) -> bool:
+    """Absolute seek on the owned <video>: jump to `secs` from the start, clamped to the duration.
+    Returns true only when a real <video> was found and set (a timeout/no-element reads False)."""
+    return bool(await _page_eval(
+        page,
+        "(s) => { const v = document.querySelector('video');"
+        " if (v && !isNaN(v.duration)) { v.currentTime = Math.max(0, Math.min(v.duration, s)); return true; }"
+        " return false; }",
+        max(0, int(secs)), default=False))
+
+
+async def _browser_control(ctx, page, action, position: int | None = None) -> ToolResult:
     try:
         if action == "stop":
             # Reliably pause (video.pause() needs no user gesture, unlike resume) and drop the player
@@ -738,6 +901,12 @@ async def _browser_control(ctx, page, action) -> ToolResult:
                 secs)
             return ToolResult(output=f"Skipped ahead {secs} seconds." if secs > 0
                               else f"Skipped back {abs(secs)} seconds.")
+        if action == _SEEK_TO:
+            if position is None:
+                return ToolResult(output="", error="Tell me a time to jump to.")
+            if not await _browser_seek_to(page, position):
+                return ToolResult(output="", error="I couldn't jump there — the movie isn't ready yet.")
+            return ToolResult(output=f"Jumped to {_fmt_hms(position)}.")
         # Idempotent: read the REAL play state, then press Space (a toggle — but a *trusted* user
         # gesture, unlike video.play() via evaluate which can be autoplay-blocked) only if the state
         # actually needs to change. cur is None when we can't read it → best-effort single press.
@@ -752,9 +921,13 @@ async def _browser_control(ctx, page, action) -> ToolResult:
         if action == "resume":
             if cur is False:
                 ctx.jellyfin_paused = False
+                await _ensure_video_audible(ctx, page, where="resume_already")
                 return ToolResult(output="It's already playing.")
             await page.keyboard.press("Space")
             ctx.jellyfin_paused = False
+            # A resume can come back muted/silent (autoplay policy) while the sink is fine — unmute the
+            # element so audio actually returns, instead of leaving Rob with a silent movie.
+            await _ensure_video_audible(ctx, page, where="resume")
             return ToolResult(output="Resumed the movie.")
         return ToolResult(output="", error=f"unknown action: {action}")
     except Exception as e:

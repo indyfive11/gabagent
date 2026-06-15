@@ -280,6 +280,20 @@ async def _expand_playable(tc, uri: str) -> list[str]:
             if isinstance(r, dict) and (r.get("uri") or "").startswith("tidal:track:")]
 
 
+async def _playback_started(tc) -> bool:
+    """True if Mopidy reports active playback. Used to reconcile a play RPC that *timed out* against
+    reality: a slow `core.tracklist.add` (it resolves every track against TIDAL's live API) can blow the
+    30s RPC timeout even after Mopidy has already started streaming track 1. Without this the caller
+    raises and we tell the user 'it timed out' over music that is actually playing — and the LLM, seeing
+    a failure, retries, doubling the dead time (live 2026-06-15: a random-playlist play hit back-to-back
+    30s timeouts → a 99s turn, while media_state showed tidal:playing the whole time). Short timeout,
+    never raises."""
+    try:
+        return (await _rpc(tc, "core.playback.get_state", timeout=2.0)) == "playing"
+    except Exception:
+        return False
+
+
 async def _play_uris(tc, uris: list[str]) -> dict:
     """Clear the tracklist, queue the URIs, and start playback. Returns per-step timings (ms) so the
     caller can localize where TIDAL play latency lands — `queue_ms` (tracklist.add, which resolves each
@@ -381,6 +395,11 @@ async def play(ctx, query="", uri="", album=False) -> ToolResult:
         try:
             timings = await _play_uris(tc, [uri])
         except Exception as e:
+            # Reconcile a timed-out play against real playback state — a slow track resolve can blow the
+            # RPC timeout after streaming has already begun (see _playback_started).
+            if _is_timeout(e) and await _playback_started(tc):
+                await _hold_ambient(ctx)
+                return ToolResult(output=f"Playing {label} on TIDAL." if label else "Playing on TIDAL.")
             return ToolResult(output="", error=f"couldn't play that: {_human_err(e)}")
         _h = time.monotonic()
         await _hold_ambient(ctx)
@@ -423,6 +442,12 @@ async def _play_container(ctx, tc, query="", uri="", album=False) -> ToolResult:
                 return ToolResult(output="", error=f"that {noun} has no playable tracks")
             timings = await _play_uris(tc, uris)
         except Exception as e:
+            # A slow live-API call can blow the RPC timeout after Mopidy already started streaming —
+            # reconcile against real playback state before calling it a failure (see _playback_started).
+            if _is_timeout(e) and await _playback_started(tc):
+                await _hold_ambient(ctx)
+                return ToolResult(output=f"Playing the {noun} {label} on TIDAL." if label
+                                  else f"Playing that {noun} on TIDAL.")
             return ToolResult(output="", error=f"couldn't play that {noun}: {_human_err(e)}")
         _h = time.monotonic()
         await _hold_ambient(ctx)

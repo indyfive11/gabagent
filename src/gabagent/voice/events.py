@@ -71,5 +71,14 @@ def addressed(value: bool) -> VoiceEvent:
     return VoiceEvent(type="addressed", extra={"addressed": bool(value)})
 
 
+def keepalive(ttl_secs: int) -> VoiceEvent:
+    """Media-control keepalive (brain → voice client). Asks the client to hold the wake/command window
+    open for `ttl_secs` longer so a follow-up media command needs no re-wake while music plays. Emitted
+    after a media command runs and refreshed per command; the client (re)arms a TTL timer on each and
+    releases on expiry — its own max-hold ceiling backstops a missed refresh. Carries `hold`/`ttl_secs`
+    via `extra` so the wire shape is explicit and survives to_dict's empty-value filter."""
+    return VoiceEvent(type="wake_hold", extra={"hold": True, "ttl_secs": int(ttl_secs)})
+
+
 def done() -> VoiceEvent:
     return VoiceEvent(type="done")

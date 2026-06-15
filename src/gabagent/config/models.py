@@ -172,6 +172,14 @@ class GabAgentConfig(BaseSettings):
     # least this % so "turn the music way down" can't ratchet to inaudible — to actually silence music
     # the user pauses/stops it. Env: GABAI_MEDIA_VOLUME_FLOOR.
     media_volume_floor: int = 5
+    # Media-control keepalive: after any media command (play/pause/seek/volume/…), ask the voice client to
+    # hold the wake/command window open this many more seconds, refreshed per command, so a follow-up
+    # ("skip", "louder", "pause") needs no re-wake while music plays — the wake-gate otherwise idle-closes
+    # the window (~15s) and silently locks the user out mid-interaction. Tunable: raise if follow-ups still
+    # get gated, lower if open-mic asides leak (a hot mic over music transcribes undirected speech as
+    # asides). 0 disables. The voice side caps it with its own max-hold ceiling so a missed refresh
+    # self-heals. Env: GABAI_MEDIA_KEEPALIVE_SECS.
+    media_keepalive_secs: int = 30
     # This machine's friendly name, used to tag media sources as LOCAL vs on another device/room (e.g.
     # "EndeavorMain"). Empty → defaults to the hostname at use. The brain only AUTO-ducks/controls media it
     # judges local to this device; remote sources are visible (for future explicit control) but never touched

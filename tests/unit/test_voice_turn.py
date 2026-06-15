@@ -344,3 +344,95 @@ async def test_escalation_failure_outer_belt_narrates_on_arya(home):
     text = "".join(e.text for e in evs if e.type == "token")
     assert "created the file" in text                     # arya narrated via the outer belt
     assert not any(e.type == "error" for e in evs)        # no "[gab.ai error]" spoken
+
+
+# -- Media-control keepalive: hold the wake window open for follow-ups while music plays -----------
+
+class _FakeCatalog:
+    """Minimal command catalog: `get(cid)` returns an object whose `.domain` is 'media' for the ids we
+    declare media, else 'files' (so _is_media_command can discriminate)."""
+    def __init__(self, media_ids):
+        self._media = set(media_ids)
+    def get(self, cid):
+        if not cid:
+            return None
+        return types.SimpleNamespace(domain="media" if cid in self._media else "files")
+    def index(self):
+        return []   # empty → _capability_brief short-circuits (we only exercise .get here)
+
+
+def _media_ctx(home, responses, **cfg_kw):
+    from gabagent.api.models import ToolResult  # noqa: F401 (kept parallel to other tool tests)
+    ctx = make_ctx(home, responses, **cfg_kw)
+    ctx.command_catalog = _FakeCatalog({"jellyfin.control", "tidal.play"})
+    return ctx
+
+
+def test_keepalive_event_wire_shape():
+    from gabagent.voice import events
+    ev = events.keepalive(30)
+    assert ev.type == "wake_hold"
+    assert ev.to_dict() == {"type": "wake_hold", "hold": True, "ttl_secs": 30}
+
+
+async def test_media_command_emits_keepalive_before_done(home, monkeypatch):
+    """A media-domain run_command emits exactly one `wake_hold` (TTL = media_keepalive_secs) right
+    before `done`, so the voice client holds the window open for a follow-up command."""
+    from gabagent.api.models import ToolResult
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, *a, **k):
+        return [ToolResult(output="Paused.") for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+    ctx = _media_ctx(home, [
+        [[_spec("run_command", command_id="jellyfin.control", action="pause")]],
+        ["Paused."],
+    ], media_keepalive_secs=30)
+    evs = await run_turn(ctx, "pause the music")
+    holds = [e for e in evs if e.type == "wake_hold"]
+    assert len(holds) == 1
+    assert holds[0].to_dict() == {"type": "wake_hold", "hold": True, "ttl_secs": 30}
+    types_ = [e.type for e in evs]
+    assert types_.index("wake_hold") < types_.index("done")   # before the turn closes
+    assert types_[-1] == "done"
+
+
+async def test_non_media_command_emits_no_keepalive(home, monkeypatch):
+    """A non-media command (read_file) must NOT hold the wake window open."""
+    from gabagent.api.models import ToolResult
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, *a, **k):
+        return [ToolResult(output="ok") for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+    ctx = _media_ctx(home, [
+        [[_spec("run_command", command_id="system.something", action="x")]],
+        ["done"],
+    ], media_keepalive_secs=30)
+    evs = await run_turn(ctx, "do a thing")
+    assert not any(e.type == "wake_hold" for e in evs)
+
+
+async def test_keepalive_disabled_when_secs_zero(home, monkeypatch):
+    """media_keepalive_secs=0 disables the hold entirely, even for a media command."""
+    from gabagent.api.models import ToolResult
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, *a, **k):
+        return [ToolResult(output="Playing.") for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+    ctx = _media_ctx(home, [
+        [[_spec("run_command", command_id="tidal.play", uri="tidal:playlist:a")]],
+        ["Playing."],
+    ], media_keepalive_secs=0)
+    evs = await run_turn(ctx, "play my playlist")
+    assert not any(e.type == "wake_hold" for e in evs)

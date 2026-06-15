@@ -37,6 +37,16 @@ VOICE_ADDENDUM = (
     "Don't add pleasantries or offers like 'let me know if you need anything else' or 'glad I "
     "could help' — just answer or report the result and stop. Keep casual conversation just as short: "
     "one sentence, no rambling or philosophizing. "
+    "Don't narrate what you're about to do or your reasoning ('let me check…', 'I need to search "
+    "for…', 'one moment while I…') — just do it and give the result in one short clause; this matters "
+    "most while a movie or music is playing, where the user wants a quick 'Done.' not a play-by-play. "
+    "Your own name (Aria) at the start or end of a request is the user addressing you, not part of a "
+    "movie or song title — ignore it when searching or playing (e.g. 'play the movie, Aria' means play "
+    "the movie, not find a title called 'Aria'). "
+    "When a tool reports the user cancelled or backed out of an action (e.g. a cancelled play "
+    "confirmation), treat it as a deliberate, completed choice — acknowledge it briefly and ask what "
+    "they'd like instead. Never describe a cancel as a failure or an error, never say it 'didn't "
+    "work' or 'didn't start', and don't offer to retry the same thing. "
     "Don't read code or long file contents aloud — make the change and say one sentence "
     "about what you did. You can read files, search the web, and edit files in safe folders "
     "without asking. For edits to the current project you'll ask out loud to confirm. For "
@@ -246,6 +256,18 @@ def _run_command_domain(tool_calls) -> str:
     return ""
 
 
+def _is_media_command(ctx: AgentContext, cid: str | None) -> bool:
+    """True if `cid` is a media-domain command (jellyfin/tidal/mpris play/pause/seek/volume/…). Used to
+    fire the media-control keepalive so follow-up commands don't get wake-gated out mid-interaction."""
+    if not cid:
+        return False
+    cat = getattr(ctx, "command_catalog", None)
+    if cat is None:
+        return False
+    cmd = cat.get(cid)
+    return bool(cmd is not None and getattr(cmd, "domain", "") == "media")
+
+
 async def _emit_filtered(sfilter: SpeakableFilter, parts, emit) -> None:
     for kind, payload in parts:
         if kind == "speak":
@@ -352,6 +374,7 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
         last_status = None
         status_emitted = False   # cap spoken status to ONE per turn (no "Opening… Trying… Looking…" chains)
         fell_back = False        # turn-level arya fallback fires at most once per turn
+        media_ran = False        # any media-domain command this turn → emit a keepalive before `done`
         while True:
             cur = ctx.active_model or simple
             # Announce an arya→premium transition ONCE (vs. every turn), and de-escalate silently.
@@ -446,9 +469,19 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
                     except Exception:
                         cid = None
                 dlog(ctx, "tool", name=tc.name, command_id=cid, ok=result.success, error=result.error)
+                if _is_media_command(ctx, cid):
+                    media_ran = True
                 ctx.session.append_message(
                     ChatMessage(role="tool", content=result.to_content(), tool_call_id=tc.id)
                 )
+
+        # Media-control keepalive: hold the wake/command window open for a follow-up command so the
+        # wake-gate doesn't idle-close and lock the user out mid-interaction while music plays (refreshed
+        # per media turn; the voice side releases on TTL expiry + its own max-hold ceiling). 0 disables.
+        keepalive_secs = int(getattr(ctx.config, "media_keepalive_secs", 0) or 0)
+        if media_ran and keepalive_secs > 0:
+            await emit(events.keepalive(keepalive_secs))
+            dlog(ctx, "keepalive", ttl_secs=keepalive_secs)
 
         await emit(events.done())
     except asyncio.CancelledError:
