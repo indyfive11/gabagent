@@ -333,6 +333,88 @@ async def test_browser_only_actions_need_owned_page():
     assert not r.success and "browser" in r.error.lower()
 
 
+# -- routing: an owned-but-PAUSED page must not swallow a command meant for a DIFFERENT session ----
+# (the live miss Rob hit 2026-06-14: "pause" kept hitting the already-paused local player while a movie
+#  on another device kept playing).
+
+@respx.mock
+async def test_paused_owned_page_routes_pause_to_remote_native_session():
+    # We own a paused movie ("Up"); a NATIVE client is actively playing "Shazam!" on another device.
+    # `pause` must reach the remote session over REST, not press Space on the paused owned page.
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "tv1", "Client": "Jellyfin Media Player", "DeviceName": "Bedroom TV",
+         "NowPlayingItem": {"Name": "Shazam!"}, "PlayState": {"IsPaused": False}},
+    ]))
+    route = respx.post(f"{BASE}/Sessions/tv1/Playing/Pause").mock(return_value=httpx.Response(204))
+    page = _FakePlayPage(paused=True)                       # owned movie is paused
+    ctx = _ctx(); ctx.jellyfin_playing_page = page; ctx.jellyfin_playing_title = "Up"
+    r = await jf.control(ctx, action="pause")
+    assert r.success and route.called                       # REST hit the remote session…
+    assert page.keyboard.keys == []                         # …and the owned page was NOT touched
+
+
+@respx.mock
+async def test_paused_owned_page_is_honest_about_remote_web_session():
+    # The other movie is a remote WEB client — Jellyfin can't remote-control it (it 204s and ignores).
+    # We must say so specifically, not falsely claim success and not poke the owned page.
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "w1", "Client": "Jellyfin Web", "DeviceName": "Office Laptop",
+         "NowPlayingItem": {"Name": "Shazam!"}, "PlayState": {"IsPaused": False},
+         "SupportsRemoteControl": True},                    # web clients lie about this
+    ]))
+    posted = respx.post(f"{BASE}/Sessions/w1/Playing/Pause").mock(return_value=httpx.Response(204))
+    page = _FakePlayPage(paused=True)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page; ctx.jellyfin_playing_title = "Up"
+    r = await jf.control(ctx, action="pause")
+    assert not r.success
+    assert "web browser" in r.error and "Office Laptop" in r.error
+    assert not posted.called and page.keyboard.keys == []   # no false REST success, owned page untouched
+
+
+async def test_playing_owned_page_still_controlled_directly():
+    # Regression: when the owned movie IS playing, control it via the page with no session lookup at all
+    # (no respx mock here — a stray /Sessions fetch would be a real network call / a bug).
+    page = _FakePlayPage(paused=False)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page; ctx.jellyfin_playing_title = "Up"
+    r = await jf.control(ctx, action="pause")
+    assert r.success and page.keyboard.keys == ["Space"] and ctx.jellyfin_paused is True
+
+
+@respx.mock
+async def test_paused_owned_page_with_nothing_else_playing_acts_on_owned():
+    # Owned movie paused, no other session playing → "pause" stays on the owned page ("already paused").
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[]))
+    page = _FakePlayPage(paused=True)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page; ctx.jellyfin_playing_title = "Up"
+    r = await jf.control(ctx, action="pause")
+    assert r.success and "already paused" in r.output and page.keyboard.keys == []
+
+
+@respx.mock
+async def test_resume_targets_owned_paused_page_even_if_remote_playing():
+    # `resume` means "un-pause the paused movie" = the owned page; it must NOT divert to a remote that's
+    # already playing (no respx route for the remote → asserts we never REST it).
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "tv1", "Client": "Jellyfin Media Player", "DeviceName": "Bedroom TV",
+         "NowPlayingItem": {"Name": "Shazam!"}, "PlayState": {"IsPaused": False}},
+    ]))
+    page = _FakePlayPage(paused=True)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page; ctx.jellyfin_playing_title = "Up"
+    r = await jf.control(ctx, action="resume")
+    assert r.success and page.keyboard.keys == ["Space"] and ctx.jellyfin_paused is False
+
+
+@respx.mock
+async def test_no_owned_page_honest_about_remote_web_session():
+    # No owned page at all; the only thing playing is a remote WEB client → honest refusal, no false success.
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "w1", "Client": "Jellyfin Web", "DeviceName": "Office Laptop",
+         "NowPlayingItem": {"Name": "Shazam!"}, "PlayState": {"IsPaused": False}},
+    ]))
+    r = await jf.control(_ctx(), action="pause")
+    assert not r.success and "web browser" in r.error and "Office Laptop" in r.error
+
+
 async def test_browser_seek_forward_and_back_set_currenttime():
     page = _FakePlayPage(current_time=50.0, duration=100.0)
     ctx = _ctx(); ctx.jellyfin_playing_page = page

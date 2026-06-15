@@ -22,6 +22,10 @@ _BROWSER_ONLY = {"close"}                                # only meaningful on th
 _SEEK = {"forward": 30, "back": -30}                     # ±seconds; owned page via currentTime, REST via ticks
 _SPECIAL = {"fullscreen", "exit_fullscreen"}             # handled directly (two fullscreen layers)
 _ACTIONS = set(_CONTROL) | set(_REMOTE_VOLUME) | _BROWSER_ONLY | set(_SEEK) | _SPECIAL
+# Actions whose target is "whatever is PLAYING" — so an owned-but-PAUSED page must not swallow them when a
+# DIFFERENT session is the one actually going (the live miss Rob hit 2026-06-14). `resume` is excluded: it
+# targets the PAUSED movie, which is the owned page; `close`/fullscreen are owned-only and handled separately.
+_DIVERTABLE = set(_SEEK) | set(_REMOTE_VOLUME) | {"pause", "stop", "next"}
 _PLAY_POLL_TRIES = 24   # ~12s waiting for the opened web client to register a session
 
 
@@ -313,6 +317,50 @@ async def _exit_fullscreen(ctx) -> ToolResult:
     return ToolResult(output="", error="I couldn't find the movie window to leave full screen.")
 
 
+def _is_web_client(session: dict) -> bool:
+    """True if this session is a Jellyfin WEB client. Web clients ignore remote-control REST commands
+    (they 204 and do nothing — the upstream issue noted below) YET still report SupportsRemoteControl:true,
+    so the `Client` string is the only reliable native-vs-web discriminator. We can drive a web movie only
+    if WE launched it (the owned Playwright page); a web movie on another device is uncontrollable."""
+    return "web" in (session.get("Client") or "").lower()
+
+
+def _session_playing(s: dict) -> bool:
+    return bool(s.get("NowPlayingItem")) and not (s.get("PlayState") or {}).get("IsPaused")
+
+
+def _other_playing_session(ctx, sessions: list[dict]) -> dict | None:
+    """The actively-playing session that is NOT the movie we own (matched by title — our own web session
+    can linger in /Sessions for a beat after we pause/close). Prefers a native client over a web one, so a
+    controllable target wins when both are present. None if nothing else is playing."""
+    owned = (getattr(ctx, "jellyfin_playing_title", "") or "").strip().lower()
+    playing = [s for s in sessions if _session_playing(s)
+               and (s.get("NowPlayingItem", {}).get("Name") or "").strip().lower() != owned]
+    if not playing:
+        return None
+    return next((s for s in playing if not _is_web_client(s)), playing[0])
+
+
+async def _rest_control(ctx, jc, session: dict, action: str) -> ToolResult:
+    """Drive a non-owned Jellyfin session over the Sessions REST API. Honest about web clients, which
+    accept the command (HTTP 204) but do nothing — so we refuse rather than falsely claim success."""
+    if _is_web_client(session):
+        title = (session.get("NowPlayingItem", {}).get("Name") or "that movie")
+        device = session.get("DeviceName") or session.get("Client") or "another device"
+        return ToolResult(output="", error=f'"{title}" is playing in a web browser on {device} — Jellyfin '
+                          "web players can't be remote-controlled. I can only control a movie I opened here.")
+    if action in _REMOTE_VOLUME:
+        return await _rest_general_command(jc, session["Id"], _REMOTE_VOLUME[action])
+    if action in _SEEK:
+        return await _rest_seek(jc, session, _SEEK[action])
+    try:
+        async with _client(jc) as c:
+            r = await c.post(f"/Sessions/{session['Id']}/Playing/{_CONTROL[action]}")
+    except Exception as e:
+        return ToolResult(output="", error=f"control failed: {e}")
+    return ToolResult(output=f"{action} sent.") if r.is_success else ToolResult(output="", error=f"control failed: HTTP {r.status_code}")
+
+
 async def control(ctx, action="") -> ToolResult:
     jc = ctx.config.jellyfin
     if action not in _ACTIONS:
@@ -325,28 +373,30 @@ async def control(ctx, action="") -> ToolResult:
     # known upstream issue), so when WE launched the movie in our own browser, control it through
     # the page instead. Native/controllable clients still go through the Sessions API below.
     page = _live_jellyfin_page(ctx)
-    if page is not None:
-        return await _browser_control(ctx, page, action)
-    if action in _BROWSER_ONLY:
+    # `close` only ever means "close the window I opened" — never a session on another device.
+    if action == "close":
+        if page is not None:
+            return await _browser_control(ctx, page, action)
         return ToolResult(output="", error="I can only do that to a movie I opened in the browser.")
-    # No owned page → drive a native/controllable Jellyfin client over REST.
+    if page is not None:
+        # Don't let an owned-but-PAUSED page swallow a pause/stop/seek/volume meant for a different
+        # session that's actually playing — route to that session instead. resume/owned-playing/no-other
+        # all fall through to the owned page (its proven path).
+        if action in _DIVERTABLE and (await _video_paused(page)) is not False:
+            target = _other_playing_session(ctx, await _sessions(jc))
+            if target is not None:
+                return await _rest_control(ctx, jc, target, action)
+        return await _browser_control(ctx, page, action)
+    # No owned page → drive a native/controllable Jellyfin client over REST (prefer what's actually playing).
     sessions = await _sessions(jc)
-    target = next((s for s in sessions if s.get("NowPlayingItem")), None) \
+    target = _other_playing_session(ctx, sessions) \
+        or next((s for s in sessions if s.get("NowPlayingItem")), None) \
         or next((s for s in sessions if s.get("SupportsRemoteControl")), None)
     if not target:
         return ToolResult(output="", error="No active playback session to control.")
-    if action in _REMOTE_VOLUME:
-        return await _rest_general_command(jc, target["Id"], _REMOTE_VOLUME[action])
-    if action in _SEEK:
-        return await _rest_seek(jc, target, _SEEK[action])
     if action in ("stop", "close"):
         ctx.jellyfin_playing_title = None
-    try:
-        async with _client(jc) as c:
-            r = await c.post(f"/Sessions/{target['Id']}/Playing/{_CONTROL[action]}")
-    except Exception as e:
-        return ToolResult(output="", error=f"control failed: {e}")
-    return ToolResult(output=f"{action} sent.") if r.is_success else ToolResult(output="", error=f"control failed: HTTP {r.status_code}")
+    return await _rest_control(ctx, jc, target, action)
 
 
 async def _rest_general_command(jc, session_id, name) -> ToolResult:
