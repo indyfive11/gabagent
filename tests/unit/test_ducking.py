@@ -255,6 +255,67 @@ def test_parse_mopidy_sink_input():
     assert _parse_mopidy_sink_input("nothing here") is None
 
 
+# Our browser owns TWO sink-inputs (PID 12345): a stale/corked sibling from a prior play attempt at full
+# volume, plus the live RUNNING movie. This is the exact shape of the bug where a whole movie window ducked
+# the silent leftover (4545) while the audible stream (4551) stayed at 100%.
+_TWO_BROWSER_SINKS = (
+    'Sink Input #4545\n\tCorked: yes\n'
+    '\tVolume: front-left: 65536 / 100% / 0 dB\n\tState: IDLE\n'
+    '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "12345"\n'
+    'Sink Input #4551\n\tCorked: no\n'
+    '\tVolume: front-left: 65536 / 100% / 0 dB\n\tState: RUNNING\n'
+    '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "12345"\n'
+)
+
+
+def test_parse_sink_inputs_captures_state_and_app():
+    from gabagent.voice.ducking import _parse_sink_inputs
+    items = {si["idx"]: si for si in _parse_sink_inputs(_TWO_BROWSER_SINKS)}
+    assert items["4545"]["state"] == "IDLE" and items["4545"]["app"] == "Chromium"
+    assert items["4551"]["state"] == "RUNNING"
+
+
+def test_pid_match_prefers_running_sink_over_corked_sibling():
+    # The fix: among our browser's sink-inputs, duck the RUNNING (audible) one, not whichever pactl lists
+    # first. Without the state preference this returned 4545 (the silent leftover) and the movie never ducked.
+    from gabagent.voice.ducking import _parse_sink_input_by_pid
+    assert _parse_sink_input_by_pid(_TWO_BROWSER_SINKS, {"12345"}) == ("4551", 100)
+
+
+def test_pid_match_falls_back_to_first_when_none_running():
+    # Movie paused → every candidate is corked/idle. No RUNNING one to prefer, so take the first match
+    # rather than declining (restore/seek still need a target).
+    from gabagent.voice.ducking import _parse_sink_input_by_pid
+    both_idle = _TWO_BROWSER_SINKS.replace("State: RUNNING", "State: IDLE")
+    assert _parse_sink_input_by_pid(both_idle, {"12345"}) == ("4545", 100)
+
+
+def test_pid_match_single_sink_unaffected():
+    from gabagent.voice.ducking import _parse_sink_input_by_pid
+    one = ('Sink Input #4551\n\tVolume: front-left: 65536 / 100% / 0 dB\n\tState: RUNNING\n'
+           '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "12345"\n')
+    assert _parse_sink_input_by_pid(one, {"12345"}) == ("4551", 100)
+    assert _parse_sink_input_by_pid(one, {"99999"}) is None    # not our PID → no match
+
+
+async def test_jellyfin_sink_input_resolves_running_and_stashes_candidates(monkeypatch):
+    # End to end: our browser owns the stale sibling + the live movie; the resolver returns the RUNNING one
+    # and stashes the candidate set on state so the sink_on dlog can show why (a stale mispick is visible).
+    monkeypatch.setattr(_dk.shutil, "which", lambda _: "/usr/bin/pactl")
+    async def fake_pactl(*args, **k):
+        return (0, _TWO_BROWSER_SINKS) if args[:2] == ("list", "sink-inputs") else (0, "")
+    async def fake_cmd(*args, **k):
+        return (0, "12345") if args and args[0] == "pgrep" else (1, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    monkeypatch.setattr(_dk, "_run_cmd", fake_cmd)
+    monkeypatch.setattr(_dk, "_proc_descendants", lambda pids: pids)
+
+    ctx = types.SimpleNamespace()
+    assert await _dk._jellyfin_sink_input(ctx) == ("4551", 100)
+    cands = _dk._state(ctx)["jellyfin_sink_cands"]
+    assert {c["idx"]: c["state"] for c in cands} == {"4545": "IDLE", "4551": "RUNNING"}
+
+
 async def test_duck_tidal_sink_ducks_then_restores(monkeypatch):
     calls = []
     list_out = ('Sink Input #7\n\tVolume: front-left: 58000 / 90% / -1.0 dB\n'

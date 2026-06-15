@@ -250,14 +250,34 @@ def _proc_descendants(pids: set[str]) -> set[str]:
     return seen
 
 
-def _parse_sink_input_by_pid(out: str, pids: set[str]) -> tuple[str, int | None] | None:
-    """The sink-input whose application.process.id is one of `pids` → (idx, vol%). This is the unambiguous
-    match: it's OUR browser's audio stream by process identity, not by a name another Chrome could share."""
+def _pid_matched_sinks(out: str, pids: set[str]) -> list[dict]:
+    """Every sink-input whose application.process.id is one of `pids` — OUR browser's audio streams by
+    process identity (not a name another Chrome could share). Usually one; a stale/corked sibling tab from
+    a prior play attempt can leave a second."""
+    res = []
     for si in _parse_sink_inputs(out):
         m = re.search(r'application\.process\.id = "?(\d+)"?', si["block"])
         if m and m.group(1) in pids:
-            return si["idx"], si["volume"]
-    return None
+            res.append(si)
+    return res
+
+
+def _choose_sink(cands: list[dict]) -> tuple[str, int | None] | None:
+    """Pick the AUDIBLE stream among our browser's sink-inputs. When the tree owns more than one — a
+    stale/corked sibling (a prior attempt / a closed tab) alongside the live movie — prefer the one that's
+    actually RUNNING over pactl's list order, which can put the silent leftover first. That ordering bug
+    ducked the wrong sink for a whole movie window (the live stream stayed at full volume). Falls back to the
+    first match only when none is RUNNING (e.g. the movie is paused, so every candidate is corked)."""
+    if not cands:
+        return None
+    chosen = next((c for c in cands if c["state"] == "RUNNING"), cands[0])
+    return chosen["idx"], chosen["volume"]
+
+
+def _parse_sink_input_by_pid(out: str, pids: set[str]) -> tuple[str, int | None] | None:
+    """The audible sink-input owned by our browser process tree → (idx, vol%), or None. RUNNING-preferred
+    when the tree owns several (see _choose_sink)."""
+    return _choose_sink(_pid_matched_sinks(out, pids))
 
 
 def _parse_lone_browser_sink(out: str) -> tuple[str, int | None] | None:
@@ -287,9 +307,15 @@ async def _jellyfin_sink_input(ctx) -> tuple[str, int | None] | None:
     rc, pout = await _run_cmd("pgrep", "-f", profile_dir)
     main_pids = {p for p in pout.split() if p.isdigit()} if rc == 0 else set()
     if main_pids:
-        hit = _parse_sink_input_by_pid(out, _proc_descendants(main_pids))
+        cands = _pid_matched_sinks(out, _proc_descendants(main_pids))
+        # Stash the candidate set (idx/app/state/vol) so the sink_on dlog can show WHY a sink was chosen —
+        # a stale-sibling mispick is then visible in one line instead of needing a re-mine.
+        _state(ctx)["jellyfin_sink_cands"] = [
+            {"idx": c["idx"], "app": c["app"], "state": c["state"], "vol": c["volume"]} for c in cands]
+        hit = _choose_sink(cands)
         if hit:
             return hit
+    _state(ctx).pop("jellyfin_sink_cands", None)
     return _parse_lone_browser_sink(out)
 
 
@@ -384,15 +410,21 @@ async def mopidy_audibility() -> dict:
 
 
 def _parse_sink_inputs(out: str) -> list[dict]:
-    """Every sink-input in `pactl list sink-inputs` as {idx, volume %, block text} — the block is kept so
-    callers can test it for exclusion markers (TTS property / Mopidy ownership)."""
+    """Every sink-input in `pactl list sink-inputs` as {idx, volume %, app, state, block text} — the block is
+    kept so callers can test it for exclusion markers (TTS property / Mopidy ownership). `state` is the
+    PipeWire stream state (RUNNING|IDLE|CORKED) — a corked/idle leftover from a prior play attempt is silent,
+    so the duck must prefer the RUNNING one when our browser owns several."""
     items = []
     for block in out.split("Sink Input #")[1:]:
         idx = block.splitlines()[0].strip()
         if not idx.isdigit():
             continue
         m = re.search(r"Volume:.*?(\d+)%", block)
-        items.append({"idx": idx, "volume": int(m.group(1)) if m else None, "block": block})
+        am = re.search(r'application\.name = "([^"]+)"', block)
+        stm = re.search(r"^\s*State:\s*(\w+)", block, re.MULTILINE)
+        items.append({"idx": idx, "volume": int(m.group(1)) if m else None,
+                      "app": am.group(1) if am else None,
+                      "state": stm.group(1) if stm else None, "block": block})
     return items
 
 
@@ -761,7 +793,7 @@ async def _duck_jellyfin_sink(ctx, page, on: bool, mute: bool = False, found=Non
             if mute:
                 st["muted"] = True
             _jf_dlog(ctx, phase="sink_on", sink_idx=idx, sink_prior=vol, ducked_to=sink_target,
-                     saved_prior=prior)
+                     saved_prior=prior, cands=st.get("jellyfin_sink_cands"))
             return True
         saved = st.get("jellyfin_sink_prior")
         if not saved:
