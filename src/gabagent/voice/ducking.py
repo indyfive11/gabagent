@@ -55,6 +55,10 @@ def _state(ctx) -> dict:
     s.setdefault("duck_window_open", False)
     s.setdefault("duck_window_seq", 0)
     s.setdefault("duck_window_opened_mono", None)
+    # Duck-watchdog heartbeat: monotonic time of the last duck-on OR incoming voice activity. The watchdog
+    # (checked on the ~1 Hz /media/state poll) auto-restores a duck left open with no refresh past the
+    # configured grace — the brain's safety net for a voice-side on-without-off (the movie-announcement strand).
+    s.setdefault("last_duck_refresh_mono", None)
     return s
 
 
@@ -76,6 +80,7 @@ async def duck_media(ctx, on: bool, session_id: str | None = None, mute: bool = 
     st0 = _state(ctx)
     win_ms = None
     if on:
+        st0["last_duck_refresh_mono"] = _t0       # every duck-on refreshes the watchdog
         if not st0.get("duck_window_open"):
             st0["duck_window_seq"] = st0.get("duck_window_seq", 0) + 1
             st0["duck_window_opened_mono"] = _t0
@@ -109,6 +114,58 @@ async def duck_media(ctx, on: bool, session_id: str | None = None, mute: bool = 
     except Exception:
         pass
     return {"ok": True, "ducked": ducked}
+
+
+def note_duck_activity(ctx) -> None:
+    """Refresh the duck-watchdog heartbeat — call on any incoming voice activity (an utterance reaching the
+    brain, addressed or aside). Keeps the watchdog from firing during a legitimate sustained hold: while Rob
+    is speaking/dictating his turns keep this fresh, so the auto-restore only triggers in genuine SILENCE
+    after a duck that was never released. Best-effort; never raises."""
+    try:
+        _state(ctx)["last_duck_refresh_mono"] = time.monotonic()
+    except Exception:
+        pass
+
+
+def _duck_watchdog_secs(ctx) -> int:
+    """Seconds a duck may stay open with no refresh before the watchdog auto-restores it (config
+    duck_watchdog_secs, default 12). 0 disables. Clamped so it can't be set absurdly tight and fight a normal
+    bot announcement."""
+    try:
+        v = int(getattr(ctx.config, "duck_watchdog_secs", 12))
+    except Exception:
+        v = 12
+    if v <= 0:
+        return 0
+    return max(5, v)
+
+
+async def _duck_watchdog_check(ctx) -> None:
+    """Safety net for a voice-side on-without-off: if a duck window has been open longer than the configured
+    grace with NO refresh (no duck-on, no incoming voice turn), force a restore so the movie can't sit stranded
+    at the duck floor in silence. Ticked by the ~1 Hz /media/state poll — no background task. Best-effort.
+
+    This is belt-and-suspenders; the correct fix is the voice side pairing every duck-on with an off. The
+    watchdog only fires on genuine silence — note_duck_activity refreshes it on every utterance, so a real
+    sustained hold during dictation is never cut."""
+    secs = _duck_watchdog_secs(ctx)
+    if not secs:
+        return
+    try:
+        st = _state(ctx)
+        if not st.get("duck_window_open"):
+            return
+        last = st.get("last_duck_refresh_mono")
+        if last is None:
+            return
+        held = time.monotonic() - last
+        if held < secs:
+            return
+        from gabagent.voice.debuglog import dlog
+        dlog(ctx, "duck_watchdog", phase="auto_restore", held_secs=round(held, 1), grace=secs)
+        await duck_media(ctx, on=False)
+    except Exception:
+        pass
 
 
 async def media_state(ctx) -> dict:
@@ -148,6 +205,8 @@ async def media_state(ctx) -> dict:
              srcs=srcs_brief, ms=int((_t1 - _t0) * 1000))
     except Exception:
         pass
+    # Heartbeat for the duck watchdog — restore a duck left open with no refresh (a voice-side on-without-off).
+    await _duck_watchdog_check(ctx)
     return {"playing": playing, "state": state, "kind": kind}
 
 
@@ -273,14 +332,24 @@ def _sink_is_active(si: dict) -> bool:
 
 def _choose_sink(cands: list[dict]) -> tuple[str, int | None] | None:
     """Pick the AUDIBLE stream among our browser's sink-inputs. When the tree owns more than one — a
-    stale/corked sibling (a prior attempt / a still-open older window) alongside the live movie — prefer the
+    stale sibling (a prior attempt / a still-open older window) alongside the live movie — prefer the
     one that's actually PLAYING (uncorked) over pactl's list order, which can put the silent leftover first.
     That ordering bug ducked the wrong sink for a whole movie window (the live stream stayed at full volume).
-    Falls back to the first match only when none looks active (e.g. the movie is paused, so every candidate is
-    corked — restore/seek still need a target)."""
+
+    When two siblings are EQUALLY active — both uncorked, so `corked` can't tell them apart (the leftover
+    from a prior attempt sometimes still reads `Corked: no`) — break the tie by sink-input INDEX: the highest
+    is the most recently created stream, i.e. the just-started movie; the leftover is older and lower. This is
+    the "doesn't duck the first time, works the second" failure — pactl listed the older sibling first, we
+    ducked it, the movie stayed at 100%, and only once the leftover stream went away did the next wake duck the
+    real one. Falls back to the first match only when none looks active (movie paused, every candidate corked —
+    restore/seek still need a target)."""
     if not cands:
         return None
-    chosen = next((c for c in cands if _sink_is_active(c)), cands[0])
+    active = [c for c in cands if _sink_is_active(c)]
+    if active:
+        chosen = max(active, key=lambda c: int(c["idx"]))
+    else:
+        chosen = cands[0]
     return chosen["idx"], chosen["volume"]
 
 
@@ -322,12 +391,80 @@ async def _jellyfin_sink_input(ctx) -> tuple[str, int | None] | None:
         # a stale-sibling mispick is then visible in one line instead of needing a re-mine.
         _state(ctx)["jellyfin_sink_cands"] = [
             {"idx": c["idx"], "app": c["app"], "state": c["state"], "corked": c["corked"],
-             "vol": c["volume"]} for c in cands]
+             "muted": c.get("muted"), "vol": c["volume"]} for c in cands]
         hit = _choose_sink(cands)
         if hit:
             return hit
     _state(ctx).pop("jellyfin_sink_cands", None)
+    # PID match found nothing. If we OWN a movie page, that match is AUTHORITATIVE — a transient miss (the
+    # owned <video> paused/re-buffered, so PipeWire briefly dropped its sink-input, leaving only the user's
+    # SEPARATE Chrome as the "lone" browser) must NOT fall through to _parse_lone_browser_sink: that grabs the
+    # wrong stream and ducks/MUTES a different movie (the sink-420 bug — silenced another movie while the owned
+    # one stayed at 100%). Duck nothing this cycle; the next poll recovers when our sink reappears. The lone
+    # fallback is kept ONLY for the no-owned-page recovery case (e.g. a page ref lost across a brain restart).
+    from gabagent.commands.providers.jellyfin import _live_jellyfin_page
+    if _live_jellyfin_page(ctx) is not None:
+        return None
     return _parse_lone_browser_sink(out)
+
+
+async def ensure_jellyfin_sink_audible(ctx, *, lift_volume: bool = False) -> None:
+    """Make our browser movie's PipeWire sink-input(s) actually AUDIBLE — two layers the <video> unmute
+    (_ensure_video_audible) and the duck can't reach on their own:
+
+    1. MUTE flag (always): clear a stranded sink-input `Mute: yes`. The duck attenuates by VOLUME only and
+       never sets the mute flag, but a reused browser stream can carry one — silent regardless of
+       <video>.muted/volume OR the sink level. Mirrors _unmute_sink_input for Mopidy.
+    2. STRANDED-LOW volume (`lift_volume=True`, fresh play only): PipeWire's stream-restore replays the PRIOR
+       movie's ducked/low level (e.g. 18%, the duck floor) onto the brand-new stream, so the movie plays quiet
+       even though <video>.volume was reset to 1.0 — the sink layer is separate. Raise such a sink UP to the
+       configured start baseline (_movie_start_volume). Only on a fresh play (resume keeps a level the user
+       set), only ACTIVE/uncorked streams, only UP (never lower a movie, never touch a corked leftover). If a
+       duck already owns the sink, fix its SAVED restore-baseline instead of raising the live ducked level —
+       so the movie returns to baseline on release without a loud blip mid-speech.
+
+    Scoped to OUR browser PID tree so it never touches another Chrome or the TTS stream. Always logs a
+    `jellyfin_audible` line when our sinks are found (even with nothing to do) so a run can PROVE which layer
+    was the culprit. Best-effort; never raises."""
+    if not shutil.which("pactl"):
+        return
+    try:
+        rc, out = await _run_pactl("list", "sink-inputs")
+        if rc != 0 or not out:
+            return
+        from gabagent.config.paths import config_dir
+        profile_dir = str(config_dir() / "browser" / "jellyfin")
+        rc2, pout = await _run_cmd("pgrep", "-f", profile_dir)
+        main_pids = {p for p in pout.split() if p.isdigit()} if rc2 == 0 else set()
+        if not main_pids:
+            return
+        cands = _pid_matched_sinks(out, _proc_descendants(main_pids))
+        if not cands:
+            return
+        st = _state(ctx)
+        baseline = _movie_start_volume(ctx)
+        duck_prior = st.get("jellyfin_sink_prior")
+        cleared, raised = [], []
+        for c in cands:
+            if c.get("muted") is True:
+                await _run_pactl("set-sink-input-mute", c["idx"], "0")
+                cleared.append(c["idx"])
+            if lift_volume and _sink_is_active(c):
+                vol = c.get("volume")
+                if vol is not None and vol < baseline:
+                    if duck_prior is not None and str(duck_prior[0]) == c["idx"]:
+                        # A duck owns this sink — don't raise the live (ducked) level; fix the restore baseline.
+                        st["jellyfin_sink_prior"] = (duck_prior[0], baseline)
+                    else:
+                        await _run_pactl("set-sink-input-volume", c["idx"], f"{baseline}%")
+                    raised.append(c["idx"])
+        from gabagent.voice.debuglog import dlog
+        dlog(ctx, "jellyfin_audible", cleared_mute=cleared, raised_to_baseline=raised,
+             baseline=baseline, lift=lift_volume,
+             cands=[{"idx": c["idx"], "muted": c.get("muted"), "corked": c.get("corked"),
+                     "vol": c["volume"]} for c in cands])
+    except Exception:
+        pass
 
 
 def _parse_mopidy_sink_full(out: str) -> dict | None:
@@ -428,7 +565,12 @@ def _parse_sink_inputs(out: str) -> list[dict]:
     actively-playing stream and `Corked: yes` for a paused/idle leftover, but — unlike PulseAudio — emits NO
     per-sink-input `State:` line at all (only *sinks* carry State), so `state` reads None on PipeWire. The duck
     must therefore prefer the UNCORKED stream when our browser owns several; `state==RUNNING` is kept only as a
-    PulseAudio-portability fallback (see _choose_sink)."""
+    PulseAudio-portability fallback (see _choose_sink).
+
+    `muted` is the per-sink-input `Mute:` flag — orthogonal to volume and to `<video>.muted`. A muted
+    sink-input is silent no matter the sink level OR the element volume, so a fresh movie that inherits a
+    stranded mute (e.g. the reused browser context after closing a prior movie) plays silently and a 'turn it
+    up' can't recover it — the muted-on-fresh-play bug. Surfaced here so the play/resume paths can clear it."""
     items = []
     for block in out.split("Sink Input #")[1:]:
         idx = block.splitlines()[0].strip()
@@ -438,10 +580,12 @@ def _parse_sink_inputs(out: str) -> list[dict]:
         am = re.search(r'application\.name = "([^"]+)"', block)
         stm = re.search(r"^\s*State:\s*(\w+)", block, re.MULTILINE)
         cm = re.search(r"^\s*Corked:\s*(yes|no)", block, re.MULTILINE)
+        mm = re.search(r"^\s*Mute:\s*(yes|no)", block, re.MULTILINE)
         items.append({"idx": idx, "volume": int(m.group(1)) if m else None,
                       "app": am.group(1) if am else None,
                       "state": stm.group(1) if stm else None,
-                      "corked": (cm.group(1) == "yes") if cm else None, "block": block})
+                      "corked": (cm.group(1) == "yes") if cm else None,
+                      "muted": (mm.group(1) == "yes") if mm else None, "block": block})
     return items
 
 
@@ -507,6 +651,18 @@ def _ambient_cap(ctx) -> int:
     except Exception:
         c = 90
     return max(1, min(100, c))
+
+
+def _movie_start_volume(ctx) -> int:
+    """The sink-input % a freshly-played movie should start at (config movie_start_volume, default 100 =
+    neutral, no per-stream attenuation; the device/player volume governs absolute loudness). Lower it to make
+    movies start gentler. Clamped to [20, 100] so a bad config can't strand a fresh movie inaudible (20 sits
+    just above the duck floor)."""
+    try:
+        v = int(getattr(ctx.config, "movie_start_volume", 100))
+    except Exception:
+        v = 100
+    return max(20, min(100, v))
 
 
 async def apply_ambient_cap(ctx, new_track: bool = True) -> None:

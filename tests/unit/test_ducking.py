@@ -289,6 +289,42 @@ def test_pid_match_prefers_uncorked_sink_over_corked_sibling():
     assert _parse_sink_input_by_pid(_TWO_BROWSER_SINKS, {"12345"}) == ("4551", 100)
 
 
+# Our browser owns TWO sink-inputs that are BOTH uncorked (corked can't disambiguate): a leftover from a
+# prior play attempt (6290) that still reads `Corked: no`, plus the just-started movie (6297). This is the
+# exact live shape of the "doesn't duck the first time, works the second" bug — pactl listed the older
+# sibling (6290) first, the duck took it, and the movie (6297) stayed at 100% until the leftover went away.
+_TWO_UNCORKED_BROWSER_SINKS = (
+    'Sink Input #6290\n\tCorked: no\n'
+    '\tVolume: front-left: 65536 / 100% / 0 dB\n'
+    '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "12345"\n'
+    'Sink Input #6297\n\tCorked: no\n'
+    '\tVolume: front-left: 65536 / 100% / 0 dB\n'
+    '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "12345"\n'
+)
+
+
+def test_pid_match_prefers_newest_when_both_uncorked():
+    # The new case: both siblings uncorked, so corked is a tie. Break it by index — the higher (6297) is the
+    # most recently created stream (the just-started movie); the leftover from a prior attempt is older (6290).
+    # pactl lists the older one first, so the old "first uncorked" pick ducked the leftover and the movie
+    # never went quiet on the first wake.
+    from gabagent.voice.ducking import _parse_sink_input_by_pid
+    assert _parse_sink_input_by_pid(_TWO_UNCORKED_BROWSER_SINKS, {"12345"}) == ("6297", 100)
+
+
+def test_pid_match_corked_still_outranks_a_newer_uncorked_is_not_inverted():
+    # Layering guard: corked-vs-uncorked still decides BEFORE index. A newer-but-corked sibling must NOT win
+    # over an older uncorked playing stream — index only breaks ties AMONG the uncorked.
+    from gabagent.voice.ducking import _parse_sink_input_by_pid
+    older_uncorked_newer_corked = (
+        'Sink Input #6290\n\tCorked: no\n\tVolume: front-left: 65536 / 100% / 0 dB\n'
+        '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "12345"\n'
+        'Sink Input #6297\n\tCorked: yes\n\tVolume: front-left: 65536 / 100% / 0 dB\n'
+        '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "12345"\n'
+    )
+    assert _parse_sink_input_by_pid(older_uncorked_newer_corked, {"12345"}) == ("6290", 100)
+
+
 def test_pid_match_falls_back_to_first_when_all_corked():
     # Movie paused → every candidate is corked. Nothing looks active, so take the first match rather than
     # declining (restore/seek still need a target).
@@ -335,6 +371,247 @@ async def test_jellyfin_sink_input_resolves_uncorked_and_stashes_candidates(monk
     assert await _dk._jellyfin_sink_input(ctx) == ("4551", 100)
     cands = _dk._state(ctx)["jellyfin_sink_cands"]
     assert {c["idx"]: c["corked"] for c in cands} == {"4545": True, "4551": False}
+
+
+# Rob's SEPARATE Chrome (NOT in our owned-browser PID tree) — sink 420, process.id 99999. The sink-420 bug:
+# when our owned movie's sink-input transiently vanished (paused/re-buffered), the lone-browser fallback
+# grabbed THIS and muted it — silencing a different movie while the owned one stayed at full volume.
+_FOREIGN_CHROME_SINK = (
+    'Sink Input #420\n\tCorked: no\n'
+    '\tVolume: front-left: 21626 / 33% / -10 dB\n'
+    '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "99999"\n'
+)
+
+
+async def test_jellyfin_sink_input_declines_foreign_chrome_when_we_own_a_movie(monkeypatch):
+    # The sink-420 FIX: our owned-browser PID match (pid 12345) finds nothing (our movie sink momentarily
+    # gone), leaving only Rob's SEPARATE Chrome (420, pid 99999). Because we OWN a movie page, we must return
+    # None — NOT fall through to the lone-browser grab and mute the wrong movie.
+    monkeypatch.setattr(_dk.shutil, "which", lambda _: "/usr/bin/pactl")
+    async def fake_pactl(*a, **k):
+        return (0, _FOREIGN_CHROME_SINK) if a[:2] == ("list", "sink-inputs") else (0, "")
+    async def fake_cmd(*a, **k):
+        return (0, "12345") if a and a[0] == "pgrep" else (1, "")   # our browser pid 12345 IS found
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    monkeypatch.setattr(_dk, "_run_cmd", fake_cmd)
+    monkeypatch.setattr(_dk, "_proc_descendants", lambda pids: pids)   # tree={12345}; 420 is pid 99999 → no match
+    monkeypatch.setattr("gabagent.commands.providers.jellyfin._live_jellyfin_page", lambda ctx: object())  # OWN a movie
+    ctx = types.SimpleNamespace()
+    assert await _dk._jellyfin_sink_input(ctx) is None   # declined — does NOT return ("420", 33)
+
+
+async def test_jellyfin_sink_input_lone_fallback_kept_when_no_owned_page(monkeypatch):
+    # Recovery case: NO owned page (e.g. page ref lost across a restart) → the lone-browser fallback still
+    # resolves a single browser sink. Only the OWNED-page path declines.
+    monkeypatch.setattr(_dk.shutil, "which", lambda _: "/usr/bin/pactl")
+    async def fake_pactl(*a, **k):
+        return (0, _FOREIGN_CHROME_SINK) if a[:2] == ("list", "sink-inputs") else (0, "")
+    async def fake_cmd(*a, **k):
+        return (1, "")   # pgrep finds no owned browser
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    monkeypatch.setattr(_dk, "_run_cmd", fake_cmd)
+    monkeypatch.setattr(_dk, "_proc_descendants", lambda pids: pids)
+    monkeypatch.setattr("gabagent.commands.providers.jellyfin._live_jellyfin_page", lambda ctx: None)  # no owned movie
+    ctx = types.SimpleNamespace()
+    assert await _dk._jellyfin_sink_input(ctx) == ("420", 33)   # fallback preserved
+
+
+# A freshly-played movie whose PipeWire sink-input is MUTED — silent at full volume regardless of
+# <video>.muted/volume or the sink level. The live signature of muted-on-fresh-play (Rob: "the movie
+# started muted… might be because we closed the other one"); the reused browser context can carry a
+# stranded mute onto the next stream.
+_MUTED_BROWSER_SINK = (
+    'Sink Input #6517\n\tCorked: no\n\tMute: yes\n'
+    '\tVolume: front-left: 65536 / 100% / 0 dB\n'
+    '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "12345"\n'
+)
+
+
+def test_parse_sink_inputs_captures_mute_flag():
+    from gabagent.voice.ducking import _parse_sink_inputs
+    items = {si["idx"]: si for si in _parse_sink_inputs(_MUTED_BROWSER_SINK)}
+    assert items["6517"]["muted"] is True
+    # An absent `Mute:` line reads None (unknown), never False — so we don't mistake "couldn't tell" for
+    # "definitely unmuted" and skip a needed clear.
+    nomute = _MUTED_BROWSER_SINK.replace("\tMute: yes\n", "")
+    assert _parse_sink_inputs(nomute)[0]["muted"] is None
+
+
+async def test_ensure_jellyfin_sink_audible_clears_stranded_mute(monkeypatch):
+    # The fix: a fresh play inherited a muted sink-input → issue `set-sink-input-mute <idx> 0` so audio
+    # actually returns (the <video> unmute can't reach this layer).
+    monkeypatch.setattr(_dk.shutil, "which", lambda _: "/usr/bin/pactl")
+    calls = []
+    async def fake_pactl(*args, **k):
+        calls.append(args)
+        return (0, _MUTED_BROWSER_SINK) if args[:2] == ("list", "sink-inputs") else (0, "")
+    async def fake_cmd(*args, **k):
+        return (0, "12345") if args and args[0] == "pgrep" else (1, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    monkeypatch.setattr(_dk, "_run_cmd", fake_cmd)
+    monkeypatch.setattr(_dk, "_proc_descendants", lambda pids: pids)
+
+    ctx = types.SimpleNamespace()
+    await _dk.ensure_jellyfin_sink_audible(ctx)
+    assert ("set-sink-input-mute", "6517", "0") in calls
+
+
+async def test_ensure_jellyfin_sink_audible_noop_when_unmuted(monkeypatch):
+    # Already audible → never issues a set-sink-input-mute (idempotent, doesn't thrash a healthy stream).
+    monkeypatch.setattr(_dk.shutil, "which", lambda _: "/usr/bin/pactl")
+    unmuted = _MUTED_BROWSER_SINK.replace("Mute: yes", "Mute: no")
+    calls = []
+    async def fake_pactl(*args, **k):
+        calls.append(args)
+        return (0, unmuted) if args[:2] == ("list", "sink-inputs") else (0, "")
+    async def fake_cmd(*args, **k):
+        return (0, "12345") if args and args[0] == "pgrep" else (1, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    monkeypatch.setattr(_dk, "_run_cmd", fake_cmd)
+    monkeypatch.setattr(_dk, "_proc_descendants", lambda pids: pids)
+
+    ctx = types.SimpleNamespace()
+    await _dk.ensure_jellyfin_sink_audible(ctx)
+    assert not any(a and a[0] == "set-sink-input-mute" for a in calls)
+
+
+# A fresh movie BORN at the duck floor (18%): uncorked + unmuted, so the only fault is the low sink-input
+# VOLUME — PipeWire stream-restore replayed the prior movie's ducked level onto the new stream. This is the
+# real live signature of "started muted" (it wasn't muted, it was quiet at 18%).
+_STRANDED_LOW_BROWSER_SINK = (
+    'Sink Input #6804\n\tCorked: no\n\tMute: no\n'
+    '\tVolume: front-left: 11796 / 18% / -24 dB\n'
+    '\tProperties:\n\t\tapplication.name = "Chromium"\n\t\tapplication.process.id = "12345"\n'
+)
+
+
+def _audible_router(monkeypatch, sink_inputs):
+    monkeypatch.setattr(_dk.shutil, "which", lambda _: "/usr/bin/pactl")
+    calls = []
+    async def fake_pactl(*args, **k):
+        calls.append(args)
+        return (0, sink_inputs) if args[:2] == ("list", "sink-inputs") else (0, "")
+    async def fake_cmd(*args, **k):
+        return (0, "12345") if args and args[0] == "pgrep" else (1, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    monkeypatch.setattr(_dk, "_run_cmd", fake_cmd)
+    monkeypatch.setattr(_dk, "_proc_descendants", lambda pids: pids)
+    return calls
+
+
+async def test_ensure_jellyfin_sink_audible_lifts_stranded_low_on_play(monkeypatch):
+    # Fresh play (lift_volume=True): a movie born at 18% is raised to the start baseline so it isn't quiet.
+    calls = _audible_router(monkeypatch, _STRANDED_LOW_BROWSER_SINK)
+    ctx = types.SimpleNamespace(config=types.SimpleNamespace(movie_start_volume=100))
+    await _dk.ensure_jellyfin_sink_audible(ctx, lift_volume=True)
+    assert ("set-sink-input-volume", "6804", "100%") in calls
+
+
+async def test_ensure_jellyfin_sink_audible_honors_lower_baseline(monkeypatch):
+    # The "good start, not loud" lever: movie_start_volume=80 raises a stranded movie to 80, not 100.
+    calls = _audible_router(monkeypatch, _STRANDED_LOW_BROWSER_SINK)
+    ctx = types.SimpleNamespace(config=types.SimpleNamespace(movie_start_volume=80))
+    await _dk.ensure_jellyfin_sink_audible(ctx, lift_volume=True)
+    assert ("set-sink-input-volume", "6804", "80%") in calls
+
+
+async def test_ensure_jellyfin_sink_audible_does_not_lift_on_resume(monkeypatch):
+    # Resume (lift_volume default False): never stomp the live level — a movie the user set low stays low.
+    calls = _audible_router(monkeypatch, _STRANDED_LOW_BROWSER_SINK)
+    ctx = types.SimpleNamespace(config=types.SimpleNamespace(movie_start_volume=100))
+    await _dk.ensure_jellyfin_sink_audible(ctx)
+    assert not any(a and a[0] == "set-sink-input-volume" for a in calls)
+
+
+async def test_ensure_jellyfin_sink_audible_does_not_lower_a_loud_movie(monkeypatch):
+    # Already at/above baseline → no volume write (raises stranded-low only, never lowers a movie).
+    full = _STRANDED_LOW_BROWSER_SINK.replace("11796 / 18%", "65536 / 100%")
+    calls = _audible_router(monkeypatch, full)
+    ctx = types.SimpleNamespace(config=types.SimpleNamespace(movie_start_volume=100))
+    await _dk.ensure_jellyfin_sink_audible(ctx, lift_volume=True)
+    assert not any(a and a[0] == "set-sink-input-volume" for a in calls)
+
+
+async def test_ensure_jellyfin_sink_audible_duck_active_fixes_baseline_not_live(monkeypatch):
+    # A duck already owns the sink → don't raise the live ducked level (no loud blip mid-speech); instead fix
+    # the SAVED restore-baseline so the movie returns to baseline on release.
+    calls = _audible_router(monkeypatch, _STRANDED_LOW_BROWSER_SINK)
+    ctx = types.SimpleNamespace(config=types.SimpleNamespace(movie_start_volume=100))
+    _dk._state(ctx)["jellyfin_sink_prior"] = ("6804", 18)
+    await _dk.ensure_jellyfin_sink_audible(ctx, lift_volume=True)
+    assert not any(a and a[0] == "set-sink-input-volume" for a in calls)   # live level untouched
+    assert _dk._state(ctx)["jellyfin_sink_prior"] == ("6804", 100)         # restore baseline fixed
+
+
+def test_movie_start_volume_clamps():
+    from gabagent.voice.ducking import _movie_start_volume
+    mk = lambda v: types.SimpleNamespace(config=types.SimpleNamespace(movie_start_volume=v))
+    assert _movie_start_volume(mk(80)) == 80
+    assert _movie_start_volume(mk(5)) == 20      # floor — can't strand a movie inaudible
+    assert _movie_start_volume(mk(999)) == 100   # ceiling
+    assert _movie_start_volume(types.SimpleNamespace(config=types.SimpleNamespace())) == 100  # default
+
+
+# -- duck watchdog (safety net for a voice-side duck-on that never gets its off) --------------------
+
+def _fake_duck(monkeypatch):
+    calls = []
+    async def fake(ctx, on, **k):
+        calls.append(on)
+        return {"ok": True, "ducked": []}
+    monkeypatch.setattr(_dk, "duck_media", fake)
+    return calls
+
+
+def _ducked_ctx(secs, stale_secs):
+    ctx = types.SimpleNamespace(config=types.SimpleNamespace(duck_watchdog_secs=secs))
+    st = _dk._state(ctx)
+    st["duck_window_open"] = True
+    st["last_duck_refresh_mono"] = _dk.time.monotonic() - stale_secs
+    return ctx
+
+
+async def test_duck_watchdog_restores_a_stuck_duck(monkeypatch):
+    # Duck open + no refresh long past the grace → force a restore (the movie-announcement strand).
+    calls = _fake_duck(monkeypatch)
+    await _dk._duck_watchdog_check(_ducked_ctx(secs=12, stale_secs=100))
+    assert calls == [False]
+
+
+async def test_duck_watchdog_holds_when_recently_refreshed(monkeypatch):
+    # Fresh activity (dictation keeps refreshing) → a legitimate sustained hold is NOT cut.
+    calls = _fake_duck(monkeypatch)
+    await _dk._duck_watchdog_check(_ducked_ctx(secs=12, stale_secs=2))
+    assert calls == []
+
+
+async def test_duck_watchdog_noop_when_not_ducked(monkeypatch):
+    calls = _fake_duck(monkeypatch)
+    ctx = _ducked_ctx(secs=12, stale_secs=100)
+    _dk._state(ctx)["duck_window_open"] = False   # nothing ducked → nothing to restore
+    await _dk._duck_watchdog_check(ctx)
+    assert calls == []
+
+
+async def test_duck_watchdog_disabled_by_zero(monkeypatch):
+    calls = _fake_duck(monkeypatch)
+    await _dk._duck_watchdog_check(_ducked_ctx(secs=0, stale_secs=100))
+    assert calls == []
+
+
+def test_note_duck_activity_refreshes():
+    ctx = types.SimpleNamespace()
+    _dk._state(ctx)["last_duck_refresh_mono"] = None
+    _dk.note_duck_activity(ctx)
+    assert _dk._state(ctx)["last_duck_refresh_mono"] is not None
+
+
+def test_duck_watchdog_secs_clamp_and_disable():
+    mk = lambda v: types.SimpleNamespace(config=types.SimpleNamespace(duck_watchdog_secs=v))
+    assert _dk._duck_watchdog_secs(mk(12)) == 12
+    assert _dk._duck_watchdog_secs(mk(0)) == 0     # disabled
+    assert _dk._duck_watchdog_secs(mk(2)) == 5     # clamped up — can't be set absurdly tight
+    assert _dk._duck_watchdog_secs(types.SimpleNamespace(config=types.SimpleNamespace())) == 12
 
 
 async def test_duck_tidal_sink_ducks_then_restores(monkeypatch):

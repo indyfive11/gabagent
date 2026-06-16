@@ -104,26 +104,6 @@ async def test_control_no_session():
     assert not res.success and "No active" in res.error
 
 
-@respx.mock
-async def test_play_uses_existing_session_when_user_says_yes():
-    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
-        {"Id": "tv1", "SupportsRemoteControl": True, "DeviceName": "Living Room TV"},
-    ]))
-    play_route = respx.post(f"{BASE}/Sessions/tv1/Playing").mock(return_value=httpx.Response(204))
-
-    ctx = _ctx()
-    vs = VoiceSession("s", None)
-    ctx.voice_session = vs
-
-    async def emit(ev):
-        if ev.type == "confirm":
-            vs.resolve(ev.id, True)   # "yes, use the open TV"
-    ctx.voice_emit = emit
-
-    res = await jf.play(ctx, item_id="abc")
-    assert res.success and "Living Room TV" in res.output and play_route.called
-
-
 class _FakePage:
     """Stand-in for a Playwright page; `url`/password-field count drive the login check. Also models the
     HTML5 <video> the play path introspects after PlayNow (so _await_playback sees a real element):
@@ -215,32 +195,6 @@ async def test_search_strips_trailing_vocative_from_query():
 
 
 @respx.mock
-async def test_play_confirm_cancel_aborts_without_playing(monkeypatch):
-    # Wrong movie: at the "play here / new window" confirm the user cancels → abort, don't play anywhere.
-    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
-        {"Id": "c1", "SupportsRemoteControl": True, "DeviceName": "Living Room TV"}]))
-    opened = {"browser": False}
-    async def _no_browser(*a, **k):
-        opened["browser"] = True
-        return jf.ToolResult(output="opened")
-    monkeypatch.setattr(jf, "_play_in_browser", _no_browser)
-    async def _wait_for(fut, timeout=None): return (False, "cancel")   # front-end signalled cancel
-    monkeypatch.setattr(jf.asyncio, "wait_for", _wait_for)
-
-    ctx = _ctx()
-    emitted = []
-    async def emit(ev): emitted.append(ev)
-    ctx.voice_emit = emit
-    ctx.voice_session = VoiceSession("s", None)
-    res = await jf.play(ctx, item_id="abc", title="Aria")
-    # Cancel is a deliberate choice — a clean abort the model won't read as a playback failure.
-    assert res.success and "cancel" in res.output.lower()
-    assert "fail" not in res.output.lower() and "didn't" not in res.output.lower()
-    assert opened["browser"] is False                                 # cancel did NOT fall through to a new window
-    assert any(e.type == "confirm" for e in emitted)
-
-
-@respx.mock
 async def test_play_signed_in_browser_path_does_not_crash(monkeypatch):
     # Regression: `events` was imported only inside the controllable-session branch, so the browser
     # fallback raised UnboundLocalError when a voice emit was set. Signed-in page → reaches the poll.
@@ -263,11 +217,11 @@ async def test_play_signed_in_browser_path_does_not_crash(monkeypatch):
 
 
 @respx.mock
-async def test_play_web_client_skips_confirm_and_opens_owned_window(monkeypatch):
-    # An open Jellyfin WEB client (Chrome) reports SupportsRemoteControl but can't be REST-controlled, so
-    # "play there" would strand an uncontrollable movie. play() must NOT offer it / PlayNow to it — it
-    # skips the confirm and opens our owned, controllable window, naming it so the new window isn't a
-    # silent surprise. (Rob, live 2026-06-15.)
+async def test_play_always_opens_owned_window_no_confirm_no_narration(monkeypatch):
+    # play() never branches on the /Sessions list — that list usually reflects API sessions on OTHER devices
+    # (a movie in another room), not a real local client we could hand off to. So it ALWAYS opens our owned
+    # controllable window: no "play there?" confirm, no PlayNow to a detected client, and no Chrome/web
+    # narration in the spoken result — just open the movie. (Rob, 2026-06-15.)
     web_play = respx.post(f"{BASE}/Sessions/web1/Playing").mock(return_value=httpx.Response(204))
     respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
         {"Id": "web1", "SupportsRemoteControl": True, "DeviceName": "Chrome", "Client": "Jellyfin Web"},
@@ -284,11 +238,14 @@ async def test_play_web_client_skips_confirm_and_opens_owned_window(monkeypatch)
     ctx.voice_session = VoiceSession("s", None)
 
     res = await jf.play(ctx, item_id="abc", title="Hot Fuzz")
-    assert res.output                                              # opened, no crash
-    assert not any(e.type == "confirm" for e in emitted)          # web client → no "play there?" confirm
-    assert not web_play.called                                    # and NO PlayNow to the web client (no double-play)
+    assert res.output                                             # opened, no crash
+    assert not any(e.type == "confirm" for e in emitted)         # never asks "play there?"
+    assert not web_play.called                                   # never PlayNows a detected client
+    # no Chrome/web bypass narration in the spoken result — just open the movie
+    assert "chrome" not in (res.output or "").lower()
+    assert "controllable window" not in (res.output or "").lower()
     status = next((e for e in emitted if e.type == "status"), None)
-    assert status is not None and "controllable window" in status.text   # caveat (b): narrated
+    assert status is not None and "player" in status.text.lower()   # plain "Opening the player…"
 
 
 # -- browser-path control via Playwright (web client ignores remote-control API) ----
@@ -408,12 +365,28 @@ async def test_browser_control_close_closes_owned_page():
 
 
 @respx.mock
-async def test_close_warns_when_another_unowned_session_still_playing():
+async def test_close_does_not_volunteer_other_session_by_default():
+    # SOP (jellyfin.announce_other_sessions default OFF): close reports what it did and does NOT volunteer
+    # that a different unowned session is still playing. (Rob's saved memory rule, 2026-06-15.)
     respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
         {"Id": "x", "NowPlayingItem": {"Name": "The Matrix"}, "PlayState": {"IsPaused": False}},
     ]))
     page = _FakePlayPage()
     ctx = _ctx(); ctx.jellyfin_playing_page = page; ctx.jellyfin_playing_title = "You Only Live Twice"
+    r = await jf.control(ctx, action="close")
+    assert r.success and "closed" in r.output.lower()
+    assert "another" not in r.output.lower() and "still playing" not in r.output.lower()
+
+
+@respx.mock
+async def test_close_warns_when_announce_other_sessions_enabled():
+    # Opt-in restores the old "…but another is still playing" honesty notice.
+    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
+        {"Id": "x", "NowPlayingItem": {"Name": "The Matrix"}, "PlayState": {"IsPaused": False}},
+    ]))
+    page = _FakePlayPage()
+    ctx = _ctx(announce_other_sessions=True)
+    ctx.jellyfin_playing_page = page; ctx.jellyfin_playing_title = "You Only Live Twice"
     r = await jf.control(ctx, action="close")
     assert r.success and "another Jellyfin is still playing" in r.output
 
@@ -597,7 +570,6 @@ async def test_play_auto_fullscreens_on_play(monkeypatch):
     # A movie that starts in a window we own is put full screen automatically (the default), and the
     # fullscreen outcome is folded into the result so the spoken confirmation is grounded.
     respx.get(f"{BASE}/Sessions").mock(side_effect=[
-        httpx.Response(200, json=[]),                                       # play(): controllable check
         httpx.Response(200, json=[]),                                       # _play_in_browser: `before`
         httpx.Response(200, json=[{"Id": "web1", "Client": "Jellyfin Web"}]),  # poll: new web session
     ])
@@ -624,9 +596,8 @@ async def test_play_is_honest_when_player_never_comes_up(monkeypatch):
     # PlayNow succeeded at the API level but the <video> never mounted (still on the library): don't
     # claim it's playing, and don't fullscreen the bare library.
     respx.get(f"{BASE}/Sessions").mock(side_effect=[
-        httpx.Response(200, json=[]),
-        httpx.Response(200, json=[]),
-        httpx.Response(200, json=[{"Id": "web1", "Client": "Jellyfin Web"}]),
+        httpx.Response(200, json=[]),                                          # _play_in_browser: `before`
+        httpx.Response(200, json=[{"Id": "web1", "Client": "Jellyfin Web"}]),  # poll: new web session
     ])
     respx.post(f"{BASE}/Sessions/web1/Playing").mock(return_value=httpx.Response(204))
     monkeypatch.setattr(jf, "_PLAY_POLL_TRIES", 1)
@@ -805,27 +776,6 @@ async def test_inject_auth_seeds_localstorage(monkeypatch):
 
 
 @respx.mock
-async def test_play_confirm_dedups_identical_device_names():
-    """Two browser windows both named 'Chrome' must read as 'your open Chrome', not 'Chrome or Chrome'."""
-    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
-        {"Id": "c1", "SupportsRemoteControl": True, "DeviceName": "Chrome"},
-        {"Id": "c2", "SupportsRemoteControl": True, "DeviceName": "Chrome"},
-    ]))
-    respx.post(f"{BASE}/Sessions/c1/Playing").mock(return_value=httpx.Response(204))
-    ctx = _ctx()
-    vs = VoiceSession("s", None)
-    ctx.voice_session = vs
-    seen = {}
-    async def emit(ev):
-        if ev.type == "confirm":
-            seen["text"] = ev.summary
-            vs.resolve(ev.id, True)
-    ctx.voice_emit = emit
-    await jf.play(ctx, item_id="abc")
-    assert "Chrome or Chrome" not in seen["text"]
-    assert seen["text"].count("Chrome") == 1
-
-
 def test_now_playing_command_published():
     cmds = {c.id for c in jf.PROVIDER.commands(_ctx())}
     assert "jellyfin.now_playing" in cmds            # real command (model used to invent this id)
@@ -863,22 +813,6 @@ async def test_now_playing_summarizes_all_devices():
     assert "Living Room TV: Playing — Dune (10:00 of 1:00:00)" in res.output
     assert "Bedroom: Paused — Edge of Tomorrow" in res.output
     assert "Idle Phone" not in res.output           # nothing playing there
-
-
-@respx.mock
-async def test_play_existing_session_stores_title_for_window_targeting():
-    respx.get(f"{BASE}/Sessions").mock(return_value=httpx.Response(200, json=[
-        {"Id": "tv1", "SupportsRemoteControl": True, "DeviceName": "Chrome"},
-    ]))
-    respx.post(f"{BASE}/Sessions/tv1/Playing").mock(return_value=httpx.Response(204))
-    ctx = _ctx()
-    vs = VoiceSession("s", None); ctx.voice_session = vs
-    async def emit(ev):
-        if ev.type == "confirm": vs.resolve(ev.id, True)   # yes, use the open Chrome (unowned)
-    ctx.voice_emit = emit
-    res = await jf.play(ctx, item_id="abc", title="12 Angry Men")
-    assert res.success
-    assert ctx.jellyfin_playing_title == "12 Angry Men"   # stored so window-ops can target the window
 
 
 @respx.mock

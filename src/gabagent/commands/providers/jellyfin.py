@@ -7,7 +7,6 @@ import asyncio
 import json
 import re
 from typing import TYPE_CHECKING
-from uuid import uuid4
 
 import httpx
 
@@ -56,10 +55,6 @@ def _fmt_hms(secs: int) -> str:
         parts.append(f"{s} second" + ("s" if s != 1 else ""))
     return " ".join(parts) or "the start"
 
-
-# The user can cancel the "play here / new window" confirm outright (wrong movie). The voice front-end
-# signals it through the existing confirm `passphrase` field, so this needs no new protocol surface.
-_CONFIRM_CANCEL = {"cancel", "cancelled", "canceled", "__cancel__"}
 
 # The wake vocative is the assistant's name; a leading/trailing "Aria"/"Arya" in a play/search request is the
 # user addressing the assistant, NOT part of the movie title (live: "play the movie Aria" → searched "Aria").
@@ -515,65 +510,21 @@ async def _rest_seek_to(jc, session, secs: int) -> ToolResult:
 
 async def play(ctx, item_id="", title="", position=None) -> ToolResult:
     # `title` is carried for the spoken confirmation only; playback uses item_id.
-    from gabagent.voice import events  # used by both the surface-confirm and the browser path
+    from gabagent.voice import events
     jc = ctx.config.jellyfin
     if not item_id:
         return ToolResult(output="", error="no item to play")
     start_secs = _coerce_secs(position)            # optional "start N seconds in"
     emit = getattr(ctx, "voice_emit", None)
-    vs = getattr(ctx, "voice_session", None)
 
-    sessions = await _sessions(jc)
-    # Only offer "play there" for a client we can actually CONTROL afterward. A web client (e.g. the user's
-    # own Chrome) reports SupportsRemoteControl but IGNORES REST control — it 204-noops pause/stop (the
-    # upstream lie, see _is_web_client) — so "play there" would strand a movie we can't stop by voice (Rob
-    # hit this live 2026-06-15: played Hot Fuzz in his Chrome, then couldn't stop it). Exclude web clients
-    # and open our OWNED window instead, which we drive via the <video> element → controllable.
-    controllable = [s for s in sessions
-                    if s.get("SupportsRemoteControl") and s.get("DeviceName") and not _is_web_client(s)]
-    # An open-but-WEB client we're deliberately bypassing → narrate the new window so it isn't a silent
-    # surprise (a second window appearing wordlessly reads as a glitch).
-    bypassing_web = any(_is_web_client(s) for s in sessions
-                        if s.get("SupportsRemoteControl") and s.get("DeviceName"))
-
-    # Ask-if-ambiguous: a CONTROLLABLE client is already open — use it, or open a new window?
-    if controllable and vs is not None and emit is not None:
-        # Dedup identical device names so two browser windows don't read as "Chrome or Chrome".
-        names = " or ".join(dict.fromkeys(s.get("DeviceName", "a device") for s in controllable))
-        what = f"{title} " if title else ""
-        cid = uuid4().hex
-        fut = vs.new_confirm(cid)
-        # This confirm carries its own choice (yes=use it / no=new window), so it's a
-        # complete spoken line — the client must not append the standard yes/no tail.
-        await emit(events.confirm(
-            cid, 2, "spoken_yesno",
-            f"Play {what}on your open {names}? Say yes to play there, no to open a new window, "
-            "or cancel if it's the wrong one.",
-            "", prompt_complete=True))
-        try:
-            approved, choice = await asyncio.wait_for(fut, timeout=60)
-        except Exception:
-            approved, choice = False, None
-        # A third outcome: the user cancels (wrong movie). The front-end signals it via the confirm
-        # passphrase field — abort entirely instead of falling through to a new-window play.
-        if (choice or "").strip().lower() in _CONFIRM_CANCEL:
-            # Deliberate user cancel — frame it as a completed choice, not a failure, or the model
-            # editorializes it into "playback didn't start, want me to retry?" (live 2026-06-15).
-            return ToolResult(output="Okay, cancelled — what would you like to watch instead?")
-        if approved:
-            res = await _play_to_session(jc, controllable[0]["Id"], item_id,
-                                         controllable[0].get("DeviceName", "your client"), start_secs)
-            if res.success and title:
-                # Remember the title even though we DON'T own this page (existing Chrome): it's the only
-                # handle window-ops have to target the movie window by caption (vs. the active window).
-                ctx.jellyfin_playing_title = title
-            return res
-
+    # ALWAYS open OUR controllable window. We deliberately do NOT branch on the Jellyfin /Sessions list to
+    # offer "play there?": that list usually reflects API sessions on OTHER devices (a movie playing in
+    # another room), not a real local client we could hand off to here — so the old confirm fired on
+    # phantom/remote clients and was misleading. A web client also can't be REST-controlled anyway. So a play
+    # here just opens the window we own and can drive (via the <video> element), with no narration. Routing a
+    # play to another device ("play it on the bedroom TV") is the deferred whole-home roadmap, not this path.
     if emit:
-        # Narrate before the slow launch; name it a "controllable window" when we're bypassing an open
-        # web client so the user knows why a fresh window is appearing.
-        await emit(events.status(
-            "Opening a controllable window…" if bypassing_web else "Opening the player…"))
+        await emit(events.status("Opening the player…"))
     res = await _play_in_browser(ctx, jc, item_id, title, start_secs)
     if res.success and title:
         ctx.jellyfin_playing_title = title
@@ -662,6 +613,12 @@ async def _play_in_browser(ctx, jc, item_id, title="", start_secs: int | None = 
         dlog(ctx, "playback", has_video=pb["has_video"], paused=pb["paused"],
              started=pb["started"], nudged=pb["nudged"], t=pb["t"], ready=pb["ready"],
              muted=pb["muted"], vol=pb["vol"])
+        # Make the sink-input audible at two layers the <video> reset can't reach: clear a stranded MUTE flag,
+        # AND un-strand a LOW volume — PipeWire stream-restore replays the prior movie's ducked level (~18%)
+        # onto the new stream, so a fresh movie plays quiet at full <video>.volume. lift_volume=True raises it
+        # to the start baseline (movie_start_volume). Runs once playback is up.
+        from gabagent.voice.ducking import ensure_jellyfin_sink_audible
+        await ensure_jellyfin_sink_audible(ctx, lift_volume=True)
         if not pb["started"]:
             # Don't claim it's playing when the element says otherwise.
             result = ToolResult(output=(
@@ -875,10 +832,12 @@ async def _browser_control(ctx, page, action, position: int | None = None) -> To
             ctx.jellyfin_playing_page = None
             ctx.jellyfin_paused = False
             ctx.jellyfin_playing_title = None
-            # Honesty: I only closed the window I opened. If a DIFFERENT (unowned) Jellyfin session is
-            # still playing, say so rather than implying everything stopped (a real live miss — Rob heard
-            # "closed" while a separate Chrome kept playing).
-            if await _other_session_playing(ctx.config.jellyfin, exclude_title=closed_title):
+            # Per the user's SOP (config jellyfin.announce_other_sessions, default OFF): do NOT volunteer that
+            # a DIFFERENT (unowned/other-device) Jellyfin session is still playing — close just reports what it
+            # did. The on-demand jellyfin.now_playing is the explicit "is anything playing elsewhere?" path.
+            # (Opt back in to restore the old "…but another is still playing" honesty notice.)
+            if getattr(ctx.config.jellyfin, "announce_other_sessions", False) \
+                    and await _other_session_playing(ctx.config.jellyfin, exclude_title=closed_title):
                 return ToolResult(output="I closed the window I opened, but another Jellyfin is still playing.")
             return ToolResult(output="Closed the movie window.")
         if action in ("volume_up", "volume_down"):
@@ -919,15 +878,19 @@ async def _browser_control(ctx, page, action, position: int | None = None) -> To
             ctx.jellyfin_paused = True
             return ToolResult(output="Paused the movie.")
         if action == "resume":
+            from gabagent.voice.ducking import ensure_jellyfin_sink_audible
             if cur is False:
                 ctx.jellyfin_paused = False
                 await _ensure_video_audible(ctx, page, where="resume_already")
+                await ensure_jellyfin_sink_audible(ctx)
                 return ToolResult(output="It's already playing.")
             await page.keyboard.press("Space")
             ctx.jellyfin_paused = False
             # A resume can come back muted/silent (autoplay policy) while the sink is fine — unmute the
-            # element so audio actually returns, instead of leaving Rob with a silent movie.
+            # element so audio actually returns, instead of leaving Rob with a silent movie. Also clear a
+            # stranded sink-input mute (a separate layer the element unmute can't reach).
             await _ensure_video_audible(ctx, page, where="resume")
+            await ensure_jellyfin_sink_audible(ctx)
             return ToolResult(output="Resumed the movie.")
         return ToolResult(output="", error=f"unknown action: {action}")
     except Exception as e:

@@ -91,6 +91,12 @@ class JellyfinConfig(BaseModel):
     rating_threshold: float = 7.0         # default minimum CommunityRating (IMDb 0–10)
     username: str = ""                    # optional: hands-free web-player auto-auth (plaintext — opt-in)
     password: str = ""
+    # Encodes the user's SOP "never mention other Jellyfin sessions/players unless I explicitly ask." When
+    # False (default), actions like close just report what they did and DON'T volunteer that a different
+    # (unowned/other-device) session is still playing — the on-demand `jellyfin.now_playing` is the explicit
+    # "is anything playing elsewhere?" path. Flip True to restore the volunteered "…but another is still
+    # playing" notice. Env: GABAI_JELLYFIN__ANNOUNCE_OTHER_SESSIONS.
+    announce_other_sessions: bool = False
 
 
 class TidalConfig(BaseModel):
@@ -180,6 +186,22 @@ class GabAgentConfig(BaseSettings):
     # asides). 0 disables. The voice side caps it with its own max-hold ceiling so a missed refresh
     # self-heals. Env: GABAI_MEDIA_KEEPALIVE_SECS.
     media_keepalive_secs: int = 30
+    # The sink-input % a freshly-played Jellyfin movie should start at. 100 = neutral (no per-stream
+    # attenuation; the device/player volume governs actual loudness) — NOT "loud". This un-strands the
+    # movie-starts-quiet bug: PipeWire's stream-restore replays the PRIOR movie's ducked/low level (e.g. 18%,
+    # the duck floor) onto the new stream, and resetting <video>.volume can't reach that sink layer. Lower it
+    # (e.g. 80) to make movies start gentler — a fresh-start baseline, never carried over from the last movie.
+    # Applied on play only (resume keeps the level you set); only raises a stranded-LOW sink, never lowers one.
+    # Clamped to [20, 100] so a bad value can't strand a movie inaudible. Env: GABAI_MOVIE_START_VOLUME.
+    movie_start_volume: int = 100
+    # Duck watchdog: a brain-side safety net against a stuck duck — if media stays ducked this many seconds
+    # with NO voice activity to refresh it (no /media/duck on, no incoming utterance), auto-restore. Catches a
+    # brain↔voice desync where the voice side opens a duck (e.g. for a movie-title announcement) but never
+    # sends the matching off, stranding the movie at the duck floor in silence. Refreshed by every duck-on AND
+    # every incoming voice turn, so it never fires during a legitimate sustained hold (dictation keeps it
+    # alive). Ticks on the existing ~1 Hz /media/state poll — no background task. 0 disables. Keep it above the
+    # longest bot announcement so a long title read isn't cut. Env: GABAI_DUCK_WATCHDOG_SECS.
+    duck_watchdog_secs: int = 12
     # This machine's friendly name, used to tag media sources as LOCAL vs on another device/room (e.g.
     # "EndeavorMain"). Empty → defaults to the hostname at use. The brain only AUTO-ducks/controls media it
     # judges local to this device; remote sources are visible (for future explicit control) but never touched

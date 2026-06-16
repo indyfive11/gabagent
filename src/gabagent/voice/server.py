@@ -66,6 +66,10 @@ def build_app(ctx: AgentContext):
         from gabagent.voice.debuglog import dlog
         busy = _busy(vs)
         dlog(ctx, "respond_recv", session=sid, words=len(text.split()), busy=busy)
+        # Any incoming utterance (addressed or aside) refreshes the duck watchdog, so a legitimate sustained
+        # hold during dictation is never auto-restored — only genuine silence after an unreleased duck is.
+        from gabagent.voice.ducking import note_duck_activity
+        note_duck_activity(ctx)
         if busy:
             return JSONResponse(
                 {"error": "a turn is already in progress for this session"}, status_code=409
