@@ -305,6 +305,29 @@ async def _local(arg: str, ctx: AgentContext) -> None:
 
     sub = arg.strip().lower() or ("off" if ctx.local_mode else "on")
 
+    # Cross-backend ladder: make local the warm FLOOR rung (router still escalates to Aria → Claude),
+    # or drop it back to Aria as the floor. Distinct from the exclusive "on"/"off" local_mode below.
+    if sub == "floor":
+        from gabagent.local.ollama import start_local_floor
+        console.print("[dim]Warming local as the floor rung… (ROCm GPU init takes ~30s)[/dim]", markup=True)
+        err = await start_local_floor(ctx)
+        if err:
+            console.print(f"[error]Could not start local floor: {err}[/error]", markup=True)
+            return
+        console.print(
+            f"[gab.accent]◆[/gab.accent] [dim]Local floor ON — {ctx.config.local_model} → Aria → Claude[/dim]",
+            markup=True,
+        )
+        return
+    if sub == "aria":
+        from gabagent.local.ollama import stop_local_floor
+        await stop_local_floor(ctx)
+        console.print(
+            "[gab.accent]◆[/gab.accent] [dim]Floor → Aria (local unloaded, VRAM freed)[/dim]",
+            markup=True,
+        )
+        return
+
     if sub == "on" and not ctx.local_mode:
         from gabagent.local.ollama import ensure_ollama_running
         from gabagent.api.client import GabAIClient

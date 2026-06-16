@@ -27,11 +27,16 @@ class AgentContext:
     token_estimate: int = 0
     active_model: str | None = None
     active_effort: str | None = None  # thinking effort for the current turn (Claude provider)
+    active_backend: str | None = None  # backend serving the current turn: "claude" | "gab" | "local"
     force_model: bool = False
     local_client: Any = field(default=None)
     local_mode: bool = False
     local_process: Any = field(default=None)
     local_context_summary: str | None = None
+    local_floor: bool = False  # local is the persisted warm bottom rung (mirrors config.local_floor)
+    # Lazily-built per-backend clients keyed "gab" | "claude" | "local", for the cross-backend
+    # escalation ladder. `client`/`local_client` remain for back-compat and the exclusive local_mode.
+    clients: dict[str, Any] = field(default_factory=dict)
     # Voice mode (all inert for TUI sessions).
     voice_mode: bool = False
     approval_hook: Any = field(default=None)  # async (tool_name, args, ctx) -> bool

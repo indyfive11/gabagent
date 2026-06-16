@@ -33,13 +33,82 @@ User request: {prompt}"""
 
 
 class ModelRouter:
-    def __init__(self, config: GabAgentConfig) -> None:
+    def __init__(
+        self,
+        config: GabAgentConfig,
+        *,
+        ladder: list[Rung] | None = None,
+        classifier_model: str | None = None,
+        classifier_effort: str | None = None,
+        classifier_backend: str = "claude",
+        assembled: bool = False,
+    ) -> None:
         self.enabled = config.router.enabled
         self.classifier_enabled = config.router.classifier_enabled
         self.simple_model = config.router.simple_model
         self.complex_model = config.router.complex_model
         self.provider = config.provider
-        self.ladder: list[Rung] = list(config.claude.ladder)
+        # Default (back-compat): the raw Claude-only ladder, classified on its bottom rung. The
+        # cross-backend assembled ladder is opt-in via ModelRouter.assemble(...).
+        self.ladder: list[Rung] = ladder if ladder is not None else list(config.claude.ladder)
+        self.assembled = assembled
+        b0 = self.ladder[0] if self.ladder else None
+        self.classifier_model = classifier_model or (b0.model if b0 else self.simple_model)
+        self.classifier_effort = (
+            classifier_effort if classifier_effort is not None else (b0.effort if b0 else "")
+        )
+        self.classifier_backend = classifier_backend
+
+    @classmethod
+    def assemble(
+        cls,
+        config: GabAgentConfig,
+        *,
+        local_floor: bool = False,
+        local_running: bool = False,
+    ) -> "ModelRouter | None":
+        """Build a UNIFIED cross-backend ladder: [local? → Aria(gab)? → Claude rungs?].
+
+        Returns None when assembly adds nothing over the legacy provider path (no local floor and
+        no real Anthropic rungs) — the caller then falls through to today's per-provider routing.
+        The classifier is pinned to a fixed cheap CLOUD model (haiku if Anthropic is configured,
+        else Aria) so it never runs on the unreliable local rung.
+        """
+        from gabagent.api.factory import anthropic_configured
+        from gabagent.config.models import Rung
+
+        include_local = bool(local_floor and local_running and config.local_model)
+        include_gab = bool(config.api_key)  # Aria reachable on gab.ai
+        include_claude = anthropic_configured(config) and (
+            config.router.cross_backend or config.provider == "claude"
+        )
+        # Assembly only earns its keep when there's a rung below Aria (local) or above it (Claude).
+        if not (include_local or include_claude):
+            return None
+
+        rungs: list[Rung] = []
+        if include_local:
+            rungs.append(Rung(model=config.local_model, effort="", backend="local"))
+        if include_gab:
+            rungs.append(Rung(model=config.router.simple_model, effort="", backend="gab"))
+        if include_claude:
+            rungs.extend(config.claude.ladder)  # each already backend="claude"
+        if not rungs:  # defensive — should not happen given the guard above
+            return None
+
+        if include_claude:
+            c0 = config.claude.ladder[0]
+            cmodel, ceffort, cbackend = c0.model, c0.effort, "claude"
+        else:
+            cmodel, ceffort, cbackend = config.router.simple_model, "", "gab"
+        return cls(
+            config,
+            ladder=rungs,
+            classifier_model=cmodel,
+            classifier_effort=ceffort,
+            classifier_backend=cbackend,
+            assembled=True,
+        )
 
     # -- gab 2-tier path (unchanged) ---------------------------------------
 
@@ -76,12 +145,14 @@ class ModelRouter:
         mid_lines = "\n".join(
             f"{i} — increasingly hard" for i in range(3, top)
         ) if top > 3 else ""
-        bottom = self.ladder[0]
         try:
             messages = [ChatMessage(role="user", content=_RUNG_PROMPT.format(
                 top=top, mid_lines=mid_lines, prompt=prompt,
             ))]
-            reply = await client.complete_simple(messages, model=bottom.model, effort=bottom.effort or None)
+            # Classify on a fixed cheap CLOUD model (never the local floor rung).
+            reply = await client.complete_simple(
+                messages, model=self.classifier_model, effort=self.classifier_effort or None
+            )
             idx = _first_int(reply)
             if idx is None:
                 idx = min(1, top)  # ambiguous → one rung up from bottom

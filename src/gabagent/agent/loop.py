@@ -25,11 +25,34 @@ _LOCAL_SYSTEM = (
 _LOCAL_CONTEXT_WINDOW = 10  # number of recent non-system messages sent to local model
 
 
-def _active_client(ctx: AgentContext):
-    """Return local client when local mode is on, otherwise primary."""
-    if ctx.local_mode and ctx.local_client is not None:
+def _active_client(ctx: AgentContext, backend: str | None = None):
+    """Resolve the client for a ladder backend ("claude"|"gab"|"local"), lazily building and
+    caching it on ctx.clients for the cross-backend escalation ladder.
+
+    With no backend (back-compat), return the exclusive local client in local_mode else primary.
+    Reuses ctx.client when it already IS the requested backend's client, and ctx.local_client for
+    the local rung, so a session holds at most one connection per backend.
+    """
+    if backend is None:
+        if ctx.local_mode and ctx.local_client is not None:
+            return ctx.local_client
+        return ctx.client
+    cached = ctx.clients.get(backend)
+    if cached is not None:
+        return cached
+    if backend == "local" and ctx.local_client is not None:
+        ctx.clients["local"] = ctx.local_client
         return ctx.local_client
-    return ctx.client
+    if backend == ctx.config.provider and not ctx.local_mode:
+        ctx.clients[backend] = ctx.client            # primary already serves this backend
+        return ctx.client
+    from gabagent.api.factory import build_client_for
+    keep_alive = "-1" if (backend == "local" and ctx.local_floor) else "1m"
+    client = build_client_for(backend, ctx.config, ctx.rate_limiter, keep_alive=keep_alive)
+    if client is None:
+        return ctx.client                            # defensive: backend unconfigured
+    ctx.clients[backend] = client
+    return client
 
 _TOOL_KEEP_RECENT = 6    # keep last N tool results in full
 _TOOL_TRIM_CHARS = 400   # trim older ones to this many chars
@@ -138,7 +161,11 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
     if not ctx.force_model and ctx.config.router.enabled:
         try:
             from gabagent.agent.router import ModelRouter
-            router = ModelRouter(ctx.config)
+            router = ModelRouter.assemble(
+                ctx.config,
+                local_floor=ctx.local_floor,
+                local_running=ctx.local_client is not None,
+            ) or ModelRouter(ctx.config)
         except Exception:
             pass
 
@@ -184,6 +211,7 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
         if _force_input or (not initial_prompt and _last_role not in ("user", "tool")):
             _force_input = False
             ctx.active_model = None  # reset only when starting a new user turn
+            ctx.active_backend = None
             if not ctx.headless:
                 from gabagent.tui.input_handler import InputHandler
                 handler = InputHandler(vim_mode=ctx.config.vim_mode)
@@ -222,7 +250,27 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
 
         messages = ctx.session.messages()
 
-        if ctx.local_mode:
+        # Intent-based routing — BEFORE message-building so a local-rung turn gets the short
+        # local context. Only on fresh user turns, not tool continuations; skipped in exclusive
+        # local mode (routing arya↔Claude doesn't apply there).
+        if router and _last_role == "user" and ctx.active_model is None and not ctx.local_mode:
+            last_user = next(
+                (m.content for m in reversed(messages) if m.role == "user" and m.content),
+                "",
+            )
+            if router.assembled:
+                idx = await router.classify_rung(last_user, _active_client(ctx, router.classifier_backend))
+                rung = router.rung(idx)
+                ctx.active_model, ctx.active_effort, ctx.active_backend = rung.model, rung.effort or None, rung.backend
+            elif ctx.config.provider == "claude":
+                rung = router.rung(await router.classify_rung(last_user, ctx.client))
+                ctx.active_model, ctx.active_effort, ctx.active_backend = rung.model, rung.effort or None, "claude"
+            else:
+                ctx.active_model = await router.classify_intent(last_user, ctx.client)
+                ctx.active_backend = "gab"
+
+        local_turn = ctx.local_mode or ctx.active_backend == "local"
+        if local_turn:
             # Send only: minimal local system prompt + arya briefing + last N messages.
             # This keeps the local model's input small so time-to-first-token stays fast.
             local_sys = _LOCAL_SYSTEM + f"\n\nWorking directory: {ctx.cwd}"
@@ -266,20 +314,6 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
             thinking.set_state("THINKING")
             thinking.start()
 
-        # Intent-based routing — only on fresh user turns, not tool continuations.
-        # Skip entirely in local mode; routing arya↔sonnet doesn't apply there.
-        if router and _last_role == "user" and ctx.active_model is None and not ctx.local_mode:
-            last_user = next(
-                (m.content for m in reversed(messages) if m.role == "user" and m.content),
-                "",
-            )
-            if ctx.config.provider == "claude":
-                rung = router.rung(await router.classify_rung(last_user, ctx.client))
-                ctx.active_model = rung.model
-                ctx.active_effort = rung.effort or None
-            else:
-                ctx.active_model = await router.classify_intent(last_user, ctx.client)
-
         tools = registry.get_schemas()
 
         text_buf = ""
@@ -290,7 +324,7 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
             request_model = None if ctx.local_mode else ctx.active_model
             request_effort = None if ctx.local_mode else ctx.active_effort
             streaming.start(model=display_model)
-            async for chunk in _active_client(ctx).stream_complete(
+            async for chunk in _active_client(ctx, ctx.active_backend).stream_complete(
                 all_messages, tools or None, model=request_model, effort=request_effort
             ):
                 if isinstance(chunk, str):
@@ -303,7 +337,7 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
             tool_calls = [tc for tc in tool_calls if tc.name]
             # Local models that reject tool schemas (e.g. deepseek-r1 via Ollama) output
             # tool calls as JSON text. Parse them from the accumulated buffer.
-            if ctx.local_mode and not tool_calls and text_buf:
+            if local_turn and not tool_calls and text_buf:
                 from gabagent.api.client import _extract_text_tool_calls
                 prose, parsed = _extract_text_tool_calls(text_buf)
                 if parsed:
@@ -411,13 +445,14 @@ async def _execute_tool_calls(
 
         # Tool-triggered escalation
         if router and not ctx.force_model:
-            if ctx.config.provider == "claude":
+            if router.assembled or ctx.config.provider == "claude":
                 floor = router.reactive_min_rung(tc.name)
                 if floor is not None:
                     rung = router.rung(floor)
                     if rung.model != ctx.active_model or (rung.effort or None) != ctx.active_effort:
                         ctx.active_model = rung.model
                         ctx.active_effort = rung.effort or None
+                        ctx.active_backend = rung.backend
                         if not getattr(ctx, "voice_mode", False):
                             eff = f"/{rung.effort}" if rung.effort else ""
                             console.print(

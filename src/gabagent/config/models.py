@@ -40,6 +40,11 @@ class RouterConfig(BaseModel):
     classifier_enabled: bool = True
     simple_model: str = "arya"
     complex_model: str = "claude-sonnet-4-5"
+    # When True, the per-session ladder is assembled ACROSS backends (local → Aria → Claude rungs)
+    # so a turn can climb from the cheap floor into the real Anthropic ladder regardless of the
+    # `provider` setting, as long as an Anthropic key exists. Flip False to restore the old
+    # provider-scoped behavior (the Claude rungs are only reachable on provider="claude").
+    cross_backend: bool = True
 
 
 class Rung(BaseModel):
@@ -48,9 +53,14 @@ class Rung(BaseModel):
     `effort=""` means plain / no thinking (the bottom-rung haiku default — effort and
     adaptive thinking 400 on Haiku 4.5). Otherwise one of low|medium|high|max, applied
     only to models that support it (opus/sonnet).
+
+    `backend` names which client serves this rung — "claude" (Anthropic), "gab" (Aria on
+    gab.ai), or "local" (Ollama). The persisted `claude.ladder` rungs are all "claude"; the
+    local/Aria floor rungs are assembled at runtime by the router (see ModelRouter).
     """
     model: str
     effort: str = ""
+    backend: str = "claude"
 
 
 def _default_ladder() -> list[Rung]:
@@ -150,6 +160,11 @@ class GabAgentConfig(BaseSettings):
     load_global_claude_md: bool = False
     local_base_url: str = "http://localhost:11434/v1"
     local_model: str = ""
+    # When True, the local Ollama model is the persisted BOTTOM RUNG of the escalation ladder
+    # (the warm floor): trivial turns run on it, harder turns climb to Aria → Claude. When False,
+    # Aria is the floor and local is off. Distinct from the ephemeral `local_mode` (exclusive
+    # local, router off). Toggled by "/local floor" | "/local aria" and the voice floor commands.
+    local_floor: bool = False
     # Voice mode (gab --voice-serve). Empty voice_model ⇒ normal router (arya base,
     # escalate to Claude); a non-empty voice_model pins that single model.
     voice_model: str = ""

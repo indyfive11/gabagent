@@ -294,6 +294,20 @@ async def _handle_meta(ctx: AgentContext, mc: commands.MetaCommand, emit) -> Non
             await emit(events.status(commands.filler("to_cloud", ctx)))
             await commands.switch_to_cloud(ctx)
             await emit(events.token("Okay, back on the cloud brain."))
+    elif mc.kind == "floor":
+        if mc.value == "local":
+            await emit(events.status(commands.filler("to_local", ctx)))
+            from gabagent.local.ollama import start_local_floor
+            err = await start_local_floor(ctx)
+            if err:
+                await emit(events.token(f"I couldn't bring local up as the floor: {err}."))
+            else:
+                await emit(events.token(
+                    f"Local's the floor now — {ctx.config.local_model}, escalating to Aria and Claude as needed."))
+        else:
+            from gabagent.local.ollama import stop_local_floor
+            await stop_local_floor(ctx)
+            await emit(events.token("Aria's the floor now — local's unloaded."))
     elif mc.kind == "quiet":
         # "Shut up / be quiet": the brain can't mute or sleep itself (the voice layer owns that), so
         # answer with ONE short pointer instead of routing to the model — a terse line ends fast and,
@@ -347,36 +361,55 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
 
         ctx.session.append_message(ChatMessage(role="user", content=user_text))
 
+        ctx.active_backend = None
         router = None
         if not ctx.force_model and not ctx.local_mode and ctx.config.router.enabled:
             from gabagent.agent.router import ModelRouter
-            router = ModelRouter(ctx.config)
+            router = ModelRouter.assemble(
+                ctx.config,
+                local_floor=ctx.local_floor,
+                local_running=ctx.local_client is not None,
+            ) or ModelRouter(ctx.config)
 
+        assembled = bool(router and router.assembled)
         is_claude = ctx.config.provider == "claude"
-        # Baseline "cheap" rung for this provider: arya on gab, the bottom ladder rung on Claude.
-        simple = ctx.config.claude.ladder[0].model if is_claude else ctx.config.router.simple_model
-        simple_effort = (ctx.config.claude.ladder[0].effort or None) if is_claude else None
+        # Baseline FLOOR rung for this turn. Assembled: ladder[0] (local if running, else Aria).
+        # Legacy: arya on gab, the bottom Claude rung on the claude provider.
+        if assembled:
+            floor = router.ladder[0]
+            simple, simple_effort, simple_backend = floor.model, floor.effort or None, floor.backend
+        else:
+            simple = ctx.config.claude.ladder[0].model if is_claude else ctx.config.router.simple_model
+            simple_effort = (ctx.config.claude.ladder[0].effort or None) if is_claude else None
+            simple_backend = "claude" if is_claude else "gab"
         if router:
-            # Re-evaluate routing EACH turn so simple follow-ups drop back to the cheap rung instead of
-            # pinning the whole session to the premium model. Obvious-simple utterances skip the
-            # classifier's API round-trip; only substantive prompts pay for classification.
+            # Re-evaluate routing EACH turn so simple follow-ups drop back to the cheap floor instead of
+            # pinning the session to a premium rung. Obvious-simple utterances skip the classifier.
             if _looks_simple(user_text):
-                ctx.active_model = simple
-                ctx.active_effort = simple_effort
+                ctx.active_model, ctx.active_effort, ctx.active_backend = simple, simple_effort, simple_backend
+            elif assembled:
+                try:
+                    rung = router.rung(await router.classify_rung(
+                        user_text, _active_client(ctx, router.classifier_backend)))
+                    ctx.active_model, ctx.active_effort, ctx.active_backend = (
+                        rung.model, rung.effort or None, rung.backend)
+                except Exception:
+                    ctx.active_model, ctx.active_effort, ctx.active_backend = simple, simple_effort, simple_backend
             elif is_claude:
                 try:
                     rung = router.rung(await router.classify_rung(user_text, _active_client(ctx)))
-                    ctx.active_model = rung.model
-                    ctx.active_effort = rung.effort or None
+                    ctx.active_model, ctx.active_effort, ctx.active_backend = (
+                        rung.model, rung.effort or None, "claude")
                 except Exception:
-                    ctx.active_model = simple
-                    ctx.active_effort = simple_effort
+                    ctx.active_model, ctx.active_effort, ctx.active_backend = simple, simple_effort, "claude"
             else:
                 try:
                     ctx.active_model = await router.classify_intent(user_text, _active_client(ctx))
                 except Exception:
                     ctx.active_model = simple
-            dlog(ctx, "route", active=ctx.active_model, effort=ctx.active_effort, via="intent_classify")
+                ctx.active_backend = "gab"
+            dlog(ctx, "route", active=ctx.active_model, effort=ctx.active_effort,
+                 backend=ctx.active_backend, via="intent_classify")
 
         from gabagent.permissions.engine import PermissionEngine
         perm_engine = PermissionEngine(ctx.config)
@@ -400,20 +433,25 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             request_effort = None if ctx.local_mode else ctx.active_effort
             # If the model bungles a tool call (e.g. calls a command-id as a function), the client
             # retries on the stronger model — but only for that failed turn, so simple turns stay cheap.
-            # (gab-only nudge; Claude has no command-id parse-error path.)
-            retry_model = None if (ctx.local_mode or is_claude) else ctx.config.router.complex_model
-            # If an escalated turn keeps failing to generate, fall back to the cheap rung rather than
-            # erroring — a simpler answer beats a dead turn.
-            fallback_model = None if ctx.local_mode else simple
+            # (gab-only nudge; Claude has no parse-error path, and the assembled ladder handles
+            # escalation/fallback at the turn level across backends — a per-call retry would target the
+            # wrong client.)
+            retry_model = (
+                None if (ctx.local_mode or is_claude or assembled)
+                else ctx.config.router.complex_model
+            )
+            # Per-call fallback is single-backend; in assembled mode the turn-level fallback below
+            # re-routes to the floor (and the floor's client) instead.
+            fallback_model = None if (ctx.local_mode or assembled) else simple
             sfilter = SpeakableFilter(code_notice=commands.filler("code", ctx))
 
             text_buf = ""
             tool_calls: list = []
-            stream = _active_client(ctx).stream_complete(
+            stream = _active_client(ctx, ctx.active_backend).stream_complete(
                 all_messages, tools or None, model=request_model, effort=request_effort,
                 retry_model=retry_model, fallback_model=fallback_model,
             )
-            if ctx.local_mode:
+            if ctx.local_mode or ctx.active_backend == "local":
                 async for chunk in stream:
                     if isinstance(chunk, str):
                         text_buf += chunk
@@ -443,6 +481,7 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
                         fell_back = True
                         ctx.active_model = simple
                         ctx.active_effort = simple_effort
+                        ctx.active_backend = simple_backend   # re-route to the floor's client
                         ctx.voice_announced_model = simple   # don't announce the switch back
                         dlog(ctx, "fallback", to=simple, reason="inference_failed")
                         continue
@@ -508,16 +547,28 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
         # escalate-after-tool path live). An escalated turn that died on a transient gab.ai
         # 'inference_failed' gets ONE plain arya narration of the current state — no tools, no
         # re-execution (the file/tool already ran) — instead of speaking "[gab.ai error]".
-        _simple = (ctx.config.claude.ladder[0].model
-                   if ctx.config.provider == "claude" else ctx.config.router.simple_model)
+        # Resolve the floor independently (assembled → ladder[0]; legacy → provider simple) so the
+        # narration runs on the floor's OWN client — in cross-backend mode ctx.client may be a
+        # different backend than the floor model.
+        from gabagent.agent.router import ModelRouter as _MR
+        _fr = _MR.assemble(ctx.config, local_floor=ctx.local_floor,
+                           local_running=ctx.local_client is not None)
+        if _fr:
+            _f0 = _fr.ladder[0]
+            _simple, _simple_backend = _f0.model, _f0.backend
+        else:
+            _simple = (ctx.config.claude.ladder[0].model
+                       if ctx.config.provider == "claude" else ctx.config.router.simple_model)
+            _simple_backend = "claude" if ctx.config.provider == "claude" else "gab"
         if (not ctx.local_mode and vs.queue is not None
                 and (ctx.active_model or _simple) != _simple
                 and _is_transient_generation_error(e)):
             try:
                 ctx.active_model = _simple
+                ctx.active_backend = _simple_backend
                 ctx.voice_announced_model = _simple
                 msgs = _build_voice_messages(ctx, ctx.session.messages())
-                text = await ctx.client.complete_simple(msgs, model=_simple)
+                text = await _active_client(ctx, _simple_backend).complete_simple(msgs, model=_simple)
                 if text and text.strip():
                     dlog(ctx, "fallback", to=_simple, reason="inference_failed", level="turn")
                     sf = SpeakableFilter(code_notice=commands.filler("code", ctx))

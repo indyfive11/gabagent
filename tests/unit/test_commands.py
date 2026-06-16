@@ -7,6 +7,43 @@ from gabagent.voice.session import VoiceSession
 from gabagent.config.models import GabAgentConfig
 
 
+@pytest.mark.parametrize("text", [
+    "make local the floor",
+    "use local as the fallback",
+    "set the default to local",
+    "local as the bottom rung",
+    "use local as the baseline",
+])
+def test_floor_on_phrases_detect_floor_local(text):
+    mc = detect_meta_command(text)
+    assert mc is not None and mc.kind == "floor" and mc.value == "local"
+
+
+@pytest.mark.parametrize("text", [
+    "drop local",
+    "use Aria as the floor",
+    "make the default Aria",
+    "turn off the local floor",
+    "unload local",
+])
+def test_floor_off_phrases_detect_floor_aria(text):
+    mc = detect_meta_command(text)
+    assert mc is not None and mc.kind == "floor" and mc.value == "aria"
+
+
+@pytest.mark.parametrize("text", ["switch to local", "use local", "load devstral"])
+def test_bare_local_switch_is_still_exclusive_brain(text):
+    # No floor/fallback qualifier → the existing EXCLUSIVE local_mode switch, not the floor toggle.
+    mc = detect_meta_command(text)
+    assert mc is not None and mc.kind == "brain" and mc.value == "local"
+
+
+@pytest.mark.parametrize("text", ["switch to Aria", "go back to the cloud", "use arya"])
+def test_bare_aria_switch_is_still_exclusive_cloud(text):
+    mc = detect_meta_command(text)
+    assert mc is not None and mc.kind == "brain" and mc.value == "cloud"
+
+
 def _ctx(tmp_path, **kw):
     cfg = GabAgentConfig(api_key="test")
     ctx = types.SimpleNamespace(

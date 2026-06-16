@@ -79,6 +79,7 @@ def _build_context(
         system_prompt=system_prompt,
         headless=headless,
     )
+    ctx.local_floor = cfg.local_floor  # mirror the persisted floor pin onto the live context
     return ctx
 
 
@@ -265,7 +266,7 @@ async def _run_voice(ctx, host: str, port: int) -> None:
         from gabagent.api.factory import build_client
         ctx.client = build_client(ctx.config, ctx.rate_limiter)
 
-    # If pinned to the local model, bring Ollama up before serving.
+    # If pinned to the local model, bring Ollama up before serving (exclusive local).
     if ctx.config.voice_model and ctx.config.voice_model == ctx.config.local_model:
         from gabagent.local.ollama import ensure_ollama_running
         from gabagent.api.client import GabAIClient
@@ -281,6 +282,13 @@ async def _run_voice(ctx, host: str, port: int) -> None:
                 keep_alive="1m",
             )
             ctx.local_mode = True
+    # Persisted cross-backend FLOOR: bring local up WARM as the bottom rung (it stays resident, the
+    # router escalates Aria→Claude). Pre-warm so the first routed turn isn't slow.
+    elif ctx.config.local_floor and ctx.config.local_model:
+        from gabagent.local.ollama import start_local_floor
+        err = await start_local_floor(ctx)
+        if err:
+            typer.echo(f"Could not warm local floor: {err}", err=True)
 
     if ctx.config.commands_enabled:
         try:

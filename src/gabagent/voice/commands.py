@@ -16,8 +16,8 @@ if TYPE_CHECKING:
 
 @dataclass
 class MetaCommand:
-    kind: str          # "brain" | "undo" | "query" | "forget" | "quiet"
-    value: str = ""    # brain: local|cloud · query: model|where|recap|error|caps|memory · forget: last|all
+    kind: str          # "brain" | "undo" | "query" | "forget" | "quiet" | "floor"
+    value: str = ""    # brain: local|cloud · floor: local|aria · query: model|where|recap|error|caps|memory · forget: last|all
 
 
 # -- detection -------------------------------------------------------------
@@ -49,6 +49,24 @@ _QUIET = re.compile(
     r"|\bzip\s+it\b"
     r"|\bthat'?s\s+enough\b"
     r"|\benough\s+(?:talking|already)\b",
+    re.I,
+)
+
+# Cross-backend ladder FLOOR toggle (distinct from the exclusive _TO_LOCAL/_TO_CLOUD switch above):
+# make the local model the warm bottom rung (router still escalates Aria→Claude), or drop it so Aria
+# is the floor. Kept strict — must name a floor/fallback/default qualifier — so "switch to local"
+# (exclusive mode) and "use Aria" (exclusive cloud) keep their existing meaning.
+_QUAL = r"(?:floor|fallback|bottom\s+rung|default|baseline)"
+_FLOOR_OFF = re.compile(
+    rf"\bdrop\s+(?:the\s+)?local\b"
+    rf"|\b(?:turn\s+off|disable|unload|shut\s+down)\s+(?:the\s+)?local\b"
+    rf"|\b(?:aria|arya)\b.{{0,25}}?\b{_QUAL}\b"
+    rf"|\b{_QUAL}\b.{{0,25}}?\b(?:aria|arya)\b",
+    re.I,
+)
+_FLOOR_ON = re.compile(
+    rf"\blocal\b.{{0,25}}?\b{_QUAL}\b"
+    rf"|\b{_QUAL}\b.{{0,25}}?\blocal\b",
     re.I,
 )
 
@@ -108,6 +126,11 @@ _FORGET_ALL = re.compile(r"\b(?:everything|all(?:\s+of\s+it)?|your\s+memory|memo
 
 def detect_meta_command(text: str) -> MetaCommand | None:
     t = text.strip()
+    # Floor toggle is checked BEFORE the exclusive switch (it's the more specific, qualified phrase).
+    if _FLOOR_OFF.search(t):
+        return MetaCommand("floor", "aria")
+    if _FLOOR_ON.search(t):
+        return MetaCommand("floor", "local")
     if _TO_LOCAL.search(t):
         return MetaCommand("brain", "local")
     if _TO_CLOUD.search(t) or _GO_ONLINE.search(t):
