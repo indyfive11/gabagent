@@ -517,31 +517,39 @@ async def _unmute_sink_input(idx: str) -> None:
     await _run_pactl("set-sink-input-mute", idx, "0")
 
 
-async def ensure_mopidy_sink_audible(ctx) -> None:
+async def ensure_mopidy_sink_audible(ctx, *, attempts: int = 6, delay: float = 0.5) -> None:
     """Clear a stranded MUTE flag on the Mopidy (Tidal) sink-input so resumed/started music isn't silent.
     The Tidal analog of ensure_jellyfin_sink_audible: the duck attenuates by VOLUME and apply_ambient_cap
     mirrors the mixer onto the sink-input LEVEL, but neither touches the per-sink-input `Mute:` flag.
     PipeWire stream-restore (or a stray toggle) can bring a stream up muted, so the music plays silent at a
     healthy mixer/level until a manual volume command happens to unmute it (Rob, live 2026-06-15: "no sound
-    until I turned up the volume" — mixer was 70 the whole time). Run on every play/resume via _hold_ambient.
-    Issues an idempotent unmute and logs `mopidy_audible` (the read `was_muted`) so a stranded mute is
-    provable. Best-effort; never raises."""
+    until I turned up the volume" — mixer was 70 the whole time).
+
+    TIMING: called from _hold_ambient at play/resume time, but the Mopidy sink-input does NOT exist yet —
+    it materializes a few seconds later when audio starts flowing (live 2026-06-16: a one-shot check at
+    play time always found nothing and no-op'd, so the fix was inert). So POLL briefly for the sink-input
+    to appear, then unmute. Called fire-and-forget by _hold_ambient so this poll never blocks playback.
+    Issues an idempotent unmute and logs `mopidy_audible` (the read `was_muted`, plus the `attempt` it was
+    found on) so a stranded mute is provable. Best-effort; never raises."""
     if not shutil.which("pactl"):
         return
-    try:
-        rc, out = await _run_pactl("list", "sink-inputs")
-        if rc != 0 or not out:
-            return
-        si = _parse_mopidy_sink_full(out)
-        if si is None:
-            return
-        was_muted = si.get("muted")
-        await _unmute_sink_input(si["idx"])     # idempotent; guarantees the stream isn't left muted
-        from gabagent.voice.debuglog import dlog
-        dlog(ctx, "mopidy_audible", idx=si["idx"], was_muted=was_muted,
-             vol=si.get("volume"), sink=si.get("sink_idx"))
-    except Exception:
-        pass
+    from gabagent.voice.debuglog import dlog
+    n = max(1, attempts)
+    for attempt in range(n):
+        try:
+            rc, out = await _run_pactl("list", "sink-inputs")
+            si = _parse_mopidy_sink_full(out) if (rc == 0 and out) else None
+            if si is not None:
+                was_muted = si.get("muted")
+                await _unmute_sink_input(si["idx"])     # idempotent; guarantees the stream isn't left muted
+                dlog(ctx, "mopidy_audible", idx=si["idx"], was_muted=was_muted,
+                     vol=si.get("volume"), sink=si.get("sink_idx"), attempt=attempt)
+                return
+        except Exception:
+            pass
+        if attempt + 1 < n:
+            await asyncio.sleep(delay)
+    # Sink-input never appeared within the window (playback didn't start, or stopped) — nothing to unmute.
 
 
 async def mopidy_audibility() -> dict:

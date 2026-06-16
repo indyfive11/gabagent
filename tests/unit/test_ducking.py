@@ -699,8 +699,30 @@ async def test_ensure_mopidy_sink_audible_noop_when_no_mopidy_stream(monkeypatch
         calls.append(a)
         return (0, other) if a[:2] == ("list", "sink-inputs") else (0, "")
     monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
-    await _dk.ensure_mopidy_sink_audible(types.SimpleNamespace())
+    await _dk.ensure_mopidy_sink_audible(types.SimpleNamespace(), attempts=1, delay=0)
     assert not any(a and a[0] == "set-sink-input-mute" for a in calls)
+
+
+async def test_ensure_mopidy_sink_audible_polls_until_sink_appears(monkeypatch):
+    # The Mopidy sink-input doesn't exist at play time — it materializes a few seconds later when audio
+    # flows (live 2026-06-16: a one-shot check always no-op'd). So poll until it appears, THEN unmute.
+    monkeypatch.setattr(_dk.shutil, "which", lambda _: "/usr/bin/pactl")
+    muted = _AUDIBLE_BLOCK.replace("Mute: no", "Mute: yes")
+    seq = ["", "", muted]  # first two polls: no Mopidy sink yet; third: it's there, muted
+    state = {"i": 0}
+    calls = []
+    async def fake_pactl(*a, **k):
+        calls.append(a)
+        if a[:2] == ("list", "sink-inputs"):
+            i = state["i"]
+            state["i"] += 1
+            return (0, seq[min(i, len(seq) - 1)])
+        return (0, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    await _dk.ensure_mopidy_sink_audible(types.SimpleNamespace(), attempts=5, delay=0)
+    # Found on the 3rd poll → unmuted then, not before.
+    assert ("set-sink-input-mute", "12", "0") in calls
+    assert len([a for a in calls if a[:2] == ("list", "sink-inputs")]) == 3
 
 
 async def test_mopidy_audibility_false_when_muted(monkeypatch):

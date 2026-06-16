@@ -342,9 +342,12 @@ async def _hold_ambient(ctx, new_track: bool = True) -> None:
     sink is unchanged) so apply_ambient_cap skips polling for a fresh sink-input."""
     try:
         from gabagent.voice.ducking import apply_ambient_cap, ensure_mopidy_sink_audible
-        # Clear a stranded sink-input MUTE first (a layer apply_ambient_cap's volume-mirror can't reach) so a
-        # resumed/started track isn't silent at a healthy mixer level, then cap the level.
-        await ensure_mopidy_sink_audible(ctx)
+        # Clear a stranded sink-input MUTE (a layer apply_ambient_cap's volume-mirror can't reach) so a
+        # resumed/started track isn't silent at a healthy mixer level. Fire-and-forget: the Mopidy sink-input
+        # doesn't exist until audio starts flowing (a few seconds after play), so ensure_mopidy_sink_audible
+        # POLLS for it — running that inline would block the play path / delay the spoken reply. The mute-clear
+        # is independent of the level-cap, so ordering doesn't matter.
+        asyncio.create_task(ensure_mopidy_sink_audible(ctx))
         await apply_ambient_cap(ctx, new_track=new_track)
     except Exception:
         pass
