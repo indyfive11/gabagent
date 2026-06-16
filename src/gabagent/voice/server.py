@@ -96,7 +96,13 @@ def build_app(ctx: AgentContext):
         vs = sessions.get(body.get("session_id", ""))
         if vs is None:
             return JSONResponse({"ok": False, "error": "unknown session"}, status_code=404)
-        if vs.turn_task is not None and not vs.turn_task.done():
+        # Log the barge-in receipt and whether a live turn was actually aborted — so a turn cancelled
+        # mid-flight is traceable to the /cancel that killed it (e.g. a spurious empty barge-in), not a
+        # mystery silent drop. Pairs with the `cancelled` dlog in the turn's CancelledError handler.
+        from gabagent.voice.debuglog import dlog
+        aborted = vs.turn_task is not None and not vs.turn_task.done()
+        dlog(ctx, "cancel_recv", session=body.get("session_id", ""), aborted_live_turn=aborted)
+        if aborted:
             vs.turn_task.cancel()
         vs.clear_pending(approved=False)
         return JSONResponse({"ok": True})

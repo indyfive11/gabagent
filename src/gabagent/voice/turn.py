@@ -485,6 +485,11 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
 
         await emit(events.done())
     except asyncio.CancelledError:
+        # A barge-in (/cancel) aborts the turn. Log it EXPLICITLY: a cancel bypasses the `except Exception`
+        # error path and only `finally` logs `turn_done`, so without this a cancelled turn reads as a phantom
+        # "silent drop" (no addressed/reply/error) — which once cost a whole debugging round chasing a
+        # non-existent brain bug for what was really a spurious empty barge-in on the voice side.
+        dlog(ctx, "cancelled", stage="turn", dur_ms=int((time.monotonic() - _t0) * 1000))
         if vs.queue is not None:
             vs.queue.put_nowait(events.done())
         raise

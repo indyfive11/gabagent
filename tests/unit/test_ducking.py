@@ -674,6 +674,35 @@ async def test_mopidy_audibility_true_when_unmuted_nonzero_on_default(monkeypatc
     assert "reason" not in res
 
 
+async def test_ensure_mopidy_sink_audible_clears_stranded_mute(monkeypatch):
+    # The Tidal analog of the Jellyfin sink-mute fix: a resumed track whose Mopidy sink-input carries a
+    # stranded Mute flag is silent at a healthy mixer level (Rob: "no sound until I turned up the volume").
+    # ensure_mopidy_sink_audible must issue set-sink-input-mute <idx> 0.
+    monkeypatch.setattr(_dk.shutil, "which", lambda _: "/usr/bin/pactl")
+    muted = _AUDIBLE_BLOCK.replace("Mute: no", "Mute: yes")
+    calls = []
+    async def fake_pactl(*a, **k):
+        calls.append(a)
+        return (0, muted) if a[:2] == ("list", "sink-inputs") else (0, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    ctx = types.SimpleNamespace()
+    await _dk.ensure_mopidy_sink_audible(ctx)
+    assert ("set-sink-input-mute", "12", "0") in calls
+
+
+async def test_ensure_mopidy_sink_audible_noop_when_no_mopidy_stream(monkeypatch):
+    # No Mopidy stream present → nothing to unmute (don't touch other apps' sinks).
+    monkeypatch.setattr(_dk.shutil, "which", lambda _: "/usr/bin/pactl")
+    other = 'Sink Input #5\n\tMute: no\n\tProperties:\n\t\tapplication.name = "Firefox"\n'
+    calls = []
+    async def fake_pactl(*a, **k):
+        calls.append(a)
+        return (0, other) if a[:2] == ("list", "sink-inputs") else (0, "")
+    monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+    await _dk.ensure_mopidy_sink_audible(types.SimpleNamespace())
+    assert not any(a and a[0] == "set-sink-input-mute" for a in calls)
+
+
 async def test_mopidy_audibility_false_when_muted(monkeypatch):
     blk = _AUDIBLE_BLOCK.replace("Mute: no", "Mute: yes")
     _pactl_router(monkeypatch, sink_inputs=blk, default_sink="alsa.spk",

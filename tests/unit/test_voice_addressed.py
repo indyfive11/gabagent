@@ -87,6 +87,28 @@ def test_fast_verdict_aria_mention_defers_not_fastpass(text):
     assert _fast_verdict(text) is None
 
 
+@pytest.mark.parametrize("text", [
+    "your performance was solid, arya",     # trailing vocative, NO leading question/command word
+    "what do you think of that, arya",
+    "did you hear me, aria",
+])
+def test_fast_verdict_trailing_vocative_fastpasses(text):
+    # A trailing/embedded vocative ("…, Arya") is direct address the lead-word check misses — these were
+    # getting mis-asided by the LLM. (Rob, live 2026-06-15.)
+    assert _fast_verdict(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "i was just talking to aria",           # narration ABOUT her — preposition before the trailing name
+    "i'm here with aria",
+    "i was chatting with aria",
+])
+def test_fast_verdict_name_in_narration_still_defers(text):
+    # The name as the last word but preceded by a narration preposition ("to/with/tell aria") is talking
+    # ABOUT her, not TO her → defer, don't fast-pass.
+    assert _fast_verdict(text) is None
+
+
 def _ctx(tag, *, raises=False, seen=None, provider="gab"):
     class _Client:
         async def complete_simple(self, messages, model=None):

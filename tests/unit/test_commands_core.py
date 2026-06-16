@@ -109,6 +109,18 @@ def test_tier_of_run_command_uses_catalog(tmp_path):
     assert tier_of("list_capabilities", {}, tmp_path, None, cat) == 1
 
 
+def test_tier_of_direct_command_id_mis_call_resolves_to_catalog_tier(tmp_path):
+    # The model mis-calls a command as a DIRECT tool (e.g. tidal.recommendations instead of
+    # run_command(command_id=...)). It must resolve to the command's catalog tier, NOT fail-closed to Tier-3
+    # — which gated a safe "pick & play" behind a mouse-click while the correct path was Tier-1/auto
+    # (Rob, live 2026-06-15).
+    cat = CommandCatalog()
+    cat.add(_echo_cmd(tier=1))
+    assert tier_of("test.echo", {}, tmp_path, None, cat) == 1        # resolved to catalog tier, not 3
+    # A truly unknown tool (not a command id) still fails closed.
+    assert tier_of("definitely_not_a_tool", {}, tmp_path, None, cat) == 3
+
+
 # -- run_command tool dispatch --------------------------------------------
 
 async def test_run_command_tool(tmp_path):

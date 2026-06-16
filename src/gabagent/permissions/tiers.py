@@ -136,4 +136,14 @@ def tier_of(
     if tool_name == "reconfigure_safe_zone":
         return 3
 
+    # The model mis-called a COMMAND as a direct tool (e.g. `tidal.recommendations` instead of
+    # run_command(command_id="tidal.recommendations")). It won't execute — the tool layer rejects the
+    # unknown tool and the model retries via run_command — but it must NOT fail-closed to a Tier-3 keyboard
+    # gate: resolve it to the command's catalog tier, same as run_command would. Otherwise a safe "pick &
+    # play" slip gets a mouse-click prompt while the correct path is Tier-1/auto (live 2026-06-15).
+    if catalog is not None:
+        cmd = catalog.get(tool_name)
+        if cmd is not None:
+            return cmd.tier
+
     return 3  # fail-closed

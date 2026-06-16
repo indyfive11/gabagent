@@ -49,6 +49,12 @@ _FILLER_LEADS = frozenset((
     "alright", "hi", "hello",
 ))
 
+# The assistant's name, for a TRAILING vocative fast-pass ("…, Arya?"). STT spells it both ways. A
+# preposition right before the name signals narration ABOUT her ("talking TO aria", "with aria"), not
+# address — those defer to the classifier rather than fast-passing.
+_NAME_TOKENS = frozenset(("aria", "arya"))
+_NARRATION_PRE = frozenset(("to", "with", "about", "and", "or", "tell", "told"))
+
 # ROUND 2 (per VAC's Jun 6–7 mining: ~40/48 of the 15s runaway-turn cap-hits were Rob dictating long
 # asides he EXPLICITLY marks as non-commands). These self-labels — the user declaring "I'm just
 # dictating" or "you don't need to respond" — are strong NOT-addressed signals. When one is present we
@@ -98,6 +104,8 @@ Examples:
 - "the music is… you don't need to do anything, I'm just dictating" → [ASIDE] (explicit non-command)
 - "I'm gonna dictate something so it's on the record, you don't need to respond" → [ASIDE]
 - "turn it up" / "what's the weather" / "it's too quiet in here" → [ADDRESSED]
+- "I was talking to you — do you think you did okay?" → [ADDRESSED] (re-asking her directly after she didn't reply; a statement-form lead like "I was talking to you" is direct address, not narration)
+- "that's a solid suggestion, thank you" → [ADDRESSED] (a direct acknowledgement or thanks TO Aria invites a brief reply)
 
 When genuinely unsure, return [ADDRESSED].
 
@@ -132,6 +140,14 @@ def _fast_verdict(text: str) -> bool | None:
     if lead == "aria":
         return True
     if lead in _COMMAND_LEADS:
+        return True
+    # Trailing/embedded VOCATIVE address: the assistant's name as the FINAL word ("what do you think, Arya?",
+    # "your performance was solid, Aria") is a strong direct-address signal the lead-word check misses — these
+    # were getting mis-asided by the LLM when no leading question/command word was present. Exclude narration
+    # ABOUT her ("talking TO aria", "with aria") where a preposition precedes the name. Leans addressed, per
+    # the conservative design (tolerate the rare aside-answer; never drop a real address). The self-label guard
+    # above already defers a dictation that happens to end on the name.
+    if len(words) >= 2 and words[-1] in _NAME_TOKENS and words[-2] not in _NARRATION_PRE:
         return True
     return None
 

@@ -341,7 +341,10 @@ async def _hold_ambient(ctx, new_track: bool = True) -> None:
     (local import to avoid a cycle with the voice layer). `new_track` is False on a resume-in-place (the
     sink is unchanged) so apply_ambient_cap skips polling for a fresh sink-input."""
     try:
-        from gabagent.voice.ducking import apply_ambient_cap
+        from gabagent.voice.ducking import apply_ambient_cap, ensure_mopidy_sink_audible
+        # Clear a stranded sink-input MUTE first (a layer apply_ambient_cap's volume-mirror can't reach) so a
+        # resumed/started track isn't silent at a healthy mixer level, then cap the level.
+        await ensure_mopidy_sink_audible(ctx)
         await apply_ambient_cap(ctx, new_track=new_track)
     except Exception:
         pass
