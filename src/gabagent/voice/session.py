@@ -27,6 +27,10 @@ class VoiceSession:
         # Last turn-level failure, for the "what went wrong?" query.
         self.last_error: str | None = None
         self.last_error_time: float | None = None
+        # Countdown timers (G2): id -> Timer. Fired by voice/timers.py's async ticker.
+        # Session-scoped (lost on a brain restart in v1); _timer_n is the per-session id counter.
+        self.timers: dict = {}
+        self._timer_n: int = 0
 
     def set_error(self, msg: str) -> None:
         self.last_error = msg

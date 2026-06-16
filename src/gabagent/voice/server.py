@@ -150,4 +150,13 @@ async def serve_voice(ctx: AgentContext, host: str = "127.0.0.1", port: int = 87
     )
     server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None  # don't hijack SIGINT in the shared loop
-    await server.serve()
+
+    # Independent ~1 Hz timer-expiry loop (G2). Not tied to the /media/state poll so a timer set
+    # in silence still fires. Cancelled on shutdown.
+    import asyncio
+    from gabagent.voice.timers import ticker as _timer_ticker
+    timer_task = asyncio.create_task(_timer_ticker(ctx, app.state.sessions))
+    try:
+        await server.serve()
+    finally:
+        timer_task.cancel()

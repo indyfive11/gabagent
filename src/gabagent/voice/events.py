@@ -80,5 +80,15 @@ def keepalive(ttl_secs: int) -> VoiceEvent:
     return VoiceEvent(type="wake_hold", extra={"hold": True, "ttl_secs": int(ttl_secs)})
 
 
+def timer_fired(timer_id: str, label: str = "", set_secs: int = 0) -> VoiceEvent:
+    """A countdown timer (G2) came due (brain → voice client). The voice side rings on receipt and its
+    stop-word cancels the ring (the LVA pattern). Carries id/label/set_secs via `extra` so the wire shape
+    is explicit and survives to_dict's empty-value filter.
+
+    NOT YET DELIVERED: the proactive brain→voice channel that carries this for an idle user is a pending
+    co-design contract; until it lands the expiry ticker only dlogs the fire (see voice/timers.py)."""
+    return VoiceEvent(type="timer_fired", extra={"id": timer_id, "label": label, "set_secs": int(set_secs)})
+
+
 def done() -> VoiceEvent:
     return VoiceEvent(type="done")
