@@ -24,7 +24,9 @@ class RunCommandTool(ToolBase):
         "launching an app). command_id is a STRING parameter — e.g. 'jellyfin.search', "
         "'tidal.recommendations'; NEVER call a capability name as a tool/function directly, always "
         "invoke it through run_command. Call list_capabilities first if you're unsure which ids exist. "
-        "Risky commands will ask the user to confirm."
+        "For media transport you can use the generic ids media.pause / media.play / media.stop / "
+        "media.next / media.previous — they target whichever player is currently active, so you don't "
+        "need to look up the provider-specific id first. Risky commands will ask the user to confirm."
     )
     parameters = {
         "type": "object",
@@ -42,7 +44,28 @@ class RunCommandTool(ToolBase):
             return ToolResult(output="", error="Capabilities haven't been discovered on this machine.")
         cmd = catalog.get(command_id)
         if cmd is None:
-            return ToolResult(output="", error=f"Unknown command: {command_id}. Try list_capabilities.")
+            # Salvage a plausible-but-wrong id before giving up (helps weaker local/Aria turns).
+            from gabagent.commands.resolve import (
+                resolve_media_intent, closest_command_ids, best_match_ratio, AUTO_ROUTE_RATIO,
+            )
+            # 1) A generic media-transport guess → the actually-playing provider (tidal/jellyfin).
+            media = await resolve_media_intent(ctx, command_id)
+            if media is not None:
+                real_id, extra = media
+                resolved = catalog.get(real_id)
+                if resolved is not None:
+                    cmd, command_id, args = resolved, real_id, {**(args or {}), **extra}
+            # 2) Otherwise a close catalog id → auto-route if very close, else suggest in one step.
+            if cmd is None:
+                near = closest_command_ids(command_id, catalog.ids())
+                if near and best_match_ratio(command_id, near[0]) >= AUTO_ROUTE_RATIO:
+                    cmd, command_id = catalog.get(near[0]), near[0]
+                elif near:
+                    return ToolResult(output="", error=(
+                        f"Unknown command: {command_id}. Did you mean: {', '.join(near)}? "
+                        "Pass one of those as command_id, or call list_capabilities."))
+            if cmd is None:
+                return ToolResult(output="", error=f"Unknown command: {command_id}. Try list_capabilities.")
         from gabagent.commands.backends import run_backend
         result = await run_backend(cmd, args or {}, ctx)
         if result.success:
