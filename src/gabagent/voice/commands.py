@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class MetaCommand:
-    kind: str          # "brain" | "undo" | "query" | "forget"
+    kind: str          # "brain" | "undo" | "query" | "forget" | "quiet"
     value: str = ""    # brain: local|cloud · query: model|where|recap|error|caps|memory · forget: last|all
 
 
@@ -31,6 +31,26 @@ _TO_CLOUD = re.compile(
 _GO_ONLINE = re.compile(r"\bgo\s+(?:back\s+)?online\b", re.I)
 
 _UNDO = re.compile(r"\b(?:undo|revert|roll\s*back|take\s+that\s+back)\b", re.I)
+
+# "Shut up / be quiet" — answered with ONE short canned line, never the LLM. Telling the assistant to
+# stop talking shouldn't draw a multi-sentence reply that itself keeps talking (and, while media plays,
+# holds the duck down for the length of that reply — Rob's 2026-06-16 "shut up voice mode" → 3.4s
+# paragraph that pinned the music ducked). The brain can't actually mute or sleep itself (the voice
+# layer owns that), so the terse reply points at the sleep control. Kept strict — only talking-directed
+# phrases — so it can NEVER swallow a media "stop"/"pause" (those have an object: "stop the music").
+_QUIET = re.compile(
+    r"\bshut\s*up\b"
+    r"|\bshut\s+it\b"
+    r"|\bbe\s+quiet\b"
+    r"|\bquiet\s+down\b"
+    r"|\bstop\s+(?:talking|yapping|yammering)\b"
+    r"|\bhush\b"
+    r"|\bpipe\s+down\b"
+    r"|\bzip\s+it\b"
+    r"|\bthat'?s\s+enough\b"
+    r"|\benough\s+(?:talking|already)\b",
+    re.I,
+)
 
 # Deterministic "which model am I on" — answered from brain state, never the LLM (the local
 # model can't reliably introspect its own runtime). Broadened to natural spoken variants.
@@ -92,6 +112,8 @@ def detect_meta_command(text: str) -> MetaCommand | None:
         return MetaCommand("brain", "local")
     if _TO_CLOUD.search(t) or _GO_ONLINE.search(t):
         return MetaCommand("brain", "cloud")
+    if _QUIET.search(t):
+        return MetaCommand("quiet")
     if _UNDO.search(t):
         return MetaCommand("undo")
     if _Q_MODEL.search(t):

@@ -68,6 +68,28 @@ def test_fast_verdict_real_command_without_self_label_still_fastpasses():
 
 
 @pytest.mark.parametrize("text", [
+    "I want you to play a playlist, something with a retro feel",  # the live 2026-06-16 42s case
+    "I'd like you to turn the lights down",
+    "I need you to pause that",
+    "I would like you to read me the news",
+    "I want to ask you something",
+])
+def test_fast_verdict_first_person_directed_openers_fastpass(text):
+    # "I want you to…" explicitly names "you" as the actor → addressed, but leads on "I" so it used to
+    # pay a ~12.7s LLM classify. Now it fast-passes with zero latency.
+    assert _fast_verdict(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "I want to dictate something for the record",  # self-label still defers (guard runs first)
+    "let's see what happens here",                 # bare "let's" deliberately NOT an opener → defer
+    "I think that went well",                      # first-person but not directed at "you" → defer
+])
+def test_fast_verdict_first_person_non_directed_still_defers(text):
+    assert _fast_verdict(text) is None
+
+
+@pytest.mark.parametrize("text", [
     "aria what time is it",          # leading name
     "hey aria play something",       # filler + leading name
     "okay aria, pause",

@@ -55,6 +55,17 @@ _FILLER_LEADS = frozenset((
 _NAME_TOKENS = frozenset(("aria", "arya"))
 _NARRATION_PRE = frozenset(("to", "with", "about", "and", "or", "tell", "told"))
 
+# First-person openers that explicitly direct the request AT the assistant ("you"). These miss the
+# lead-word fast-pass because the lead word is "I", so a clear command like "I want you to play a
+# playlist" otherwise pays a ~12.7s LLM classify (a quarter of Rob's 2026-06-16 42s play). They name
+# "you" as the actor → unambiguously addressed; fast-passing them is safe (the heuristic only ever
+# short-circuits the addressed case). Kept to explicit "I … you" forms (no bare "let's", which would
+# fast-pass thinking-aloud asides like "let's see"). The "want to dictate" self-label defers first.
+_ADDRESSED_OPENERS = (
+    "i want you", "i'd like you", "i would like you", "i need you", "i'd love you to",
+    "i want to ask you", "i'd like for you", "i need for you",
+)
+
 # ROUND 2 (per VAC's Jun 6–7 mining: ~40/48 of the 15s runaway-turn cap-hits were Rob dictating long
 # asides he EXPLICITLY marks as non-commands). These self-labels — the user declaring "I'm just
 # dictating" or "you don't need to respond" — are strong NOT-addressed signals. When one is present we
@@ -124,6 +135,10 @@ def _fast_verdict(text: str) -> bool | None:
     # "make" and an "...Aria..." aside fast-passes on the mention. (Safe: deferring never eats a command.)
     if _has_aside_self_label(t):
         return None
+    # First-person openers that explicitly name "you" as the actor ("I want you to…", "let's…") are
+    # addressed but lead on "I"/"let's", so they'd otherwise fall through to the costly LLM classify.
+    if t.startswith(_ADDRESSED_OPENERS):
+        return True
     # NB: a trailing "?" is deliberately NOT a fast-pass — rhetoricals ("isn't that wild?", "really?")
     # are asides, so anything question-shaped but not led by a question word goes to the classifier.
     # Genuine questions still fast-pass via their leading question word (what/how/is/are/can…) below.

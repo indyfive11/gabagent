@@ -27,6 +27,25 @@ def test_detect_brain_switch():
     assert detect_meta_command("go back online").value == "cloud"
 
 
+def test_detect_quiet_shutup_is_terse_meta():
+    # "Shut up / be quiet" → a deterministic quiet meta (no LLM, terse pointer), incl. "shut up voice mode".
+    for phrase in (
+        "shut up", "shut up voice mode", "be quiet", "quiet down", "stop talking",
+        "stop yapping", "hush", "pipe down", "zip it", "that's enough", "enough talking",
+        "enough already",
+    ):
+        mc = detect_meta_command(phrase)
+        assert mc is not None and mc.kind == "quiet", phrase
+
+
+def test_detect_quiet_does_not_eat_media_stop():
+    # Strict: a media stop/pause with an object must NOT be swallowed by the quiet meta (bare "stop"
+    # and "stop the music" carry no quiet handler → fall through to normal routing for the real stop).
+    for phrase in ("stop the music", "pause the movie", "stop"):
+        mc = detect_meta_command(phrase)
+        assert mc is None or mc.kind != "quiet", phrase
+
+
 def test_detect_cloud_by_persona_name_aria():
     # Users say the persona name "Aria" (sounds like the model "arya").
     assert detect_meta_command("let's stop this and go back to Aria").value == "cloud"

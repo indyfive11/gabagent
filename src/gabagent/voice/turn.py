@@ -68,6 +68,11 @@ VOICE_ADDENDUM = (
     "playing until now_playing confirms it. When the user asks for several things in one breath (e.g. 'play some music and keep it "
     "quiet'), do every part and mention each one you did — don't report only the last action. To change "
     "how loud MUSIC is, use the music volume control, not the system volume. "
+    "When the user loosely asks for music ('play something retro', 'put on a playlist', 'play some "
+    "music'), just PICK a fitting option and play it right away — don't read back a list of choices and "
+    "ask which one unless they explicitly ask what's available. If you just offered choices and the user "
+    "replies with a single title or name ('Gunship'), that's their pick — play it immediately, don't ask "
+    "again. "
     "Don't invent reasons for being slow or for anything you can't actually explain — say "
     "you're not sure rather than making up a cause. If a tool returns an error or says it couldn't do something, tell the user it "
     "didn't work — never say you did it. You can take a screenshot, but you can't see or read images: "
@@ -289,6 +294,11 @@ async def _handle_meta(ctx: AgentContext, mc: commands.MetaCommand, emit) -> Non
             await emit(events.status(commands.filler("to_cloud", ctx)))
             await commands.switch_to_cloud(ctx)
             await emit(events.token("Okay, back on the cloud brain."))
+    elif mc.kind == "quiet":
+        # "Shut up / be quiet": the brain can't mute or sleep itself (the voice layer owns that), so
+        # answer with ONE short pointer instead of routing to the model — a terse line ends fast and,
+        # while media plays, releases the duck quickly instead of holding it for a multi-sentence reply.
+        await emit(events.token("Say \"go to sleep\" if you want me to stop listening."))
     elif mc.kind == "undo":
         await emit(events.token(commands.undo_last(ctx)))
     elif mc.kind == "forget":
