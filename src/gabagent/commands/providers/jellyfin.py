@@ -27,7 +27,12 @@ _TICKS = 10_000_000                                      # Jellyfin position uni
 # Actions whose target is "whatever is PLAYING" — so an owned-but-PAUSED page must not swallow them when a
 # DIFFERENT session is the one actually going (the live miss Rob hit 2026-06-14). `resume` is excluded: it
 # targets the PAUSED movie, which is the owned page; `close`/fullscreen are owned-only and handled separately.
-_DIVERTABLE = set(_SEEK) | set(_REMOTE_VOLUME) | {"pause", "stop", "next", _SEEK_TO}
+# The SEEK family (forward/back/seek_to/next) is deliberately NOT here: a skip is timeline-specific to the
+# movie you're watching, a paused movie is a normal skip target (currentTime is settable while paused), and a
+# remote WEB session can't be seeked over REST anyway. Before this, "pause then skip ahead" on an owned movie
+# diverted to a lingering web-client session and hard-failed ("…playing in a web browser…", the live miss Rob
+# hit 2026-06-17). Owning a page → seeks always act on that page.
+_DIVERTABLE = set(_REMOTE_VOLUME) | {"pause", "stop"}
 _PLAY_POLL_TRIES = 24   # ~12s waiting for the opened web client to register a session
 
 

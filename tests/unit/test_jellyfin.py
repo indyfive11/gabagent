@@ -498,6 +498,27 @@ async def test_resume_targets_owned_paused_page_even_if_remote_playing():
     assert r.success and page.keyboard.keys == ["Space"] and ctx.jellyfin_paused is False
 
 
+async def test_seek_on_paused_owned_page_never_diverts():
+    # The live miss Rob hit 2026-06-17: pause the owned movie, then "skip ahead" → the seek used to divert
+    # to a lingering web-client session and hard-fail ("…playing in a web browser…"). A skip is timeline-
+    # specific to the movie you own and works fine while paused — it must seek the owned page, never divert.
+    # No respx mock: a /Sessions fetch here would mean the divert path ran = a regression.
+    for action, expected in (("forward", 80.0), ("back", 20.0), ("next", 80.0)):
+        page = _FakePlayPage(paused=True, current_time=50.0, duration=100.0)
+        ctx = _ctx(); ctx.jellyfin_playing_page = page; ctx.jellyfin_playing_title = "Up"
+        r = await jf.control(ctx, action=action)
+        assert r.success, action
+        assert page.currentTime == expected, (action, page.currentTime)
+
+
+async def test_seek_to_on_paused_owned_page_never_diverts():
+    # Absolute jump on a paused owned movie also stays on the owned page (no divert / no REST lookup).
+    page = _FakePlayPage(paused=True, current_time=50.0, duration=6000.0)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page; ctx.jellyfin_playing_title = "Up"
+    r = await jf.control(ctx, action="seek_to", position=2700)   # jump to 45:00
+    assert r.success and page.currentTime == 2700.0
+
+
 @respx.mock
 async def test_no_owned_page_honest_about_remote_web_session():
     # No owned page at all; the only thing playing is a remote WEB client → honest refusal, no false success.
