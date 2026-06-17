@@ -91,29 +91,23 @@ class WebSearchTool(ToolBase):
         if cache_path.exists() and (time.time() - cache_path.stat().st_mtime) < 300:
             return ToolResult(output=cache_path.read_text())
 
-        # Try ddgs library (handles bot detection reliably)
-        try:
-            import asyncio
-            from ddgs import DDGS
-
-            def _search() -> list[str]:
-                with DDGS() as ddgs:
-                    hits = list(ddgs.text(query, max_results=10))
-                lines = []
-                for r in hits:
-                    title = r.get("title", "")
-                    url = r.get("href", "")
-                    snippet = r.get("body", "")[:200]
-                    lines.append(f"- [{title}]({url})\n  {snippet}")
-                return lines
-
-            results = await asyncio.get_event_loop().run_in_executor(None, _search)
-            output = "\n".join(results)
+        # ddgs search — run in an ISOLATED CHILD PROCESS. The ddgs backend (primp, a Rust/C
+        # extension) can hard-crash with no Python traceback; in-process that kills the whole voice
+        # brain mid-turn (observed 2026-06-17). Out-of-process, a crash/timeout exits only the child
+        # and we fall through to the SearxNG fallback below instead of dying.
+        hits = await _ddg_search_subprocess(query)
+        if hits is not None:
+            lines = []
+            for r in hits:
+                title = r.get("title", "")
+                url = r.get("href", "")
+                snippet = (r.get("body", "") or "")[:200]
+                lines.append(f"- [{title}]({url})\n  {snippet}")
+            output = "\n".join(lines)
             if output:
                 cache_path.write_text(output)
             return ToolResult(output=output or "(no results)")
-        except Exception as e:
-            pass
+        # hits is None → the search child failed, timed out, or CRASHED → fall through to SearxNG.
 
         # SearxNG fallback
         searxng = ctx.config.searxng_url
@@ -136,6 +130,40 @@ class WebSearchTool(ToolBase):
                 return ToolResult(output="", error=f"Search failed: ddgs and searxng both unavailable")
 
         return ToolResult(output="", error="Search unavailable: install ddgs or configure searxng_url")
+
+
+async def _ddg_search_subprocess(query: str, timeout: float = 20.0) -> list[dict] | None:
+    """Run the ddgs search in an isolated child process and return its hit list.
+
+    Returns None if the child failed, timed out, or CRASHED — a native segfault in the search backend
+    exits the child with a signal (negative returncode), so the parent voice brain survives and the
+    caller degrades gracefully instead of the whole process dying."""
+    import asyncio
+    import sys
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "gabagent.tools._ddg_search_worker",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(query.encode()), timeout=timeout)
+    except (asyncio.TimeoutError, Exception):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return None
+    if proc.returncode != 0:  # non-zero exit OR killed-by-signal (negative) → search unusable
+        return None
+    try:
+        data = json.loads(out.decode() or "null")
+        return data if isinstance(data, list) else None
+    except Exception:
+        return None
 
 
 def _parse_ddg_html(html: str) -> list[str]:

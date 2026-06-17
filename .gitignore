@@ -28,3 +28,10 @@ cache/
 # IDE
 .vscode/
 .idea/
+
+# Local working notes + cross-project coordination — never committed
+/comms/
+/LIVE_FINDINGS_*.md
+/PIPECAT_HARVEST_*.md
+/PLAN_*.md
+/REVIEW_LATER_*.md

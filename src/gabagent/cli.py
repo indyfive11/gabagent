@@ -7,6 +7,31 @@ import typer
 
 app = typer.Typer(name="gab", help="Gab-Agent: AI coding assistant powered by Gab AI")
 
+# Held open for the whole process so faulthandler can write to its fd at crash time.
+_FAULT_LOG = None
+
+
+def _enable_faulthandler() -> None:
+    """Dump a C+Python stack on a FATAL native crash (segfault/abort/bus error).
+
+    Without this, a native crash in a C/Rust extension — e.g. the ddgs/primp search backend that
+    once killed the voice brain mid web-lookup — exits the process with NO Python traceback, leaving
+    the death completely unexplained. Writes to a persistent file (survives the exit) so the next
+    occurrence is self-identifying; falls back to stderr if the file can't be opened."""
+    global _FAULT_LOG
+    try:
+        import faulthandler
+        if faulthandler.is_enabled():
+            return
+        try:
+            from gabagent.config.paths import data_dir
+            _FAULT_LOG = open(data_dir() / "faulthandler.log", "a", buffering=1)
+            faulthandler.enable(file=_FAULT_LOG, all_threads=True)
+        except Exception:
+            faulthandler.enable(all_threads=True)  # → stderr (the brain's goes to the journal)
+    except Exception:
+        pass
+
 
 def _build_context(
     api_key: str,
@@ -107,6 +132,8 @@ def main(
     set_claude_key: str = typer.Option("", "--set-claude-key", help="Save an Anthropic key, switch to the Claude backend, and exit"),
     version: bool = typer.Option(False, "--version", "-v", help="Show version"),
 ) -> None:
+    _enable_faulthandler()
+
     if version:
         from gabagent import __version__
         typer.echo(f"gab-agent {__version__}")
