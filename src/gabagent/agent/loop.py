@@ -61,6 +61,19 @@ def _eye(ctx: AgentContext, state: str, level: float = 0.0) -> None:
         set_state(state, level)
 
 
+async def _eye_heartbeat(ctx: AgentContext, interval: float = 2.0) -> None:
+    """Keep the eye lit for the whole turn: re-stamp `thinking` on an interval so the state file's
+    `ts` keeps advancing and the reader's stale-failsafe (aria_state.STALE_SECS=5s) never blanks the
+    eye to `off` during long LLM streams or slow tool runs. `_eye` no-ops unless config.aria_eye, so
+    this is free when the eye is off. TUI run_loop only — in voice mode VAC owns the writer."""
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            _eye(ctx, "thinking")
+    except asyncio.CancelledError:
+        pass
+
+
 _TOOL_KEEP_RECENT = 6    # keep last N tool results in full
 _TOOL_TRIM_CHARS = 400   # trim older ones to this many chars
 
@@ -212,6 +225,13 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
         ctx.session.append_message(ChatMessage(role="user", content=initial_prompt))
 
     _force_input = False
+    _eye_hb: asyncio.Task | None = None  # heartbeat keeping the eye lit across a turn (aria_eye)
+
+    def _stop_eye_hb() -> None:
+        nonlocal _eye_hb
+        if _eye_hb is not None:
+            _eye_hb.cancel()
+            _eye_hb = None
 
     while True:
         _msgs = ctx.session.messages()
@@ -232,6 +252,7 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
                     badge = ctx.rate_limiter.forced_badge(pinned)
                 else:
                     badge = ctx.rate_limiter.badge
+                _stop_eye_hb()
                 _eye(ctx, "idle")
                 user_input = await handler.prompt(badge)
                 if user_input is None:
@@ -257,6 +278,7 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
 
                 ctx.session.append_message(ChatMessage(role="user", content=stripped))
             else:
+                _stop_eye_hb()
                 break
 
         initial_prompt = None
@@ -350,6 +372,8 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
             request_model = None if ctx.local_mode else ctx.active_model
             request_effort = None if ctx.local_mode else ctx.active_effort
             _eye(ctx, "thinking")
+            if _eye_hb is None or _eye_hb.done():
+                _eye_hb = asyncio.create_task(_eye_heartbeat(ctx))
             streaming.start(model=display_model)
             async for chunk in _active_client(ctx, ctx.active_backend).stream_complete(
                 all_messages, tools or None, model=request_model, effort=request_effort
