@@ -34,6 +34,14 @@ def memory_file(cwd: Path | None = None) -> Path:
     return d / "memory.md"
 
 
+def persona_dir() -> Path:
+    """Global (cwd-independent) home for the self-learning persona layer: seed.md, INDEX.md,
+    journal.md. Deliberately ignores cwd — there is ONE Aria across every project/session."""
+    p = data_dir() / "persona"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def history_file() -> Path:
     return config_dir() / "history"
 

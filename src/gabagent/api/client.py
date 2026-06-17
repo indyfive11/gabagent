@@ -68,6 +68,13 @@ def _is_hard_backend_error(e: Exception) -> bool:
     ))
 
 
+def _is_network_timeout(e: Exception) -> bool:
+    """A transient network/connection timeout reaching the backend (httpx ConnectTimeout/ReadTimeout,
+    openai APITimeoutError). Expected-and-handled — the graceful 'say that again' retry covers it, so
+    it should NOT spill a full crash postmortem like an unexpected bug would."""
+    return "timeout" in type(e).__name__.lower() or "timed out" in str(e).lower()
+
+
 def _extract_text_tool_calls(content: str) -> tuple[str, list[ToolCallSpec]]:
     """Split model text that embeds tool calls as JSON into prose and ToolCallSpecs.
 

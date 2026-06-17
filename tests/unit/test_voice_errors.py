@@ -226,3 +226,80 @@ async def test_turn_error_is_captured(tmp_path, monkeypatch):
     # Logged to the debug join file.
     rows = [json.loads(l) for l in debug_path.read_text().splitlines()]
     assert any(r["event"] == "error" and "kaboom" in r["cause"] for r in rows)
+    # An UNEXPECTED error (not a known backend state) DOES leave a crash postmortem for diagnosis.
+    assert list(tmp_path.glob("**/postmortems/*.md"))
+
+
+class _RaisingWith:
+    """A client whose stream raises a caller-supplied exception (to exercise error classification)."""
+    model = "arya"
+
+    def __init__(self, exc): self._exc = exc
+
+    async def stream_complete(self, messages, tools=None, model=None, retry_model=None, **kw):
+        raise self._exc
+        yield  # noqa: unreachable — makes this an async generator
+
+    async def complete_simple(self, messages, model=None):
+        return "x"
+
+
+def _err_ctx(tmp_path, exc):
+    cfg = GabAgentConfig(api_key="test")
+    cfg.router.enabled = False
+    ctx = AgentContext(
+        config=cfg, client=_RaisingWith(exc),
+        rate_limiter=types.SimpleNamespace(record=lambda *a, **k: None),
+        session=_FakeSession(), session_id="s", cwd=tmp_path,
+        system_prompt="", headless=True,
+    )
+    ctx.voice_mode = True
+    ctx.voice_session = VoiceSession("s", ctx)
+    ctx.voice_debug_path = str(tmp_path / "voice_debug.jsonl")
+    return ctx
+
+
+async def _drive(ctx):
+    vs = ctx.voice_session
+    evs = []
+    start_turn(ctx, vs, "play some 80s synthwave")
+    async for ev in drain(vs):
+        evs.append(ev)
+    return evs
+
+
+async def test_hard_backend_error_speaks_honest_line_and_skips_postmortem(tmp_path, monkeypatch):
+    # A persistent 402 with no fallback rung must NOT read as a transient "say that again", and must
+    # NOT spill a crash postmortem (it's a known billing state, not a bug).
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    ctx = _err_ctx(tmp_path, RuntimeError(
+        "APIStatusError: Error code: 402 - Insufficient credits. Please purchase more credits"))
+    evs = await _drive(ctx)
+
+    err = [e for e in evs if e.type == "error"]
+    assert err, "expected a spoken error event"
+    spoken = err[0].text.lower()
+    assert "billing" in spoken or "account" in spoken            # honest, distinct line
+    assert "say that again" not in spoken and "hiccup" not in spoken
+    assert not list(tmp_path.glob("**/postmortems/*.md"))        # no crash report for a billing state
+
+
+async def test_network_timeout_skips_postmortem(tmp_path, monkeypatch):
+    # A ConnectTimeout is transient — "say that again" is fine — but it shouldn't write a crash report.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    ctx = _err_ctx(tmp_path, RuntimeError("APITimeoutError: Request timed out."))
+    evs = await _drive(ctx)
+
+    err = [e for e in evs if e.type == "error"]
+    assert err and err[0].text                                   # still speaks a graceful line
+    assert "hiccup" in err[0].text.lower()                       # transient → the retry nudge
+    assert not list(tmp_path.glob("**/postmortems/*.md"))
+
+
+def test_network_timeout_classifier():
+    from gabagent.api.client import _is_network_timeout, _is_hard_backend_error
+    assert _is_network_timeout(RuntimeError("APITimeoutError: Request timed out.")) is True
+    assert _is_network_timeout(TimeoutError("slow")) is True     # class name carries it
+    assert _is_network_timeout(RuntimeError("inference_failed")) is False
+    # A timeout is NOT a hard/structural error — it can succeed on retry.
+    assert _is_hard_backend_error(RuntimeError("Request timed out.")) is False

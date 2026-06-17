@@ -10,6 +10,22 @@ if TYPE_CHECKING:
     from gabagent.agent.context import AgentContext
 
 
+def archive_if_large(path: Path, keep: int = 50, threshold: int = 200) -> None:
+    """If `path` exceeds `threshold` lines, move the oldest lines to a sibling `<stem>-archive.md`
+    and keep only the newest `keep` lines. Shared tiered-pruning primitive used by both project
+    memory (MemoryManager.health_check) and the persona journal. No-op if the file is small/absent."""
+    if not path.exists():
+        return
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if len(lines) < threshold:
+        return
+    kept, archive = lines[-keep:], lines[:-keep]
+    archive_path = path.with_name(f"{path.stem}-archive.md")
+    with archive_path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(archive) + "\n")
+    path.write_text("\n".join(kept), encoding="utf-8")
+
+
 class MemoryManager:
     def __init__(self, cwd: Path | None = None):
         self._path = memory_file(cwd)
@@ -48,21 +64,7 @@ class MemoryManager:
 
     def health_check(self) -> None:
         """Archiving logic: if memory file > 200 lines, archive oldest and keep newest."""
-        if not self._path.exists():
-            return
-            
-        lines = self._path.read_text(encoding="utf-8").splitlines()
-        if len(lines) < 200:
-            return
-            
-        # Split: keep last 50 lines in memory, archive the rest
-        keep, archive = lines[-50:], lines[:-50]
-        
-        archive_path = self._path.with_name(f"{self._path.stem}-archive.md")
-        with archive_path.open("a", encoding="utf-8") as f:
-            f.write("\n".join(archive) + "\n")
-            
-        self._path.write_text("\n".join(keep), encoding="utf-8")
+        archive_if_large(self._path)
 
 
 @registry.register
@@ -115,4 +117,16 @@ def _rebuild_system_prompt(ctx: AgentContext) -> str:
     from gabagent.session.memory import MemoryManager
     mgr = MemoryManager(ctx.cwd)
     memory = mgr.load()
-    return build_system_prompt(cwd=ctx.cwd, memory=memory or None)
+    persona = None
+    if getattr(ctx.config, "persona_enabled", False):
+        try:
+            from gabagent.persona.manager import PersonaManager
+            persona = PersonaManager().brief() or None
+        except Exception:
+            persona = None
+    return build_system_prompt(
+        cwd=ctx.cwd,
+        memory=memory or None,
+        load_global_claude_md=ctx.config.load_global_claude_md,
+        persona=persona,
+    )

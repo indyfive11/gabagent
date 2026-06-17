@@ -31,6 +31,7 @@ async def handle_slash(command: str, ctx: AgentContext) -> bool:
         "/inbox": _inbox,
         "/local": _local,
         "/backend": _backend,
+        "/persona": _persona,
         "/voice": _voice,
         "/skills": _skills,
         "/attestation": _attestation,
@@ -70,6 +71,7 @@ async def _help(arg: str, ctx: AgentContext) -> None:
         ("/inbox", "Check messages from Claude Code"),
         ("/local [on|off|only]", "on=local as the floor rung (escalates); only=exclusive; off=back to Aria"),
         ("/backend [gab|claude]", "Show or switch the LLM backend (the brain)"),
+        ("/persona [show|reset|on|off]", "Aria's learned personality — show it, reset to seed, or toggle"),
         ("/voice [on|off|brain]", "on/start=brain+mic (talk by voice); off/stop=stop; bare /voice toggles"),
         ("/skills [list|install <path>]", "Manage attested skill plugins (capabilities)"),
         ("/attestation", "View/set how skill plugins are vetted"),
@@ -172,6 +174,47 @@ async def _backend(arg: str, ctx: AgentContext) -> None:
     from gabagent.config.loader import save_config
     save_config(ctx.config)
     console.print(f"[info]Backend switched to: {target}  (base model: {ctx.client.model})[/info]", markup=True)
+
+
+async def _persona(arg: str, ctx: AgentContext) -> None:
+    from gabagent.persona.manager import PersonaManager
+    from gabagent.session.memory import _rebuild_system_prompt
+    mgr = PersonaManager()
+    sub = arg.strip().lower() or "show"
+
+    if sub == "show":
+        if not ctx.config.persona_enabled:
+            console.print("[dim]Persona learning is OFF. /persona on to enable.[/dim]", markup=True)
+        from rich.markdown import Markdown
+        seed, idx = mgr.seed(), mgr.index()
+        console.print("[info]— Seed (the floor) —[/info]", markup=True)
+        console.print(Markdown(seed or "(none)"))
+        console.print("[info]— Learned with this user —[/info]", markup=True)
+        console.print(Markdown(idx or "_(nothing learned yet — talk to her and it grows at shutdown)_"))
+        hint = mgr.voice_hint()
+        if hint.get("character"):
+            console.print(
+                f"[dim]Suggested TTS voice character: {hint['character']} "
+                f"(confidence {hint.get('confidence', 0)}) — voice side confirms/overrides[/dim]",
+                markup=True,
+            )
+        return
+
+    if sub == "reset":
+        mgr.reset()
+        ctx.system_prompt = _rebuild_system_prompt(ctx)
+        console.print("[info]Persona reset to seed (learned traits + journal cleared).[/info]", markup=True)
+        return
+
+    if sub in ("on", "off"):
+        ctx.config.persona_enabled = sub == "on"
+        from gabagent.config.loader import save_config
+        save_config(ctx.config)
+        ctx.system_prompt = _rebuild_system_prompt(ctx)
+        console.print(f"[info]Persona learning {'ON' if sub == 'on' else 'OFF'}.[/info]", markup=True)
+        return
+
+    console.print("[warning]Usage: /persona [show|reset|on|off][/warning]", markup=True)
 
 
 async def _cost(arg: str, ctx: AgentContext) -> None:

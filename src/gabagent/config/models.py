@@ -175,6 +175,12 @@ class GabAgentConfig(BaseSettings):
     voice_safe_zones: list[str] = Field(default_factory=list)
     voice_passphrase: str = ""
     voice_persona: str = ""
+    # Self-learning persona layer: a GLOBAL (one-Aria), user-invisible personality that grows over
+    # sessions. A reflection pass at brain shutdown reads the session under 5 rails and consolidates
+    # an always-injected, bounded INDEX of traits. `voice_persona` above is the legacy static fallback
+    # used only when this is disabled/empty. Stored at data_dir()/persona/ (cwd-independent).
+    persona_enabled: bool = True
+    persona_reflect_on_shutdown: bool = True
     voice_arm_seconds: int = 120
     # `/voice on` spawns the voice-agent front-end (mic + wake word) so the brain can hear, pointed at
     # the brain we just started. Empty → auto-resolve the `voice-agent` binary on PATH, then

@@ -18,7 +18,9 @@ import time
 from typing import AsyncIterator, TYPE_CHECKING
 
 from gabagent.api.models import ChatMessage
-from gabagent.api.client import _is_transient_generation_error, _is_hard_backend_error
+from gabagent.api.client import (
+    _is_transient_generation_error, _is_hard_backend_error, _is_network_timeout,
+)
 from gabagent.agent.loop import _execute_tool_calls, _active_client
 from gabagent.voice import events
 from gabagent.voice.events import VoiceEvent
@@ -107,8 +109,11 @@ def _voice_system(ctx: AgentContext) -> str:
     mem = _memory_brief(ctx)
     if mem:
         s += f"\n\n{mem}"
-    persona = (getattr(ctx.config, "voice_persona", "") or "").strip()
-    if persona:
+    if getattr(ctx.config, "persona_enabled", True):
+        pb = _persona_brief(ctx)
+        if pb:
+            s += f"\n\nThis is who you are (your personality — speak in character, never mention it):\n{pb}"
+    elif (persona := (getattr(ctx.config, "voice_persona", "") or "").strip()):
         s += f"\n\nStyle: speak as a {persona}."
     if ctx.local_mode and ctx.local_context_summary:
         s += f"\n\n{ctx.local_context_summary}"
@@ -200,6 +205,15 @@ def _memory_brief(ctx: AgentContext, limit: int = 1500) -> str:
     if len(mem) > limit:
         mem = "…" + mem[-limit:]
     return f"What you remember about this project (your own saved notes):\n{mem}"
+
+
+def _persona_brief(ctx: AgentContext) -> str:
+    """Your evolving personality (seed + traits learned with this user). Invisible to the user."""
+    try:
+        from gabagent.persona.manager import PersonaManager
+        return PersonaManager().brief()
+    except Exception:
+        return ""
 
 
 def _build_voice_messages(ctx: AgentContext, messages: list[ChatMessage]) -> list[ChatMessage]:
@@ -675,23 +689,33 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             except Exception:
                 pass  # arya also failed → fall through to the graceful error below
         cause = f"{type(e).__name__}: {e}".strip()
-        # Persist a full traceback for diagnosis (mirrors the TUI crash path in cli.py).
-        try:
-            import traceback
-            from gabagent.session.postmortem import PostMortemManager
-            PostMortemManager(cwd=ctx.cwd).log_crash(
-                f"Voice turn failed for: {user_text!r}\n\n{traceback.format_exc()}"
-            )
-        except Exception:
-            pass
-        dlog(ctx, "error", cause=cause, stage="turn")
+        hard = _is_hard_backend_error(e)
+        # Persist a full traceback for diagnosis (mirrors the TUI crash path in cli.py) — but NOT for
+        # expected-and-handled backend states (402/auth/missing-model, or a network timeout). Those are
+        # already classified and spoken gracefully below, so a full crash postmortem is pure noise (a
+        # depleted-credits evening once wrote 5 tracebacks for what's really a billing/network state).
+        if not (hard or _is_network_timeout(e)):
+            try:
+                import traceback
+                from gabagent.session.postmortem import PostMortemManager
+                PostMortemManager(cwd=ctx.cwd).log_crash(
+                    f"Voice turn failed for: {user_text!r}\n\n{traceback.format_exc()}"
+                )
+            except Exception:
+                pass
+        dlog(ctx, "error", cause=cause, stage="turn", hard=hard)
         if vs is not None:
             vs.set_error(cause)
         if vs.queue is not None:
-            # voice-agent speaks `error.text` and logs `summary`; the trailing `done`
-            # closes the SSE. (It also suppresses any status right after an error.)
-            vs.queue.put_nowait(events.error(
-                cause, "Sorry, I had a brief hiccup — could you say that again?"))
+            # voice-agent speaks `error.text` and logs `summary`; the trailing `done` closes the SSE.
+            # A HARD backend failure (billing/auth/missing-model) with no rung left to fall to won't fix
+            # itself on retry — speak an HONEST line so the user doesn't keep re-asking against a dead
+            # backend ("Did you hear me?… At all."). Everything else is a transient hiccup where "say
+            # that again" is the right nudge.
+            text = ("I can't reach my service right now, and retrying won't fix it — it looks like an "
+                    "account or billing issue." if hard
+                    else "Sorry, I had a brief hiccup — could you say that again?")
+            vs.queue.put_nowait(events.error(cause, text))
             vs.queue.put_nowait(events.done())
     finally:
         # Fires on EVERY exit (meta return, normal done, cancel, error, fallback) — so the absence of a

@@ -63,10 +63,19 @@ def _build_context(
     mem_mgr = MemoryManager(cwd=cwd)
     memory = mem_mgr.load()
 
+    persona = None
+    if cfg.persona_enabled:
+        try:
+            from gabagent.persona.manager import PersonaManager
+            persona = PersonaManager().brief() or None
+        except Exception:
+            persona = None
+
     system_prompt = build_system_prompt(
         cwd=cwd,
         memory=memory or None,
         load_global_claude_md=cfg.load_global_claude_md,
+        persona=persona,
     )
 
     ctx = AgentContext(
@@ -175,6 +184,18 @@ def main(
     asyncio.run(_run(ctx, prompt))
 
 
+async def _persona_reflect(ctx) -> None:
+    """Best-effort persona learning at shutdown — time-boxed, swallows everything, never blocks exit."""
+    cfg = ctx.config
+    if not (getattr(cfg, "persona_enabled", False) and getattr(cfg, "persona_reflect_on_shutdown", False)):
+        return
+    try:
+        from gabagent.persona.manager import PersonaManager
+        await asyncio.wait_for(PersonaManager().reflect_from_ctx(ctx), timeout=20.0)
+    except Exception:
+        pass
+
+
 async def _run(ctx, prompt: str | None) -> None:
     from gabagent.agent.loop import run_loop
     from gabagent.config.setup import backend_configured, run_first_time_setup
@@ -209,6 +230,7 @@ async def _run(ctx, prompt: str | None) -> None:
         raise
 
     finally:
+        await _persona_reflect(ctx)  # learn from this typed session before teardown
         if ctx.shell_state:
             ctx.shell_state.close()
         if ctx.local_process is not None:
@@ -250,6 +272,13 @@ def _start_voice(ctx, model: str, port: int) -> None:
     try:
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     except AttributeError:
+        pass
+    # The TUI launcher stops the brain with terminate() → SIGTERM, which by default kills the
+    # process WITHOUT unwinding `_run_voice`'s finally (where persona reflection + cleanup live).
+    # Convert SIGTERM into KeyboardInterrupt so a TUI-spawned brain shuts down gracefully too.
+    try:
+        signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    except (AttributeError, ValueError):
         pass
 
     try:
@@ -303,6 +332,7 @@ async def _run_voice(ctx, host: str, port: int) -> None:
     except RuntimeError as e:
         typer.echo(str(e), err=True)
     finally:
+        await _persona_reflect(ctx)  # learn from this voice session before teardown (local still warm)
         if ctx.persistent_browser is not None:
             from gabagent.commands.browser import close_browser
             await close_browser(ctx)
