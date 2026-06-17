@@ -54,6 +54,13 @@ def _active_client(ctx: AgentContext, backend: str | None = None):
     ctx.clients[backend] = client
     return client
 
+def _eye(ctx: AgentContext, state: str, level: float = 0.0) -> None:
+    """Emit Aria eye-indicator state during TUI turns (opt-in via config.aria_eye). No-op otherwise."""
+    if getattr(ctx.config, "aria_eye", False):
+        from gabagent.aria_state import set_state
+        set_state(state, level)
+
+
 _TOOL_KEEP_RECENT = 6    # keep last N tool results in full
 _TOOL_TRIM_CHARS = 400   # trim older ones to this many chars
 
@@ -225,8 +232,10 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
                     badge = ctx.rate_limiter.forced_badge(pinned)
                 else:
                     badge = ctx.rate_limiter.badge
+                _eye(ctx, "idle")
                 user_input = await handler.prompt(badge)
                 if user_input is None:
+                    _eye(ctx, "off")
                     break
 
                 stripped = user_input.strip()
@@ -340,6 +349,7 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
             display_model = ctx.config.local_model if ctx.local_mode else (ctx.active_model or ctx.config.model)
             request_model = None if ctx.local_mode else ctx.active_model
             request_effort = None if ctx.local_mode else ctx.active_effort
+            _eye(ctx, "thinking")
             streaming.start(model=display_model)
             async for chunk in _active_client(ctx, ctx.active_backend).stream_complete(
                 all_messages, tools or None, model=request_model, effort=request_effort

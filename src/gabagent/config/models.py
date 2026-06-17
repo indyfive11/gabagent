@@ -165,6 +165,9 @@ class GabAgentConfig(BaseSettings):
     # Aria is the floor and local is off. Distinct from the ephemeral `local_mode` (exclusive
     # local, router off). Toggled by "/local floor" | "/local aria" and the voice floor commands.
     local_floor: bool = False
+    # Emit Aria "HAL eye" status (thinking/idle/off) to the state file during TUI turns so a Conky
+    # eye panel glows for typed sessions too. Opt-in; the voice front-end is the writer in voice mode.
+    aria_eye: bool = False
     # Voice mode (gab --voice-serve). Empty voice_model ⇒ normal router (arya base,
     # escalate to Claude); a non-empty voice_model pins that single model.
     voice_model: str = ""
