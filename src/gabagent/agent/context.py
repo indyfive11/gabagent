@@ -29,6 +29,11 @@ class AgentContext:
     active_effort: str | None = None  # thinking effort for the current turn (Claude provider)
     active_backend: str | None = None  # backend serving the current turn: "claude" | "gab" | "local"
     force_model: bool = False
+    # Runtime model PIN (session-only): when force_model is True and pinned_backend is set, every turn
+    # runs on exactly this (model, effort, backend) with NO escalation, until unpinned (/model auto).
+    pinned_model: str | None = None
+    pinned_effort: str | None = None
+    pinned_backend: str | None = None
     local_client: Any = field(default=None)
     local_mode: bool = False
     local_process: Any = field(default=None)
@@ -37,6 +42,9 @@ class AgentContext:
     # Lazily-built per-backend clients keyed "gab" | "claude" | "local", for the cross-backend
     # escalation ladder. `client`/`local_client` remain for back-compat and the exclusive local_mode.
     clients: dict[str, Any] = field(default_factory=dict)
+    # Backends that HARD-failed this session (402 billing / auth / missing model). The assembled
+    # ladder skips them so the floor moves up; cleared on restart. Announced once when first marked.
+    degraded_backends: set = field(default_factory=set)
     # Voice mode (all inert for TUI sessions).
     voice_mode: bool = False
     approval_hook: Any = field(default=None)  # async (tool_name, args, ctx) -> bool

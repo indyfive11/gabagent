@@ -52,6 +52,22 @@ def _is_transient_generation_error(e: Exception) -> bool:
             or "inference_failed" in s)
 
 
+def _is_hard_backend_error(e: Exception) -> bool:
+    """A STRUCTURAL backend failure that will NOT fix itself on retry — billing (HTTP 402
+    'insufficient credits'), auth (401/403), or a missing model (404). Unlike a transient hiccup,
+    these mean the backend is genuinely unusable, so they must be SURFACED (announced + the backend
+    marked degraded), never silently retried/masked."""
+    s = str(e).lower()
+    if any(c in s for c in ("code: 402", "code: 401", "code: 403", "code: 404",
+                            "status 402", "status 401", "status 403", "status 404")):
+        return True
+    return any(p in s for p in (
+        "insufficient credits", "purchase more credits", "upgrade to plus",
+        "invalid api key", "unauthorized", "authentication", "permission denied",
+        "model not found", "model does not exist",
+    ))
+
+
 def _extract_text_tool_calls(content: str) -> tuple[str, list[ToolCallSpec]]:
     """Split model text that embeds tool calls as JSON into prose and ToolCallSpecs.
 

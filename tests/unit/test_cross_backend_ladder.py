@@ -102,6 +102,91 @@ def test_default_constructor_is_unchanged_backcompat():
     assert [rung.model for rung in r.ladder] == [rung.model for rung in cfg.claude.ladder]
 
 
+# ---- hard-failure safeguard: surface + degrade + skip (never silent) ----
+
+@pytest.mark.parametrize("msg", [
+    "RuntimeError: APIStatusError: Error code: 402 - Insufficient credits. Please purchase more credits",
+    "APIStatusError: Error code: 401 - unauthorized",
+    "Error code: 403 - permission denied",
+    "invalid api key",
+    "model not found",
+])
+def test_hard_backend_errors_detected(msg):
+    from gabagent.api.client import _is_hard_backend_error
+    assert _is_hard_backend_error(Exception(msg)) is True
+
+
+@pytest.mark.parametrize("msg", [
+    "The model failed to generate a response. Please try again.",
+    "inference_failed",
+    "some random network blip",
+])
+def test_transient_and_normal_errors_are_not_hard(msg):
+    from gabagent.api.client import _is_hard_backend_error
+    assert _is_hard_backend_error(Exception(msg)) is False
+
+
+def test_degraded_gab_moves_floor_off_aria():
+    cfg = _cfg()
+    r = ModelRouter.assemble(cfg, local_floor=False, local_running=False, degraded={"gab"})
+    # Aria skipped → the floor is now the first Claude rung; no gab rung anywhere.
+    assert r.ladder[0].backend == "claude"
+    assert all(rung.backend == "claude" for rung in r.ladder)
+
+
+def test_degraded_gab_with_local_floor_keeps_local_then_claude():
+    cfg = _cfg()
+    r = ModelRouter.assemble(cfg, local_floor=True, local_running=True, degraded={"gab"})
+    assert [rung.backend for rung in r.ladder] == ["local"] + ["claude"] * len(cfg.claude.ladder)
+
+
+def test_all_cloud_degraded_leaves_local_only():
+    cfg = _cfg()
+    r = ModelRouter.assemble(cfg, local_floor=True, local_running=True, degraded={"gab", "claude"})
+    assert [rung.backend for rung in r.ladder] == ["local"]
+
+
+def test_everything_degraded_returns_none():
+    cfg = _cfg()
+    assert ModelRouter.assemble(cfg, local_floor=False, local_running=False,
+                                degraded={"gab", "claude"}) is None
+
+
+# ---- command-intent: device/media turns bump off the local floor to Aria ----
+
+@pytest.mark.parametrize("text", [
+    "turn down the music", "turn it up", "lower the volume", "make it louder", "pause the music",
+    "skip this song", "next track", "play some jazz", "play music", "put on a playlist",
+    "stop the movie", "mute it", "set the volume to 30", "turn off the lights", "crank up the music",
+])
+def test_looks_like_command_true(text):
+    from gabagent.agent.router import looks_like_command
+    assert looks_like_command(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "what's the weather like", "tell me a joke", "how are you", "what do you think of that",
+    "who won the game last night", "explain how dns works", "what time is it",
+])
+def test_looks_like_command_false_for_chat(text):
+    from gabagent.agent.router import looks_like_command
+    assert looks_like_command(text) is False
+
+
+def test_command_bump_target_is_aria_when_local_floor():
+    # The bump sends a command to rung 1 = the first non-local rung (Aria) when local is the floor.
+    cfg = _cfg()
+    r = ModelRouter.assemble(cfg, local_floor=True, local_running=True)
+    assert r.ladder[0].backend == "local"
+    assert r.rung(1).backend == "gab"  # Aria
+
+
+def test_degraded_notice_names_both_backends():
+    from gabagent.voice.turn import _degraded_notice
+    msg = _degraded_notice("gab", "claude")
+    assert "Aria" in msg and "Claude" in msg
+
+
 def test_local_floor_config_field_round_trips(tmp_path, monkeypatch):
     from gabagent.config import loader
     monkeypatch.setattr(loader, "_settings_path", lambda: tmp_path / "settings.json", raising=False)

@@ -165,6 +165,7 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
                 ctx.config,
                 local_floor=ctx.local_floor,
                 local_running=ctx.local_client is not None,
+                degraded=ctx.degraded_backends,
             ) or ModelRouter(ctx.config)
         except Exception:
             pass
@@ -218,7 +219,10 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
                 if ctx.local_mode and ctx.config.local_model:
                     badge = f"LOCAL:{ctx.config.local_model}"
                 elif ctx.force_model:
-                    badge = ctx.rate_limiter.forced_badge(ctx.config.model)
+                    pinned = ctx.pinned_model or ctx.config.model
+                    if ctx.pinned_effort:
+                        pinned = f"{pinned}/{ctx.pinned_effort}"
+                    badge = ctx.rate_limiter.forced_badge(pinned)
                 else:
                     badge = ctx.rate_limiter.badge
                 user_input = await handler.prompt(badge)
@@ -268,6 +272,19 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
             else:
                 ctx.active_model = await router.classify_intent(last_user, ctx.client)
                 ctx.active_backend = "gab"
+            # Device/media commands can't run reliably on the local floor → bump to the first non-local rung.
+            if router.assembled and ctx.active_backend == "local":
+                from gabagent.agent.router import looks_like_command
+                if looks_like_command(last_user):
+                    nl = router.rung(1)
+                    if nl.backend != "local":
+                        ctx.active_model, ctx.active_effort, ctx.active_backend = (
+                            nl.model, nl.effort or None, nl.backend)
+
+        # Runtime model PIN: routing is skipped (force_model), so apply the pinned rung directly.
+        if ctx.force_model and ctx.pinned_backend and ctx.active_model is None:
+            ctx.active_model, ctx.active_effort, ctx.active_backend = (
+                ctx.pinned_model, ctx.pinned_effort, ctx.pinned_backend)
 
         local_turn = ctx.local_mode or ctx.active_backend == "local"
         if local_turn:

@@ -16,8 +16,8 @@ if TYPE_CHECKING:
 
 @dataclass
 class MetaCommand:
-    kind: str          # "brain" | "undo" | "query" | "forget" | "quiet" | "floor"
-    value: str = ""    # brain: local|cloud · floor: local|aria · query: model|where|recap|error|caps|memory · forget: last|all
+    kind: str          # "brain" | "undo" | "query" | "forget" | "quiet" | "floor" | "pin"
+    value: str = ""    # brain: local|cloud · floor: local|aria · pin: <model[ effort]>|auto · query: … · forget: last|all
 
 
 # -- detection -------------------------------------------------------------
@@ -59,14 +59,38 @@ _QUIET = re.compile(
 _QUAL = r"(?:floor|fallback|bottom\s+rung|default|baseline)"
 _FLOOR_OFF = re.compile(
     rf"\bdrop\s+(?:the\s+)?local\b"
-    rf"|\b(?:turn\s+off|disable|unload|shut\s+down)\s+(?:the\s+)?local\b"
+    rf"|\b(?:turn\s+off|disable|unload|shut\s+down|stop)\s+(?:the\s+)?local\b"
+    rf"|\bturn\s+(?:the\s+)?local\s+off\b"
     rf"|\b(?:aria|arya)\b.{{0,25}}?\b{_QUAL}\b"
     rf"|\b{_QUAL}\b.{{0,25}}?\b(?:aria|arya)\b",
     re.I,
 )
 _FLOOR_ON = re.compile(
     rf"\blocal\b.{{0,25}}?\b{_QUAL}\b"
-    rf"|\b{_QUAL}\b.{{0,25}}?\blocal\b",
+    rf"|\b{_QUAL}\b.{{0,25}}?\blocal\b"
+    rf"|\bturn\s+(?:on\s+(?:the\s+)?local|(?:the\s+)?local\s+on)\b"  # "turn on local" → floor (the default)
+    rf"|\b(?:enable|activate)\s+(?:the\s+)?local\b",
+    re.I,
+)
+# EXCLUSIVE local (no escalation) — distinct from the floor. "use only local" / "local only".
+_EXCLUSIVE_LOCAL = re.compile(
+    r"\b(?:use\s+only|only\s+use|exclusively)\s+(?:the\s+)?local\b"
+    r"|\blocal\s+only\b|\bonly\s+(?:the\s+)?local\b",
+    re.I,
+)
+
+# Model PIN — run EVERY prompt on one chosen model, no escalation, until "back to auto". Needs an
+# explicit pin verb ("just use opus", "lock to sonnet", "pin haiku at max") so a bare "use aria"
+# still means the exclusive cloud switch. Cloud models only here; local has its own commands.
+_PIN = re.compile(
+    r"\b(?:just\s+use|only\s+use|use\s+only|lock\s+(?:to|onto)|pin(?:\s+to)?|stick\s+(?:to|with))\s+"
+    r"(?P<m>opus|sonnet|haiku|claude(?:[-\w.]+)?|aria|arya|gab)"
+    r"(?:\s+(?:at\s+|on\s+)?(?P<e>low|medium|high|xhigh|max))?\b",
+    re.I,
+)
+_UNPIN = re.compile(
+    r"\b(?:back\s+to\s+auto|use\s+auto(?:matic)?|automatic(?:\s+model)?|unpin|stop\s+pinning"
+    r"|use\s+the\s+ladder|auto\s+escalat\w*|resume\s+escalat\w*)\b",
     re.I,
 )
 
@@ -126,6 +150,16 @@ _FORGET_ALL = re.compile(r"\b(?:everything|all(?:\s+of\s+it)?|your\s+memory|memo
 
 def detect_meta_command(text: str) -> MetaCommand | None:
     t = text.strip()
+    # Model pin / unpin are checked BEFORE the exclusive switch ("just use aria" = pin, not switch).
+    if _UNPIN.search(t):
+        return MetaCommand("pin", "auto")
+    m = _PIN.search(t)
+    if m:
+        val = m.group("m") + (" " + m.group("e") if m.group("e") else "")
+        return MetaCommand("pin", val.strip())
+    # "use only local" / "local only" → EXCLUSIVE local (no escalation), checked before the floor.
+    if _EXCLUSIVE_LOCAL.search(t):
+        return MetaCommand("brain", "local")
     # Floor toggle is checked BEFORE the exclusive switch (it's the more specific, qualified phrase).
     if _FLOOR_OFF.search(t):
         return MetaCommand("floor", "aria")

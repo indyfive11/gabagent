@@ -55,7 +55,7 @@ async def _help(arg: str, ctx: AgentContext) -> None:
         ("/help", "Show this help"),
         ("/clear", "Clear screen and reset display"),
         ("/compact", "Compress conversation context"),
-        ("/model [name]", "Show or switch model"),
+        ("/model [name|auto]", "Pin one model (opus/sonnet/haiku/aria/local) — no escalation; /model auto to resume"),
         ("/cost", "Show token usage and model info"),
         ("/usage", "Detailed session usage"),
         ("/memory", "Show persistent memory"),
@@ -68,9 +68,9 @@ async def _help(arg: str, ctx: AgentContext) -> None:
         ("/config", "Show current configuration"),
         ("/msg <text>", "Send a message to Claude Code"),
         ("/inbox", "Check messages from Claude Code"),
-        ("/local [on|off]", "Toggle local Ollama model (starts on demand)"),
+        ("/local [on|off|only]", "on=local as the floor rung (escalates); only=exclusive; off=back to Aria"),
         ("/backend [gab|claude]", "Show or switch the LLM backend (the brain)"),
-        ("/voice [on|brain|off]", "on=brain+mic front-end (talk by voice); brain=brain only; off=stop"),
+        ("/voice [on|off|brain]", "on/start=brain+mic (talk by voice); off/stop=stop; bare /voice toggles"),
         ("/skills [list|install <path>]", "Manage attested skill plugins (capabilities)"),
         ("/attestation", "View/set how skill plugins are vetted"),
         ("/exit", "Exit Gab-Agent"),
@@ -91,14 +91,50 @@ async def _compact(arg: str, ctx: AgentContext) -> None:
 
 
 async def _model(arg: str, ctx: AgentContext) -> None:
-    if arg:
-        ctx.config.model = arg
-        ctx.client.model = arg
-        console.print(f"[info]Model switched to: {arg}[/info]", markup=True)
-    else:
-        active = ctx.active_model or ctx.config.model
-        console.print(f"[info]Current model: {active}[/info]", markup=True)
-        console.print(f"[info]Usage: {ctx.rate_limiter.badge}[/info]", markup=True)
+    a = arg.strip().lower()
+    if not a:
+        if ctx.force_model and ctx.pinned_backend:
+            eff = f"/{ctx.pinned_effort}" if ctx.pinned_effort else ""
+            console.print(
+                f"[info]Pinned to {ctx.pinned_model}{eff} ({ctx.pinned_backend}). "
+                "Escalation OFF — /model auto to resume.[/info]", markup=True)
+        else:
+            console.print(
+                f"[info]Auto-escalation ON (Aria → Claude). Pin one model with /model <name>.[/info]",
+                markup=True)
+        console.print("[dim]names: opus · sonnet · haiku · aria · local  (add effort: 'opus max')[/dim]",
+                      markup=True)
+        return
+    if a in ("auto", "off", "ladder", "escalate", "automatic"):
+        ctx.force_model = False
+        ctx.pinned_model = ctx.pinned_effort = ctx.pinned_backend = None
+        ctx.active_model = ctx.active_effort = ctx.active_backend = None
+        console.print("[info]Auto-escalation resumed (Aria → Claude).[/info]", markup=True)
+        return
+    if a in ("list", "?", "names"):
+        console.print("[info]opus · sonnet · haiku (Claude) · aria (Gab) · local/devstral (Ollama). "
+                      "Add an effort for Claude: 'opus max'.[/info]", markup=True)
+        return
+    from gabagent.agent.router import resolve_pin
+    res = resolve_pin(a, ctx.config)
+    if res is None:
+        console.print(f"[warning]Unknown model '{arg}'. Try /model list[/warning]", markup=True)
+        return
+    model, effort, backend = res
+    if backend == "local":
+        from gabagent.local.ollama import ensure_ollama_running, _build_local_client, _FLOOR_KEEP_ALIVE
+        console.print("[dim]Starting local model…[/dim]", markup=True)
+        err = await ensure_ollama_running(ctx)
+        if err:
+            console.print(f"[error]Can't start local: {err}[/error]", markup=True)
+            return
+        if ctx.local_client is None:
+            ctx.local_client = _build_local_client(ctx, _FLOOR_KEEP_ALIVE)
+    ctx.force_model = True
+    ctx.pinned_model, ctx.pinned_effort, ctx.pinned_backend = model, effort, backend
+    eff = f"/{effort}" if effort else ""
+    console.print(f"[info]Pinned to {model}{eff}. Escalation OFF — /model auto to resume.[/info]",
+                  markup=True)
 
 
 async def _backend(arg: str, ctx: AgentContext) -> None:
@@ -124,6 +160,8 @@ async def _backend(arg: str, ctx: AgentContext) -> None:
     ctx.config.provider = target
     if target == "claude":
         ctx.config.model = ctx.config.claude.ladder[0].model
+    else:  # gab — reset the base model to Aria so a stale Claude id doesn't linger in the badge/client
+        ctx.config.model = ctx.config.router.simple_model
     # Reset per-turn routing state so the next turn re-classifies on the new provider.
     ctx.active_model = None
     ctx.active_effort = None
@@ -303,11 +341,11 @@ async def _local(arg: str, ctx: AgentContext) -> None:
         )
         return
 
-    sub = arg.strip().lower() or ("off" if ctx.local_mode else "on")
+    sub = arg.strip().lower() or ("off" if (ctx.local_mode or ctx.local_floor) else "on")
 
-    # Cross-backend ladder: make local the warm FLOOR rung (router still escalates to Aria → Claude),
-    # or drop it back to Aria as the floor. Distinct from the exclusive "on"/"off" local_mode below.
-    if sub == "floor":
+    # "/local on" (and "floor") = make local the warm FLOOR rung (router still escalates Aria → Claude).
+    # "/local only" = exclusive local (no escalation). "/local off" turns off whichever is active.
+    if sub in ("on", "floor"):
         from gabagent.local.ollama import start_local_floor
         console.print("[dim]Warming local as the floor rung… (ROCm GPU init takes ~30s)[/dim]", markup=True)
         err = await start_local_floor(ctx)
@@ -319,7 +357,7 @@ async def _local(arg: str, ctx: AgentContext) -> None:
             markup=True,
         )
         return
-    if sub == "aria":
+    if sub in ("aria",) or (sub == "off" and ctx.local_floor and not ctx.local_mode):
         from gabagent.local.ollama import stop_local_floor
         await stop_local_floor(ctx)
         console.print(
@@ -328,7 +366,7 @@ async def _local(arg: str, ctx: AgentContext) -> None:
         )
         return
 
-    if sub == "on" and not ctx.local_mode:
+    if sub in ("only", "exclusive") and not ctx.local_mode:
         from gabagent.local.ollama import ensure_ollama_running
         from gabagent.api.client import GabAIClient
         console.print("[dim]Starting local model… (ROCm GPU init takes ~30s)[/dim]", markup=True)
@@ -411,11 +449,17 @@ async def _voice(arg: str, ctx: AgentContext) -> None:
     )
 
     parts = arg.strip().split()
-    sub = parts[0].lower() if parts else "status"
+    sub = parts[0].lower() if parts else "toggle"
+    # Intuitive aliases: start→on, stop→off, listen→on, mute→off.
+    sub = {"start": "on", "listen": "on", "stop": "off", "mute": "off", "quit": "off"}.get(sub, sub)
     port = ctx.config.voice_port
     if len(parts) > 1 and parts[1].isdigit():
         port = int(parts[1])
     base = f"http://127.0.0.1:{port}"
+
+    # Bare "/voice" toggles: stop if the brain is up, else start it.
+    if sub == "toggle":
+        sub = "off" if await brain_health(base) else "on"
 
     if sub in ("status", ""):
         up = await brain_health(base)

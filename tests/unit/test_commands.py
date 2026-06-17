@@ -38,6 +38,26 @@ def test_bare_local_switch_is_still_exclusive_brain(text):
     assert mc is not None and mc.kind == "brain" and mc.value == "local"
 
 
+@pytest.mark.parametrize("text", ["turn on local", "turn local on", "enable local", "activate local"])
+def test_turn_on_local_is_floor(text):
+    # Intuitive "turn on local" → the FLOOR (escalates), the cross-backend default.
+    mc = detect_meta_command(text)
+    assert mc is not None and mc.kind == "floor" and mc.value == "local"
+
+
+@pytest.mark.parametrize("text", ["use only local", "only use local", "local only", "exclusively local"])
+def test_only_local_is_exclusive(text):
+    # "use only local" → EXCLUSIVE local (no escalation).
+    mc = detect_meta_command(text)
+    assert mc is not None and mc.kind == "brain" and mc.value == "local"
+
+
+@pytest.mark.parametrize("text", ["turn off local", "turn local off", "disable local", "stop local"])
+def test_turn_off_local_drops_to_aria(text):
+    mc = detect_meta_command(text)
+    assert mc is not None and mc.kind == "floor" and mc.value == "aria"
+
+
 @pytest.mark.parametrize("text", ["switch to Aria", "go back to the cloud", "use arya"])
 def test_bare_aria_switch_is_still_exclusive_cloud(text):
     mc = detect_meta_command(text)

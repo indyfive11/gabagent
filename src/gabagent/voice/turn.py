@@ -18,7 +18,7 @@ import time
 from typing import AsyncIterator, TYPE_CHECKING
 
 from gabagent.api.models import ChatMessage
-from gabagent.api.client import _is_transient_generation_error
+from gabagent.api.client import _is_transient_generation_error, _is_hard_backend_error
 from gabagent.agent.loop import _execute_tool_calls, _active_client
 from gabagent.voice import events
 from gabagent.voice.events import VoiceEvent
@@ -281,6 +281,38 @@ async def _emit_filtered(sfilter: SpeakableFilter, parts, emit) -> None:
             await emit(events.status(payload))
 
 
+_BACKEND_NAME = {"gab": "Aria", "claude": "Claude", "local": "the local model"}
+
+
+def _pin_friendly(model: str) -> str:
+    m = model.lower()
+    if "opus" in m: return "Opus"
+    if "sonnet" in m: return "Sonnet"
+    if "haiku" in m: return "Haiku"
+    if m == "arya": return "Aria"
+    return model
+
+
+def _degraded_notice(failed: str, recovered: str) -> str:
+    return (f"Heads up — {_BACKEND_NAME.get(failed, failed)} is unavailable "
+            f"(looks like a billing or auth problem). I've switched to "
+            f"{_BACKEND_NAME.get(recovered, recovered)} for now.")
+
+
+def _reassemble_floor(ctx: AgentContext):
+    """The floor rung of the ladder re-assembled with the current degraded set, as
+    (model, effort, backend) — or None when nothing usable is left."""
+    from gabagent.agent.router import ModelRouter
+    r = ModelRouter.assemble(
+        ctx.config, local_floor=ctx.local_floor,
+        local_running=ctx.local_client is not None, degraded=ctx.degraded_backends,
+    )
+    if r and r.ladder:
+        f = r.ladder[0]
+        return (f.model, f.effort or None, f.backend)
+    return None
+
+
 async def _handle_meta(ctx: AgentContext, mc: commands.MetaCommand, emit) -> None:
     if mc.kind == "brain":
         if mc.value == "local":
@@ -308,6 +340,31 @@ async def _handle_meta(ctx: AgentContext, mc: commands.MetaCommand, emit) -> Non
             from gabagent.local.ollama import stop_local_floor
             await stop_local_floor(ctx)
             await emit(events.token("Aria's the floor now — local's unloaded."))
+    elif mc.kind == "pin":
+        if mc.value == "auto":
+            ctx.force_model = False
+            ctx.pinned_model = ctx.pinned_effort = ctx.pinned_backend = None
+            ctx.active_model = ctx.active_effort = ctx.active_backend = None
+            await emit(events.token("Back to automatic — I'll pick the model per request."))
+        else:
+            from gabagent.agent.router import resolve_pin
+            res = resolve_pin(mc.value, ctx.config)
+            if res is None:
+                await emit(events.token(f"I don't know the model {mc.value}."))
+            else:
+                model, effort, backend = res
+                if backend == "local" and ctx.local_client is None:
+                    from gabagent.local.ollama import start_local_floor
+                    err = await start_local_floor(ctx, prewarm=False)
+                    if err:
+                        await emit(events.token(f"I couldn't start local: {err}."))
+                        await emit(events.done())
+                        return
+                ctx.force_model = True
+                ctx.pinned_model, ctx.pinned_effort, ctx.pinned_backend = model, effort, backend
+                eff = f" at {effort}" if effort else ""
+                await emit(events.token(
+                    f"Locked to {_pin_friendly(model)}{eff} — say 'back to auto' to re-enable escalation."))
     elif mc.kind == "quiet":
         # "Shut up / be quiet": the brain can't mute or sleep itself (the voice layer owns that), so
         # answer with ONE short pointer instead of routing to the model — a terse line ends fast and,
@@ -369,6 +426,7 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
                 ctx.config,
                 local_floor=ctx.local_floor,
                 local_running=ctx.local_client is not None,
+                degraded=ctx.degraded_backends,
             ) or ModelRouter(ctx.config)
 
         assembled = bool(router and router.assembled)
@@ -411,6 +469,25 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             dlog(ctx, "route", active=ctx.active_model, effort=ctx.active_effort,
                  backend=ctx.active_backend, via="intent_classify")
 
+        # A device/media command can't run reliably on the LOCAL floor (a weak model fumbles the tool
+        # call). Bump it to the first non-local rung (Aria) — conversation stays local, commands escalate.
+        if router and assembled and ctx.active_backend == "local":
+            from gabagent.agent.router import looks_like_command
+            if looks_like_command(user_text):
+                nl = router.rung(1)  # first rung above the local floor (Aria, else Claude)
+                if nl.backend != "local":
+                    ctx.active_model, ctx.active_effort, ctx.active_backend = (
+                        nl.model, nl.effort or None, nl.backend)
+                    dlog(ctx, "route", active=ctx.active_model, backend=ctx.active_backend,
+                         via="command_escalate")
+
+        # Runtime model PIN: routing is skipped (force_model); run every turn on the pinned rung.
+        if ctx.force_model and ctx.pinned_backend:
+            ctx.active_model, ctx.active_effort, ctx.active_backend = (
+                ctx.pinned_model, ctx.pinned_effort, ctx.pinned_backend)
+            dlog(ctx, "route", active=ctx.active_model, effort=ctx.active_effort,
+                 backend=ctx.active_backend, via="pinned")
+
         from gabagent.permissions.engine import PermissionEngine
         perm_engine = PermissionEngine(ctx.config)
 
@@ -437,12 +514,12 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             # escalation/fallback at the turn level across backends — a per-call retry would target the
             # wrong client.)
             retry_model = (
-                None if (ctx.local_mode or is_claude or assembled)
+                None if (ctx.local_mode or is_claude or assembled or ctx.force_model)
                 else ctx.config.router.complex_model
             )
             # Per-call fallback is single-backend; in assembled mode the turn-level fallback below
-            # re-routes to the floor (and the floor's client) instead.
-            fallback_model = None if (ctx.local_mode or assembled) else simple
+            # re-routes to the floor (and the floor's client) instead. A PIN stays on its model.
+            fallback_model = None if (ctx.local_mode or assembled or ctx.force_model) else simple
             sfilter = SpeakableFilter(code_notice=commands.filler("code", ctx))
 
             text_buf = ""
@@ -473,6 +550,23 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
                         elif isinstance(chunk, list):
                             tool_calls = [tc for tc in chunk if tc.name]
                 except Exception as e:
+                    # HARD backend failure (402 billing / auth / missing model) — NEVER silent. Announce
+                    # ONCE, mark the backend degraded so the ladder skips it (the floor moves up), and
+                    # recover the turn on the next working rung. Only before any speech (else we'd replay).
+                    bk = ctx.active_backend
+                    if (not text_buf and bk and bk not in ctx.degraded_backends
+                            and _is_hard_backend_error(e)):
+                        ctx.degraded_backends.add(bk)
+                        nxt = _reassemble_floor(ctx)
+                        dlog(ctx, "backend_degraded", backend=bk,
+                             cause=f"{type(e).__name__}: {e}"[:120],
+                             recovered_to=(nxt[2] if nxt else None))
+                        if nxt:
+                            await emit(events.token(_degraded_notice(bk, nxt[2])))
+                            ctx.active_model, ctx.active_effort, ctx.active_backend = nxt
+                            ctx.voice_announced_model = nxt[0]
+                            continue
+                        # nothing left to fall to → surface the error below
                     # An escalated turn that fails to generate (gab.ai 'inference_failed') falls back to
                     # the simple model at the TURN level — a guaranteed arya answer beats a spoken error.
                     # Only safe before any speech was emitted (else we'd replay it), and only once.
@@ -552,7 +646,8 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
         # different backend than the floor model.
         from gabagent.agent.router import ModelRouter as _MR
         _fr = _MR.assemble(ctx.config, local_floor=ctx.local_floor,
-                           local_running=ctx.local_client is not None)
+                           local_running=ctx.local_client is not None,
+                           degraded=ctx.degraded_backends)
         if _fr:
             _f0 = _fr.ladder[0]
             _simple, _simple_backend = _f0.model, _f0.backend
