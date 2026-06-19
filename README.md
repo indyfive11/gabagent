@@ -8,7 +8,7 @@ A Claude Code-style AI coding assistant built on the [Gab AI](https://gab.ai) De
 - Interactive REPL with streaming responses
 - File read/write/edit, grep, glob, bash tools
 - Web search (DuckDuckGo) and web fetch (static + JS-rendered via Playwright)
-- Cascading model router: fast model for exploration, complex model for code writes
+- Cross-backend model ladder: a turn escalates from a cheap fast model up to a more capable one as the work gets harder — rungs can span backends (local Ollama → Gab AI → an optional Claude/Anthropic rung). Pin a single model with `/model` or switch the backend with `/backend`.
 - Session persistence with context compaction
 - Plan/approve workflow — reviews plan before executing
 - Thinking indicator so you can tell it's working
