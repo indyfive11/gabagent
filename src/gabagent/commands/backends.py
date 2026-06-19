@@ -49,7 +49,11 @@ def validate_and_resolve(cmd: Command, args: dict) -> dict:
         else:
             continue
         resolved[slot.name] = _coerce(slot, val)
-    if provided:
+    # A command that declares NO params takes a fixed action (e.g. volume_up = pactl +10%); the model
+    # sometimes hands it a stray arg anyway (`volume_up(level=50)`). Ignore extras on a paramless command
+    # rather than failing the turn. Commands that DO declare params stay strict — a stray arg there is a
+    # real typo (wrong name / wrong command) worth surfacing.
+    if provided and cmd.params:
         raise ValueError(f"unknown parameter(s): {', '.join(provided)}")
     return resolved
 

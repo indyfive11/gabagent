@@ -62,8 +62,24 @@ async def test_no_resolution_when_nothing_playing(patch_inv):
 async def test_non_transport_ids_are_ignored(patch_inv):
     patch_inv([_Src("tidal", "playing")])
     assert await resolve.resolve_media_intent(None, "tidal.search") is None
-    assert await resolve.resolve_media_intent(None, "jellyfin.now_playing") is None
     assert await resolve.resolve_media_intent(None, "weather.today") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cid", ["media.now_playing", "media.current", "media.nowplaying",
+                                 "media.whats_playing", "music.current_track"])
+async def test_now_playing_routes_to_active_provider(patch_inv, cid):
+    # The model riffs media.now_playing / media.current; route it to whatever's actually playing.
+    patch_inv([_Src("tidal", "playing")])
+    assert await resolve.resolve_media_intent(None, cid) == ("tidal.now_playing", {})
+    patch_inv([_Src("jellyfin", "paused")])
+    assert await resolve.resolve_media_intent(None, cid) == ("jellyfin.now_playing", {})
+
+
+@pytest.mark.asyncio
+async def test_now_playing_unknown_provider_falls_through(patch_inv):
+    patch_inv([_Src("spotify", "playing")])  # no now_playing mapping → None → difflib salvage
+    assert await resolve.resolve_media_intent(None, "media.now_playing") is None
 
 
 def test_closest_and_ratio():
@@ -121,3 +137,17 @@ async def test_execute_suggests_when_not_close(patch_inv, monkeypatch):
     ctx = types.SimpleNamespace(command_catalog=_StubCatalog({"tidal.search", "jellyfin.control"}))
     res = await RunCommandTool().execute(ctx, command_id="frobnicate.foo", args={})
     assert res.error and "Unknown command" in res.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["list_capabilities", "rescan_capabilities", "run_command"])
+async def test_execute_redirects_wrapped_tool_name(patch_inv, tool_name):
+    # Model wraps a top-level tool name in run_command → point it at the real tool, not a circular
+    # "Unknown command: list_capabilities. Try list_capabilities." Catalog has no such id.
+    from gabagent.commands.tools import RunCommandTool
+    patch_inv([])
+    ctx = types.SimpleNamespace(command_catalog=_StubCatalog({"tidal.search", "jellyfin.control"}))
+    res = await RunCommandTool().execute(ctx, command_id=tool_name, args={})
+    assert res.error and "its own tool" in res.error
+    assert f"call {tool_name} directly" in res.error
+    assert f"Try {tool_name}" not in res.error  # not the old self-defeating message

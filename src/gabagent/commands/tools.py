@@ -44,6 +44,14 @@ class RunCommandTool(ToolBase):
             return ToolResult(output="", error="Capabilities haven't been discovered on this machine.")
         cmd = catalog.get(command_id)
         if cmd is None:
+            # The model sometimes wraps a top-level TOOL name (list_capabilities, rescan_capabilities,
+            # even run_command itself) in run_command's command_id. That's never a catalog id, and a
+            # difflib salvage would loop right back to the same name — "Unknown command: X. Try X."
+            # Point it at the real tool instead of giving self-defeating advice.
+            if registry.get_tool(command_id) is not None:
+                return ToolResult(output="", error=(
+                    f"'{command_id}' is its own tool, not a run_command capability — call {command_id} "
+                    "directly as a tool. run_command is only for catalog command ids (e.g. 'media.pause')."))
             # Salvage a plausible-but-wrong id before giving up (helps weaker local/Aria turns).
             from gabagent.commands.resolve import (
                 resolve_media_intent, closest_command_ids, best_match_ratio, AUTO_ROUTE_RATIO,

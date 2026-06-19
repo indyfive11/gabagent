@@ -27,6 +27,14 @@ def test_unknown_param_rejected():
         validate_and_resolve(_echo_cmd(), {"val": "x", "bogus": 1})
 
 
+def test_paramless_command_ignores_stray_args():
+    # A fixed-action command with no declared params (e.g. system.volume_up = pactl +10%) tolerates a
+    # stray arg the model invents (`volume_up(level=50)`) instead of failing the turn.
+    cmd = Command(id="system.volume_up", domain="system", summary="louder", tier=1,
+                  backend=ShellBackend(argv=["pactl", "set-sink-volume", "@DEFAULT_SINK@", "+10%"]))
+    assert validate_and_resolve(cmd, {"level": 50, "unit": "percent"}) == {}
+
+
 def test_missing_required_rejected():
     with pytest.raises(ValueError):
         validate_and_resolve(_echo_cmd(), {})

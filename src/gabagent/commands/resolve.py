@@ -26,6 +26,9 @@ _MEDIA_VERB = {
     "stop": "stop",
     "next": "next", "skip": "next", "forward": "next", "next_track": "next",
     "previous": "previous", "prev": "previous", "back": "previous", "previous_track": "previous",
+    # "what's playing" queries the model riffs as media.now_playing / media.current / …
+    "now_playing": "now_playing", "nowplaying": "now_playing", "whats_playing": "now_playing",
+    "current": "now_playing", "current_track": "now_playing", "current_song": "now_playing",
 }
 
 # normalized intent → real command id per provider. Jellyfin routes through jellyfin.control(action).
@@ -33,6 +36,8 @@ _TIDAL = {"pause": "tidal.pause", "resume": "tidal.resume", "stop": "tidal.stop"
           "next": "tidal.next", "previous": "tidal.previous"}
 _JELLYFIN_ACTION = {"pause": "pause", "resume": "resume", "stop": "stop",
                     "next": "next", "previous": "back"}
+# now_playing is a direct per-provider command (a query, not a transport action via control()).
+_NOW_PLAYING = {"tidal": "tidal.now_playing", "jellyfin": "jellyfin.now_playing"}
 
 
 def _looks_like_media_transport(command_id: str) -> str | None:
@@ -60,9 +65,12 @@ async def resolve_media_intent(ctx: AgentContext, command_id: str) -> tuple[str,
     if not srcs:
         return None
     active = next((s for s in srcs if s.state == "playing"), None) or srcs[0]
+    prov = (active.provider or "").lower()
+    if intent == "now_playing":
+        rid = _NOW_PLAYING.get(prov)
+        return (rid, {}) if rid else None
     if intent == "toggle":
         intent = "pause" if active.state == "playing" else "resume"
-    prov = (active.provider or "").lower()
     if prov == "tidal":
         rid = _TIDAL.get(intent)
         return (rid, {}) if rid else None
