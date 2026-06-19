@@ -22,7 +22,13 @@ import time
 from pathlib import Path
 
 # The semantic states. Appearance (color/pulse) is the panel's job, NOT encoded here.
-STATES = ("off", "idle", "listening", "thinking", "speaking", "error")
+#   "sleeping" — Aria is intentionally asleep (voice "go to sleep"), distinct from "off" which doubles
+#   as dead/stale/crashed. A sleeping eye should read as dormant-but-alive, not dark-and-dead. The
+#   voice layer (sole writer in voice mode) emits it on sleep-enter; it must KEEP refreshing it (or the
+#   STALE_SECS failsafe below will decay it to "off" after 5s — that decay is acceptable as a fallback
+#   but a steady "sleeping" render needs a heartbeat). Backward-compatible: a reader that doesn't know
+#   "sleeping" falls back to dark, same as "off".
+STATES = ("off", "idle", "listening", "thinking", "speaking", "error", "sleeping")
 STALE_SECS = 5.0  # a reader past this with no fresh write should render "off"
 
 

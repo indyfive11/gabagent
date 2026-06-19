@@ -53,6 +53,16 @@ def test_all_states_accepted(tmp_state):
         assert aria_state.read_state()["state"] == s
 
 
+def test_sleeping_is_a_distinct_live_state(tmp_state):
+    # "sleeping" (intentionally asleep) must be a valid, distinct state — not coerced to idle, and
+    # not the same as "off" (which doubles as dead/stale). It still obeys the stale failsafe.
+    assert "sleeping" in aria_state.STATES
+    aria_state.set_state("sleeping")
+    assert aria_state.read_state(now=time.time())["state"] == "sleeping"
+    stale = time.time() + aria_state.STALE_SECS + 10
+    assert aria_state.read_state(now=stale)["state"] == "off"  # decays to off without a heartbeat
+
+
 def test_write_is_atomic_no_partial(tmp_state):
     # After a write, the only file is the final state file — no leftover temp files.
     aria_state.set_state("idle")
