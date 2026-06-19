@@ -56,8 +56,12 @@ class SystemProvider:
 
         if shutil.which("systemctl"):
             cmds += [
+                # NB: deliberately NO "go to sleep" example — that phrase is the voice layer's
+                # sleep control (pause Aria), which it consumes before /respond. Keeping it here
+                # risked an ASR-mangled "go to sleep" slipping through to the brain and matching
+                # this → systemctl suspend → suspending the whole PC. "suspend" is unambiguous.
                 Command(id="system.suspend", domain="system", tier=3, summary="Suspend the computer",
-                        backend=_sh("systemctl", "suspend"), examples=["go to sleep", "suspend"]),
+                        backend=_sh("systemctl", "suspend"), examples=["suspend"]),
                 Command(id="system.reboot", domain="system", tier=3, summary="Reboot the computer",
                         backend=_sh("systemctl", "reboot")),
                 Command(id="system.poweroff", domain="system", tier=3, summary="Power off the computer",

@@ -34,6 +34,10 @@ async def test_system_volume_tier1_power_tier3(monkeypatch):
     assert cmds["system.volume_up"].tier == 1
     assert cmds["system.mute"].backend.argv[0] == "pactl"
     assert cmds["system.poweroff"].tier == 3 and cmds["system.suspend"].tier == 3
+    # "go to sleep" is the voice layer's sleep control — it must NOT be a suspend trigger example,
+    # or an ASR-mangled phrase slipping to the brain could suspend the whole PC.
+    assert "go to sleep" not in cmds["system.suspend"].examples
+    assert "suspend" in cmds["system.suspend"].examples
     assert "system.brightness_up" not in cmds  # brightnessctl absent
 
 
