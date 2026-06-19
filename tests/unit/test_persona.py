@@ -1,5 +1,7 @@
 """Self-learning persona layer: global store, bounded injection, archive pruning, reflection loop."""
+import json
 import types
+from pathlib import Path
 
 import pytest
 
@@ -173,6 +175,108 @@ async def test_reflection_swallows_client_error(persona, monkeypatch):
             raise RuntimeError("network down")
     ctx = _ctx_with_turns(persona, _MIN_TURNS, monkeypatch, _Boom())
     await persona.reflect_from_ctx(ctx)  # must not raise
+
+
+# -- detached reflection (survives the brain's SIGTERM/SIGKILL) ---------------
+
+def _cli_ctx(enabled=True, n_user=4):
+    msgs = []
+    for i in range(n_user):
+        msgs.append(ChatMessage(role="user", content=f"u{i} keep it dry"))
+        msgs.append(ChatMessage(role="assistant", content=f"a{i}"))
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(persona_enabled=enabled, persona_reflect_on_shutdown=enabled),
+        session=types.SimpleNamespace(messages=lambda: list(msgs)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_persona_reflect_spawns_detached_child(monkeypatch):
+    # Shutdown reflection must NOT run in-process (it loses the race to the front-end's 5s SIGKILL);
+    # it spawns a detached child that outlives the brain.
+    import subprocess
+    from gabagent import cli
+    captured = {}
+
+    class _FakePopen:
+        def __init__(self, argv, **kw):
+            captured["argv"], captured["kw"] = argv, kw
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    await cli._persona_reflect(_cli_ctx(enabled=True, n_user=4))
+
+    assert captured["argv"][1:3] == ["-m", "gabagent.persona.reflect_detached"]
+    assert captured["kw"]["start_new_session"] is True  # own session → survives the kill
+    handoff = Path(captured["argv"][-1])
+    assert handoff.exists()
+    payload = json.loads(handoff.read_text())
+    assert len(payload["turns"]) == 8 and payload["turns"][0]["role"] == "user"
+    handoff.unlink()
+
+
+@pytest.mark.asyncio
+async def test_persona_reflect_skips_trivial_session(monkeypatch):
+    import subprocess
+    from gabagent import cli
+    called = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: called.append(1))
+    await cli._persona_reflect(_cli_ctx(enabled=True, n_user=2))  # < _MIN_TURNS user turns
+    assert not called  # not worth spawning a child
+
+
+@pytest.mark.asyncio
+async def test_persona_reflect_skips_when_disabled(monkeypatch):
+    import subprocess
+    from gabagent import cli
+    called = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: called.append(1))
+    await cli._persona_reflect(_cli_ctx(enabled=False, n_user=8))
+    assert not called
+
+
+def test_detached_load_turns_roundtrip(tmp_path):
+    from gabagent.persona import reflect_detached
+    h = tmp_path / "h.json"
+    h.write_text(json.dumps({"turns": [{"role": "user", "content": "hi"},
+                                       {"role": "assistant", "content": "yo"}]}))
+    turns = reflect_detached._load_turns(h)
+    assert [t.role for t in turns] == ["user", "assistant"] and turns[0].content == "hi"
+
+
+@pytest.mark.asyncio
+async def test_detached_run_reflects_into_store(persona, monkeypatch, tmp_path):
+    # The child rebuilds a ctx from the handoff and writes the learned INDEX into the (redirected) store.
+    from gabagent.persona import reflect_detached
+    fake = _FakeClient("<INDEX>\n- dry, the user asked\n</INDEX>\n<JOURNAL>\nasked for dry\n</JOURNAL>")
+
+    def _fake_build_ctx(turns):
+        monkeypatch.setattr(PersonaManager, "_reflection_client",
+                            staticmethod(lambda ctx: (fake, None, None)))
+        return types.SimpleNamespace(
+            session=types.SimpleNamespace(messages=lambda: list(turns)),
+            config=types.SimpleNamespace(), local_floor=False,
+            local_client=None, degraded_backends=set())
+
+    monkeypatch.setattr(reflect_detached, "_build_ctx", _fake_build_ctx)
+    h = tmp_path / "h.json"
+    h.write_text(json.dumps({"turns": [{"role": "user", "content": "keep it dry"}] * 4 +
+                                       [{"role": "assistant", "content": "ok"}]}))
+    await reflect_detached._run(h)
+    assert "dry, the user asked" in persona.index()
+
+
+def test_detached_main_deletes_handoff(monkeypatch, tmp_path):
+    # main() always removes the handoff file, even on a no-op run — no /tmp litter.
+    from gabagent.persona import reflect_detached
+
+    async def _noop(_h):
+        return None
+
+    monkeypatch.setattr(reflect_detached, "_run", _noop)
+    h = tmp_path / "h.json"
+    h.write_text("{}")
+    assert reflect_detached.main([str(h)]) == 0
+    assert not h.exists()
 
 
 # -- parser -------------------------------------------------------------------

@@ -212,13 +212,42 @@ def main(
 
 
 async def _persona_reflect(ctx) -> None:
-    """Best-effort persona learning at shutdown — time-boxed, swallows everything, never blocks exit."""
+    """Hand persona learning to a DETACHED child that outlives this process, then return at once.
+
+    Reflection uses the top rung (opus/max) and routinely takes far longer than the ~5s the voice
+    front-end gives the brain between SIGTERM and SIGKILL — so doing it in-process here loses the race
+    every time and never persists (the live store stayed seed-only for days). Instead we serialize the
+    recent transcript to a handoff file and spawn `python -m gabagent.persona.reflect_detached` in its
+    OWN session (start_new_session=True). Killing the brain — by pid or process group — never touches
+    that child; it finishes on its own time. Best-effort: never blocks shutdown, never raises.
+
+    The _MIN_TURNS guard is checked here (in-memory, cheap) so a trivial 'hello' session never spawns a
+    child; reflect_from_ctx re-applies it defensively in the child."""
     cfg = ctx.config
     if not (getattr(cfg, "persona_enabled", False) and getattr(cfg, "persona_reflect_on_shutdown", False)):
         return
     try:
-        from gabagent.persona.manager import PersonaManager
-        await asyncio.wait_for(PersonaManager().reflect_from_ctx(ctx), timeout=20.0)
+        import json
+        import os
+        import subprocess
+        import tempfile
+        from gabagent.persona.manager import _MIN_TURNS, _TRANSCRIPT_TURNS
+
+        turns = [m for m in ctx.session.messages() if m.role in ("user", "assistant") and m.content]
+        if sum(1 for m in turns if m.role == "user") < _MIN_TURNS:
+            return  # nothing worth learning from — don't spawn
+
+        payload = {"turns": [{"role": m.role, "content": m.content} for m in turns[-_TRANSCRIPT_TURNS:]]}
+        fd, path = tempfile.mkstemp(prefix="gabagent_persona_", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+        subprocess.Popen(
+            [sys.executable, "-m", "gabagent.persona.reflect_detached", path],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,  # own session/process group — survives the brain's SIGTERM/SIGKILL
+            close_fds=True,
+        )
     except Exception:
         pass
 
