@@ -510,6 +510,13 @@ def test_is_terminal_reply_heuristic():
     assert _is_terminal_reply("Which playlist did you mean?") is False  # awaiting an answer
     assert _is_terminal_reply('Did you mean "Jaymes"?') is False      # trailing quote stripped, still a Q
     assert _is_terminal_reply("") is False                            # nothing said → nothing to release
+    # A long declarative reply (a story) IS terminal — the bed restores promptly at BotStopped instead of
+    # lingering through the ~15s convo-hold tail (live-drive #3: Rob wants the music back right after she
+    # finishes). bot_speaking handles the mid-narration watchdog, so length doesn't affect terminality.
+    story = ("Frisha the cat had decided that Diamond the dog was the dumbest creature she had ever met, "
+             "and yet when the thunderstorm hit at two in the morning it was Diamond who sat beside her "
+             "without being asked, warm and steady and entirely unbothered by the noise outside.")
+    assert _is_terminal_reply(story) is True
 
 
 async def test_terminal_qa_emits_convo_hold_before_done(home, monkeypatch):
@@ -540,9 +547,11 @@ async def test_question_reply_does_not_emit_convo_hold(home, monkeypatch):
     assert not any(e.type == "convo_hold" for e in evs)
 
 
-async def test_media_turn_does_not_emit_convo_hold(home, monkeypatch):
-    """A media-control turn keeps the conversation-hold (more commands likely; the keepalive holds the
-    window) — convo_hold is only for a terminal one-shot, never a media turn."""
+async def test_terminal_media_turn_emits_both_keepalive_and_convo_hold(home, monkeypatch):
+    """A TERMINAL media-control turn emits BOTH the keepalive (wake_hold — keeps the MIC window open to chain
+    'louder'/'skip' without re-waking) AND convo_hold release (restores the BED promptly at BotStopped). The
+    two are independent on the voice side, so a 'volume up' confirmation gives the music back right away
+    without losing chaining (live-drive #3 ask)."""
     from gabagent.api.models import ToolResult
     import gabagent.voice.turn as turn_mod
     async def fake_exec(tool_calls, *a, **k):
@@ -557,8 +566,29 @@ async def test_media_turn_does_not_emit_convo_hold(home, monkeypatch):
         ["Paused the music for you."],
     ], media_keepalive_secs=30)
     evs = await run_turn(ctx, "pause the music")
-    assert not any(e.type == "convo_hold" for e in evs)
-    assert any(e.type == "wake_hold" for e in evs)        # the media keepalive still fires
+    assert any(e.type == "convo_hold" for e in evs)       # terminal reply → bed restores promptly
+    assert any(e.type == "wake_hold" for e in evs)        # the media keepalive still holds the mic open
+
+
+async def test_media_turn_ending_in_question_keeps_the_hold(home, monkeypatch):
+    """A media turn whose reply ENDS in a question (a clarification) is NOT terminal — no convo_hold release,
+    so the bed stays ducked while the voice side waits for Rob's answer. The keepalive still fires."""
+    from gabagent.api.models import ToolResult
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, *a, **k):
+        return [ToolResult(output="more than one match") for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+    ctx = _media_ctx(home, [
+        [[_spec("run_command", command_id="tidal.play", playlist="x")]],
+        ["Did you mean Jaymes or Retro Favorites?"],
+    ], media_keepalive_secs=30)
+    evs = await run_turn(ctx, "play my playlist")
+    assert not any(e.type == "convo_hold" for e in evs)   # question reply → hold stays open for the answer
+    assert any(e.type == "wake_hold" for e in evs)
 
 
 async def test_convo_hold_disabled_by_flag(home, monkeypatch):
@@ -570,3 +600,50 @@ async def test_convo_hold_disabled_by_flag(home, monkeypatch):
     ctx = make_ctx(home, [["It's three o'clock."]], voice_convo_hold_release=False)
     evs = await run_turn(ctx, "what time is it")
     assert not any(e.type == "convo_hold" for e in evs)
+
+
+# -- voice_volume: F3 my-voice-volume control event (wire shape co-designed with the voice agent) --
+
+async def test_voice_set_volume_emits_voice_volume_before_done(home, monkeypatch):
+    """voice.set_volume records a my-voice-volume request; the turn emits exactly one `voice_volume`
+    event (carrying op) right before `done` for the voice side to map onto its TTS gain."""
+    from gabagent.commands.providers import voice_control as vc
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, ctx, *a, **k):
+        # Mirror real dispatch: run the backend so it sets ctx._voice_volume_signal.
+        return [await vc.set_volume(ctx, op="down") for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+    ctx = _media_ctx(home, [
+        [[_spec("run_command", command_id="voice.set_volume", op="down")]],
+        ["Okay, lowering my voice."],
+    ])
+    evs = await run_turn(ctx, "lower your voice")
+    vv = [e for e in evs if e.type == "voice_volume"]
+    assert len(vv) == 1
+    assert vv[0].to_dict() == {"type": "voice_volume", "op": "down"}
+    types_ = [e.type for e in evs]
+    assert types_.index("voice_volume") < types_.index("done")
+    assert types_[-1] == "done"
+
+
+async def test_voice_volume_kill_switch_suppresses_event(home, monkeypatch):
+    """voice_volume_control=False: the command still runs and speaks, but NO event crosses the wire."""
+    from gabagent.commands.providers import voice_control as vc
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, ctx, *a, **k):
+        return [await vc.set_volume(ctx, op="up") for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+    ctx = _media_ctx(home, [
+        [[_spec("run_command", command_id="voice.set_volume", op="up")]],
+        ["Okay, speaking up."],
+    ], voice_volume_control=False)
+    evs = await run_turn(ctx, "speak up")
+    assert not any(e.type == "voice_volume" for e in evs)

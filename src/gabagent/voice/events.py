@@ -92,6 +92,19 @@ def convo_hold() -> VoiceEvent:
     return VoiceEvent(type="convo_hold", extra={"release": True})
 
 
+def voice_volume(op: str, value: float | None = None) -> VoiceEvent:
+    """Change Aria's OWN TTS voice volume (brain → voice client, F3). Emitted before `done` when the user
+    asks to change HER speaking volume — distinct from media/system volume, which the brain handles itself.
+    `op` is up|down|set; `value` is an optional 0..1 absolute level for `set`. The voice side maps it onto
+    its TTS gain (clamp [0,1]). Carried via `extra` so the wire shape is explicit and survives to_dict's
+    empty-value filter (an `op`/`value` of 0 must not be stripped). Arrival-keyed like the other control
+    events; safe to omit on a brain that doesn't support it. Wire shape co-designed with the voice agent."""
+    extra: dict = {"op": op}
+    if value is not None:
+        extra["value"] = float(value)
+    return VoiceEvent(type="voice_volume", extra=extra)
+
+
 def timer_fired(timer_id: str, label: str = "", set_secs: int = 0) -> VoiceEvent:
     """A countdown timer (G2) came due (brain → voice client). The voice side rings on receipt and its
     stop-word cancels the ring (the LVA pattern). Carries id/label/set_secs via `extra` so the wire shape

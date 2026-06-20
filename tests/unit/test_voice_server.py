@@ -198,3 +198,25 @@ async def test_cancel_unknown_session(tmp_path):
     async with _client(app) as client:
         r = await client.post("/cancel", json={"session_id": "nope"})
     assert r.status_code == 404
+
+
+async def test_media_state_bot_speaking_refreshes_duck_watchdog(tmp_path):
+    """`bot_speaking=true` on the ~1 Hz /media/state poll refreshes the duck-watchdog heartbeat, so a long
+    bot reply (a story — no INCOMING utterance) can't trip the watchdog and pop the bed mid-reply. An absent
+    or `false` param is a plain check with no refresh (back-compat with an older voice side)."""
+    import gabagent.voice.ducking as _dk
+    ctx = make_ctx(tmp_path, [])
+    app = build_app(ctx)
+    st = _dk._state(ctx)
+    async with _client(app) as client:
+        st["last_duck_refresh_mono"] = 1.0                       # ancient heartbeat
+        await client.get("/media/state", params={"bot_speaking": "true"})
+        assert st["last_duck_refresh_mono"] > 1.0               # refreshed while she's speaking
+
+        st["last_duck_refresh_mono"] = 1.0
+        await client.get("/media/state")                        # no param ⇒ plain check, no refresh
+        assert st["last_duck_refresh_mono"] == 1.0
+
+        st["last_duck_refresh_mono"] = 1.0
+        await client.get("/media/state", params={"bot_speaking": "false"})
+        assert st["last_duck_refresh_mono"] == 1.0

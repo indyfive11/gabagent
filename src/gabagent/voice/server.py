@@ -121,7 +121,15 @@ def build_app(ctx: AgentContext):
         # PROTOCOL INVARIANT: this response (like every event/endpoint here) stays brain-agnostic —
         # provider-NEUTRAL, no jellyfin/tidal/etc. names cross to the voice side. Keep it generic so
         # any brain is pluggable. (Enforced by test_media_state_is_provider_neutral.)
-        from gabagent.voice.ducking import media_state as _media_state
+        from gabagent.voice.ducking import media_state as _media_state, note_duck_activity
+        # `bot_speaking=true` on this ~1 Hz poll means Aria's TTS is actively playing. A long reply (a story)
+        # produces no INCOMING utterance, so the duck-watchdog — which times out from the last incoming voice
+        # activity — would otherwise auto-restore the bed mid-reply (the live-drive #2 pop). Treat the poll as
+        # a heartbeat REFRESH while she's speaking, so the watchdog only ever fires on genuine silence (still a
+        # true crash-net for a stranded duck). Absent/`false` ⇒ a plain check, exactly as before (back-compat
+        # with an older voice side). The check itself runs inside _media_state below, so refresh first.
+        if request.query_params.get("bot_speaking") == "true":
+            note_duck_activity(ctx)
         return JSONResponse(await _media_state(ctx))
 
     app = Starlette(routes=[

@@ -217,6 +217,12 @@ class GabAgentConfig(BaseSettings):
     # degrades to the voice-side timed hold, so it's emitted conservatively. False disables the hint.
     # Env: GABAI_VOICE_CONVO_HOLD_RELEASE.
     voice_convo_hold_release: bool = True
+    # Voice-volume control (F3): when the user asks to change ARIA'S OWN speaking volume ('lower your
+    # voice', 'speak up'), the voice.set_volume command records a per-turn signal and the turn emits a
+    # `voice_volume` SSE event the voice side maps onto its TTS gain. Distinct from media/system volume.
+    # False disables the emit (the command still speaks its confirm but no event crosses). Kill-switch.
+    # Env: GABAI_VOICE_VOLUME_CONTROL.
+    voice_volume_control: bool = True
     # The sink-input % a freshly-played Jellyfin movie should start at. 100 = neutral (no per-stream
     # attenuation; the device/player volume governs actual loudness) — NOT "loud". This un-strands the
     # movie-starts-quiet bug: PipeWire's stream-restore replays the PRIOR movie's ducked/low level (e.g. 18%,
@@ -230,9 +236,18 @@ class GabAgentConfig(BaseSettings):
     # brain↔voice desync where the voice side opens a duck (e.g. for a movie-title announcement) but never
     # sends the matching off, stranding the movie at the duck floor in silence. Refreshed by every duck-on AND
     # every incoming voice turn, so it never fires during a legitimate sustained hold (dictation keeps it
-    # alive). Ticks on the existing ~1 Hz /media/state poll — no background task. 0 disables. Keep it above the
-    # longest bot announcement so a long title read isn't cut. Env: GABAI_DUCK_WATCHDOG_SECS.
-    duck_watchdog_secs: int = 12
+    # alive — and during a long bot REPLY, the voice side refreshes it ~1 Hz via bot_speaking=true on the poll,
+    # so a story can't trip it mid-narration; see voice/server.py). Ticks on the existing ~1 Hz /media/state poll
+    # — no background task. 0 disables.
+    # ★ COUPLED INVARIANT: duck_watchdog_secs (20) MUST stay > the voice-side conversation-hold window (~15s).
+    # After BotStopped the bot_speaking refresh stops, so the watchdog grace re-bases to ≈BotStopped and then runs
+    # for `duck_watchdog_secs`; the voice single-writer restores the bed at BotStopped + convo-hold (~15s). The 5s
+    # margin (20 > 15) is what lets the voice restore win — if the watchdog ever drops below the convo-hold, it
+    # fires first and pops the bed ~early AND emits an off media_duck didn't ask for. So if the voice convo-hold is
+    # ever raised, raise this in step (keep the margin). With the single-writer fix a genuine stuck duck is rare, so
+    # a looser backstop costs little — and the crash-net stays honest (no TTS → no refresh → fires on real silence).
+    # Env: GABAI_DUCK_WATCHDOG_SECS.
+    duck_watchdog_secs: int = 20
     # This machine's friendly name, used to tag media sources as LOCAL vs on another device/room (e.g.
     # "EndeavorMain"). Empty → defaults to the hostname at use. The brain only AUTO-ducks/controls media it
     # judges local to this device; remote sources are visible (for future explicit control) but never touched

@@ -13,5 +13,7 @@ from gabagent.commands.providers.system import PROVIDER as _system
 from gabagent.commands.providers.applaunch import PROVIDER as _applaunch
 from gabagent.commands.providers.desktop import PROVIDER as _desktop
 from gabagent.commands.providers.timer import PROVIDER as _timer
+from gabagent.commands.providers.voice_control import PROVIDER as _voice_control
 
-PROVIDERS: list[CapabilityProvider] = [_jellyfin, _tidal, _mpris, _system, _applaunch, _desktop, _timer]
+PROVIDERS: list[CapabilityProvider] = [_jellyfin, _tidal, _mpris, _system, _applaunch, _desktop, _timer,
+                                       _voice_control]

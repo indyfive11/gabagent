@@ -31,7 +31,11 @@ from gabagent.voice.debuglog import dlog
 if TYPE_CHECKING:
     from gabagent.agent.context import AgentContext
 
-_WINDOW = 12  # recent non-system messages sent to the model
+_WINDOW = 30  # recent non-system messages sent to the model. Counts tool messages too, so a few
+              # command turns (user+assistant+tool each) eat the window fast — 12 was too small and
+              # dropped same-session content (a story just told, a command just learned) within ~2 min
+              # of mixed chat+commands, so she'd say "I don't remember" about her own session. 30 holds
+              # a multi-turn topic across interleaved commands. Raise further if topics still fall out.
 
 VOICE_ADDENDUM = (
     "You are speaking out loud through a voice assistant. Keep replies short and "
@@ -39,6 +43,10 @@ VOICE_ADDENDUM = (
     "Don't add pleasantries or offers like 'let me know if you need anything else' or 'glad I "
     "could help' — just answer or report the result and stop. Keep casual conversation just as short: "
     "one sentence, no rambling or philosophizing. "
+    "When the user gives a command or asks a direct question, lead with the result or answer and nothing "
+    "else — do NOT open with how you're doing, what you're 'just' up to, or any volunteered status about "
+    "yourself ('I'm doing well, …', 'just keeping track of your music, …'); that reads as ignoring the "
+    "request. Share your own state ONLY when they actually ask how you are. "
     "Don't narrate what you're about to do or your reasoning ('let me check…', 'I need to search "
     "for…', 'one moment while I…') — just do it and give the result in one short clause; this matters "
     "most while a movie or music is playing, where the user wants a quick 'Done.' not a play-by-play. "
@@ -70,6 +78,11 @@ VOICE_ADDENDUM = (
     "playing until now_playing confirms it. When the user asks for several things in one breath (e.g. 'play some music and keep it "
     "quiet'), do every part and mention each one you did — don't report only the last action. To change "
     "how loud MUSIC is, use the music volume control, not the system volume. "
+    "To change how loud YOUR OWN speaking voice is — when the user says 'lower your voice', 'speak up', "
+    "'you're too loud/quiet', or 'talk quieter' — use your voice.set_volume command (op='down' for "
+    "quieter, 'up' for louder, 'set' with a 0-1 value for a level). This is a REAL ability you have, "
+    "distinct from BOTH the music and the system volume — never lower the music or the system volume when "
+    "the user means your voice, and never say you can't change your own voice. "
     "When the user loosely asks for music ('play something retro', 'put on a playlist', 'play some "
     "music'), just PICK a fitting option and play it right away — don't read back a list of choices and "
     "ask which one unless they explicitly ask what's available. If you just offered choices and the user "
@@ -427,7 +440,13 @@ def _is_terminal_reply(text: str) -> bool:
     """Heuristic for a TERMINAL turn (for the conversation-hold release hint): a self-contained spoken
     reply with no expected follow-up. Conservative — a reply that ENDS in a question (a clarification,
     an option list, 'anything else?') is NOT terminal, so the voice-side hold stays open for the answer.
-    Trailing quotes/emphasis/brackets are stripped before the final-punctuation check."""
+    Trailing quotes/emphasis/brackets are stripped before the final-punctuation check.
+
+    A LONG declarative reply (a story) IS terminal, deliberately: the bed then restores promptly at
+    BotStopped instead of lingering through the ~15s convo-hold tail (Rob wants the music back right after
+    she finishes — the lingering tail was the live-drive #3 complaint). The bot_speaking poll-refresh (see
+    voice/server.py) keeps the duck watchdog from firing DURING the narration regardless of length, so a
+    long terminal reply is safe — terminality only governs the post-reply restore, not the mid-reply duck."""
     t = (text or "").strip()
     if not t:
         return False
@@ -554,6 +573,7 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
         status_emitted = False   # cap spoken status to ONE per turn (no "Opening… Trying… Looking…" chains)
         fell_back = False        # turn-level arya fallback fires at most once per turn
         media_ran = False        # any media-domain command this turn → emit a keepalive before `done`
+        ctx._voice_volume_signal = None   # cleared each turn; voice.set_volume sets it → emit before `done`
         sig_counts: dict[str, int] = {}   # tool-call signature → times seen this turn (loop detector)
         tool_rounds = 0                    # total tool rounds this turn (hard backstop)
         while True:
@@ -719,16 +739,28 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             await emit(events.keepalive(keepalive_secs))
             dlog(ctx, "keepalive", ttl_secs=keepalive_secs)
 
-        # Conversation-hold release: tell the voice side to drop the bed-duck early when THIS turn is a
-        # terminal one-shot reply, instead of holding it the full conversation-hold window after an
-        # addressed reply over playing media. NOT on a media-control turn (more commands likely — the
-        # keepalive above already holds the window) and NOT when the reply ends in a question (a
-        # clarification/option list awaiting an answer). Arrival-keyed + safe to omit (degrades to the
-        # voice-side timer), so emit conservatively. text_buf holds the final reply (loop broke on no tools).
+        # Conversation-hold release: tell the voice side to restore the bed-duck at BotStopped (instead of
+        # holding it the full conversation-hold window) when THIS turn is a TERMINAL reply over playing media.
+        # Emitted on a media-control turn TOO: the keepalive above keeps the MIC/follow-up window open (chain
+        # "louder"/"skip" without re-waking) while this restores the BED promptly — they're independent on the
+        # voice side (keepalive→wake_word, release→media_duck, bed-only), so a "volume up" confirmation gives
+        # the music back right away without losing chaining (Rob's live-drive #3 ask). Still NOT emitted when
+        # the reply ends in a question (a clarification/option list awaiting an answer — the hold stays open for
+        # it), via _is_terminal_reply. Arrival-keyed + safe to omit (degrades to the voice-side timer). text_buf
+        # holds the final reply (loop broke on no tools).
         if (getattr(ctx.config, "voice_convo_hold_release", True)
-                and not media_ran and _is_terminal_reply(text_buf)):
+                and _is_terminal_reply(text_buf)):
             await emit(events.convo_hold())
             dlog(ctx, "convo_hold", release=True)
+
+        # Voice-volume control (F3): voice.set_volume recorded a my-voice-volume request this turn → tell
+        # the voice side to adjust its TTS gain. Emitted before `done`; the kill-switch gates the wire event
+        # only (the command still spoke its confirm). Arrival-keyed; safe to omit on a voice side that
+        # doesn't consume it. Wire shape co-designed with the voice agent.
+        vv = getattr(ctx, "_voice_volume_signal", None)
+        if vv and getattr(ctx.config, "voice_volume_control", True):
+            await emit(events.voice_volume(vv["op"], vv.get("value")))
+            dlog(ctx, "voice_volume", op=vv["op"], value=vv.get("value"))
 
         await emit(events.done())
     except asyncio.CancelledError:
