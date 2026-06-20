@@ -509,6 +509,32 @@ async def _sink_name_by_index(sink_idx: str | None) -> str | None:
     return None
 
 
+async def _sink_mute_volume(sink: str | None) -> tuple[bool | None, int | None]:
+    """The DEFAULT sink's OWN mute flag and volume %, read from `pactl get-sink-mute/-volume`. A music
+    sink-input can be present, unmuted and at 100% yet DEAD SILENT if the sink it feeds is muted or at 0% —
+    the Mopidy player still reports "playing" (live 2026-06-18: "It died." → brain said "sounds audible").
+    Returns (muted, volume%); EITHER is None when unreadable so the caller stays neutral and never
+    false-claims silence. PipeWire's pactl emits `Mute: yes|no` and `Volume: … /  NN% / …`. Never raises."""
+    if not sink:
+        return (None, None)
+    muted: bool | None = None
+    vol: int | None = None
+    try:
+        rc, out = await _run_pactl("get-sink-mute", sink)
+        if rc == 0 and out:
+            m = re.search(r"Mute:\s*(yes|no)", out)
+            if m:
+                muted = (m.group(1) == "yes")
+        rc, out = await _run_pactl("get-sink-volume", sink)
+        if rc == 0 and out:
+            m = re.search(r"(\d+)%", out)
+            if m:
+                vol = int(m.group(1))
+    except Exception:
+        pass
+    return (muted, vol)
+
+
 async def _unmute_sink_input(idx: str) -> None:
     """Clear a stray MUTE flag on a music sink-input. Our duck scheme attenuates by VOLUME only and never
     sets the mute flag, so on the audible-restore/play paths the music stream should never carry one; if
@@ -574,6 +600,12 @@ async def mopidy_audibility() -> dict:
         sink_name = await _sink_name_by_index(si["sink_idx"])
         vol, muted = si["volume"], si["muted"]
         off_default = bool(sink_name and default_sink and sink_name != default_sink)
+        # The MASTER sink itself: a healthy sink-input feeding a muted / 0% default sink is still silent,
+        # and the player keeps reporting "playing". Without this the verify path over-claimed audible into
+        # dead silence (#3) and the brain couldn't tell the user to unmute the SINK (it kept nudging
+        # stream levels — #2). Only counted as POSITIVE evidence of silence when actually read (True / 0);
+        # unreadable (None) stays neutral, per this probe's conservative contract.
+        sink_muted, sink_vol = await _sink_mute_volume(default_sink)
         reasons = []
         if muted:
             reasons.append("the music output is muted")
@@ -581,10 +613,14 @@ async def mopidy_audibility() -> dict:
             reasons.append("its volume is at zero")
         if off_default:
             reasons.append(f"it's routed to '{sink_name}', not your active output")
-        audible = not (muted or vol == 0 or off_default)
+        if sink_muted is True:
+            reasons.append("your speakers are muted")
+        if sink_vol == 0:
+            reasons.append("your speaker volume is at zero")
+        audible = not (muted or vol == 0 or off_default or sink_muted is True or sink_vol == 0)
         res = {"checked": True, "present": True, "audible": audible,
                "volume": vol, "muted": muted, "sink": sink_name, "default_sink": default_sink,
-               "on_default": (not off_default)}
+               "on_default": (not off_default), "sink_muted": sink_muted, "sink_volume": sink_vol}
         if reasons:
             res["reason"] = "; ".join(reasons)
         return res

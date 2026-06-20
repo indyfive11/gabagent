@@ -648,18 +648,30 @@ def test_parse_mopidy_sink_full():
     assert _parse_mopidy_sink_full("nothing here") is None
 
 
-def _pactl_router(monkeypatch, *, sink_inputs="", default_sink="", sinks_short=""):
-    """Stub pactl + shutil.which for the audibility probe: route by the pactl subcommand."""
+def _pactl_router(monkeypatch, *, sink_inputs="", default_sink="", sinks_short="",
+                  sink_mute="", sink_volume=""):
+    """Stub pactl + shutil.which for the audibility probe: route by the pactl subcommand. sink_mute /
+    sink_volume feed the master-sink check (get-sink-mute / get-sink-volume); default "" → unreadable
+    (the probe then stays neutral on the sink, as on a host where those return nothing)."""
     monkeypatch.setattr(_dk.shutil, "which", lambda _name: "/usr/bin/pactl")
     async def fake_pactl(*args, **k):
         if args[:1] == ("get-default-sink",):
             return (0, default_sink)
+        if args[:1] == ("get-sink-mute",):
+            return (0, sink_mute)
+        if args[:1] == ("get-sink-volume",):
+            return (0, sink_volume)
         if args[:3] == ("list", "short", "sinks"):
             return (0, sinks_short)
         if args[:2] == ("list", "sink-inputs"):
             return (0, sink_inputs)
         return (0, "")
     monkeypatch.setattr(_dk, "_run_pactl", fake_pactl)
+
+
+# Real PipeWire `pactl get-sink-volume` / `get-sink-mute` output shapes (captured on the dev box).
+_SINK_VOL = "Volume: front-left: 22938 /  35% / -27.36 dB,   front-right: 22938 /  35% / -27.36 dB\n        balance 0.00"
+_SINK_VOL_ZERO = "Volume: front-left: 0 /  0% / -inf dB,   front-right: 0 /  0% / -inf dB\n        balance 0.00"
 
 
 _AUDIBLE_BLOCK = ('Sink Input #12\n\tVolume: front-left: 45000 / 69%\n'
@@ -747,6 +759,42 @@ async def test_mopidy_audibility_false_when_off_default_sink(monkeypatch):
                   sinks_short="3\talsa.hdmi\tmod\trun\n9\talsa.spk\tmod\trun\n")
     res = await _dk.mopidy_audibility()
     assert res["audible"] is False and "alsa.hdmi" in res["reason"]
+
+
+async def test_mopidy_audibility_false_when_default_sink_muted(monkeypatch):
+    # The sink-INPUT is healthy and on the default sink, but the default sink ITSELF is muted → dead
+    # silent while the player still reports "playing". The probe must call this inaudible (#3: user said
+    # "it died", brain over-claimed "sounds audible").
+    _pactl_router(monkeypatch, sink_inputs=_AUDIBLE_BLOCK, default_sink="alsa.spk",
+                  sinks_short="3\talsa.spk\tmod\trun\n", sink_mute="Mute: yes", sink_volume=_SINK_VOL)
+    res = await _dk.mopidy_audibility()
+    assert res["audible"] is False and "speakers are muted" in res["reason"]
+    assert res["sink_muted"] is True
+
+
+async def test_mopidy_audibility_false_when_default_sink_volume_zero(monkeypatch):
+    _pactl_router(monkeypatch, sink_inputs=_AUDIBLE_BLOCK, default_sink="alsa.spk",
+                  sinks_short="3\talsa.spk\tmod\trun\n", sink_mute="Mute: no", sink_volume=_SINK_VOL_ZERO)
+    res = await _dk.mopidy_audibility()
+    assert res["audible"] is False and "speaker volume is at zero" in res["reason"]
+    assert res["sink_volume"] == 0
+
+
+async def test_mopidy_audibility_true_with_healthy_master_sink(monkeypatch):
+    # Sink-input healthy AND default sink unmuted + >0 → genuinely audible; master-sink fields reported.
+    _pactl_router(monkeypatch, sink_inputs=_AUDIBLE_BLOCK, default_sink="alsa.spk",
+                  sinks_short="3\talsa.spk\tmod\trun\n", sink_mute="Mute: no", sink_volume=_SINK_VOL)
+    res = await _dk.mopidy_audibility()
+    assert res["audible"] is True and "reason" not in res
+    assert res["sink_muted"] is False and res["sink_volume"] == 35
+
+
+async def test_mopidy_audibility_neutral_when_master_sink_unreadable(monkeypatch):
+    # get-sink-mute/-volume return nothing on some hosts → stay neutral, never false-claim silence.
+    _pactl_router(monkeypatch, sink_inputs=_AUDIBLE_BLOCK, default_sink="alsa.spk",
+                  sinks_short="3\talsa.spk\tmod\trun\n")  # sink_mute/volume default "" → unreadable
+    res = await _dk.mopidy_audibility()
+    assert res["audible"] is True and res["sink_muted"] is None and res["sink_volume"] is None
 
 
 async def test_mopidy_audibility_present_false_when_no_stream(monkeypatch):
