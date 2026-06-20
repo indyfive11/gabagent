@@ -138,6 +138,23 @@ class ModelRouter:
         idx = max(0, min(idx, self.top_rung))
         return self.ladder[idx]
 
+    def index_of(self, model: str | None, effort: str | None, backend: str | None) -> int | None:
+        """Ladder index of the rung currently active, or None when it isn't on the ladder (e.g. a
+        legacy/pinned model). Used by the reactive sequential climb to know where it stands."""
+        for i, r in enumerate(self.ladder):
+            if r.model == model and (r.effort or None) == (effort or None) and r.backend == backend:
+                return i
+        return None
+
+    def next_rung(self, model: str | None, effort: str | None, backend: str | None) -> Rung | None:
+        """The next rung UP from the active one — sequential, least-escalation-first (+1, not a jump
+        to the top). None when already at the ceiling or the active rung isn't on the ladder. This is
+        the climb the loop-detector takes: start at the floor, step up only on evidence of trouble."""
+        i = self.index_of(model, effort, backend)
+        if i is None or i >= self.top_rung:
+            return None
+        return self.ladder[i + 1]
+
     async def classify_rung(self, prompt: str, client: GabAIClient) -> int:
         """Pick a ladder rung index for a fresh user turn. Bottom rung when the classifier is off;
         on genuine ambiguity (unparseable reply) round UP one rung — correctness over a few cents."""

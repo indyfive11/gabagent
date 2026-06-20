@@ -240,6 +240,36 @@ def _looks_simple(text: str) -> bool:
     return len(t.split()) <= 6 and " and " not in f" {t} "
 
 
+# Loop guard: when the model keeps firing the SAME tool call with no progress (live 2026-06-20:
+# tidal.play x13 in one turn, each a no-op "Resuming.", the user heard nothing), don't spin. After a
+# signature repeats this many times we step ONE rung up the ladder — least-escalation-first — to give a
+# more tool-capable model a shot, and bail with an honest line if we're already at the top or it keeps
+# looping. _MAX_TOOL_ROUNDS is the absolute per-turn backstop so no turn can hammer indefinitely.
+_LOOP_REPEAT = 3
+_MAX_TOOL_ROUNDS = 16
+_LOOP_GIVEUP_MSG = "I'm having trouble getting that to work right now."
+
+
+def _tool_sig(tc, result=None) -> str:
+    """A signature for loop detection: the run_command command_id when present (else tool+args), folded
+    with the RESULT text. "Stuck" means the SAME call returns the SAME response over and over (the live
+    13x no-op "Resuming."); folding in the result means a call that makes PROGRESS — a different track, a
+    disambiguation, an eventual success — gets a distinct signature, so a model working its way to an
+    answer isn't mistaken for a stuck loop and told it failed right after it succeeded."""
+    if tc.name == "run_command":
+        try:
+            cid = (json.loads(tc.arguments) if tc.arguments else {}).get("command_id")
+        except Exception:
+            cid = None
+        base = f"run_command:{cid}" if cid else f"run_command:{tc.arguments or ''}"
+    else:
+        base = f"{tc.name}:{tc.arguments or ''}"
+    if result is not None:
+        out = (result.output or result.error or "").strip()[:80]
+        base = f"{base}|{out}"
+    return base
+
+
 def _status_phrase(tool_calls) -> str:
     names = {tc.name for tc in tool_calls}
     # Pure recon (list/rescan capabilities) is internal — don't narrate it; it's what produced the
@@ -494,17 +524,21 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
             dlog(ctx, "route", active=ctx.active_model, effort=ctx.active_effort,
                  backend=ctx.active_backend, via="intent_classify")
 
-        # A device/media command can't run reliably on the LOCAL floor (a weak model fumbles the tool
-        # call). Bump it to the first non-local rung (Aria) — conversation stays local, commands escalate.
-        if router and assembled and ctx.active_backend == "local":
-            from gabagent.agent.router import looks_like_command
-            if looks_like_command(user_text):
-                nl = router.rung(1)  # first rung above the local floor (Aria, else Claude)
-                if nl.backend != "local":
-                    ctx.active_model, ctx.active_effort, ctx.active_backend = (
-                        nl.model, nl.effort or None, nl.backend)
-                    dlog(ctx, "route", active=ctx.active_model, backend=ctx.active_backend,
-                         via="command_escalate")
+        # Device/media CONTROL turns drive run_command, where a weak model fumbles the tool protocol
+        # (wrong arg shape / command id) rather than the reasoning — something the complexity classifier
+        # never escalates for (it rates a short imperative as simple). Arm such turns for the reactive
+        # sequential climb in the tool loop below: start at the floor (least escalation) and step ONE
+        # rung up only on evidence of trouble. A LOCAL floor is the exception — a local model can't drive
+        # tools at all, so don't waste a round discovering it; pre-bump to the first non-local rung.
+        from gabagent.agent.router import looks_like_command
+        command_intent = looks_like_command(user_text)
+        if command_intent and router and assembled and ctx.active_backend == "local":
+            nl = router.rung(1)  # first rung above the local floor (Aria, else Claude)
+            if nl.backend != "local":
+                ctx.active_model, ctx.active_effort, ctx.active_backend = (
+                    nl.model, nl.effort or None, nl.backend)
+                dlog(ctx, "route", active=ctx.active_model, backend=ctx.active_backend,
+                     via="command_escalate")
 
         # Runtime model PIN: routing is skipped (force_model); run every turn on the pinned rung.
         if ctx.force_model and ctx.pinned_backend:
@@ -520,6 +554,8 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
         status_emitted = False   # cap spoken status to ONE per turn (no "Opening… Trying… Looking…" chains)
         fell_back = False        # turn-level arya fallback fires at most once per turn
         media_ran = False        # any media-domain command this turn → emit a keepalive before `done`
+        sig_counts: dict[str, int] = {}   # tool-call signature → times seen this turn (loop detector)
+        tool_rounds = 0                    # total tool rounds this turn (hard backstop)
         while True:
             cur = ctx.active_model or simple
             # Announce an arya→premium transition ONCE (vs. every turn), and de-escalate silently.
@@ -642,6 +678,38 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
                 ctx.session.append_message(
                     ChatMessage(role="tool", content=result.to_content(), tool_call_id=tc.id)
                 )
+
+            # Loop guard: count this round's signatures; a repeated one means the model is stuck firing
+            # the same call with no progress. Step ONE rung up (sequential, least-escalation-first) to let
+            # a more tool-capable model break the loop — but only on a command-intent turn (the class that
+            # loops on tool-protocol fumbles) and only when an assembled ladder has a rung left. At the
+            # ceiling, off the ladder, or past the hard round cap: stop and say so rather than hammer on.
+            tool_rounds += 1
+            stuck = None
+            for tc, result in zip(tool_calls, results):
+                s = _tool_sig(tc, result)
+                sig_counts[s] = sig_counts.get(s, 0) + 1
+                if sig_counts[s] >= _LOOP_REPEAT:
+                    stuck = s
+            if stuck or tool_rounds >= _MAX_TOOL_ROUNDS:
+                nxt = None
+                # A runtime PIN means "stay on this rung" — bail honestly rather than override it.
+                if stuck and command_intent and router and assembled and not ctx.force_model:
+                    nxt = router.next_rung(ctx.active_model, ctx.active_effort, ctx.active_backend)
+                if nxt is not None:
+                    sig_counts[stuck] = 0   # give the higher rung a clean shot before climbing again
+                    ctx.active_model, ctx.active_effort, ctx.active_backend = (
+                        nxt.model, nxt.effort or None, nxt.backend)
+                    dlog(ctx, "loop_escalate", sig=stuck, to=nxt.model,
+                         effort=nxt.effort or None, backend=nxt.backend, rounds=tool_rounds)
+                    continue
+                dlog(ctx, "loop_abort", sig=stuck, rounds=tool_rounds, model=ctx.active_model)
+                if not text_buf:   # nothing spoken yet → give an honest line instead of silence
+                    await emit(events.token(_LOOP_GIVEUP_MSG))
+                    ctx.session.append_message(
+                        ChatMessage(role="assistant", content=_LOOP_GIVEUP_MSG))
+                    text_buf = _LOOP_GIVEUP_MSG
+                break
 
         # Media-control keepalive: hold the wake/command window open for a follow-up command so the
         # wake-gate doesn't idle-close and lock the user out mid-interaction while music plays (refreshed

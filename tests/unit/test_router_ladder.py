@@ -32,6 +32,29 @@ def test_first_int():
     assert _first_int("nope") is None
 
 
+def test_index_of_and_next_rung_climb_sequentially():
+    # The loop-detector's sequential climb: from any rung, next_rung steps +1 (least escalation first),
+    # not a jump to the top. Walk the whole ladder a rung at a time and stop at the ceiling.
+    r, _ = _router()
+    ladder = r.ladder
+    assert len(ladder) >= 2
+    for i, rung in enumerate(ladder):
+        assert r.index_of(rung.model, rung.effort or None, rung.backend) == i
+        nxt = r.next_rung(rung.model, rung.effort or None, rung.backend)
+        if i < r.top_rung:
+            assert (nxt.model, nxt.effort or None, nxt.backend) == (
+                ladder[i + 1].model, ladder[i + 1].effort or None, ladder[i + 1].backend)
+        else:
+            assert nxt is None          # at the ceiling there's nowhere higher to climb
+
+
+def test_next_rung_off_ladder_is_none():
+    # A pinned/legacy model that isn't on the ladder has no defined climb.
+    r, _ = _router()
+    assert r.index_of("some-unknown-model", None, "gab") is None
+    assert r.next_rung("some-unknown-model", None, "gab") is None
+
+
 @pytest.mark.asyncio
 async def test_trivial_maps_to_bottom():
     r, _ = _router()

@@ -303,6 +303,62 @@ async def test_no_fallback_after_text_emitted(home):
     assert any(e.type == "error" for e in evs)
 
 
+# -- loop detector: a stuck tool loop escalates a rung, then bails honestly ------------------------
+
+def test_tool_sig_counts_repetition_by_result_not_just_command_id():
+    """Live 2026-06-20: the Foreigner turn (play→ask, play→ask, list, play-by-uri→SUCCESS) tripped the
+    detector by command_id alone and told the user it failed right after the playlist started. The
+    signature must fold in the RESULT so progress reads as progress, while an identical no-op repeat
+    (the 13x "Resuming.") still collapses to one signature."""
+    from gabagent.voice.turn import _tool_sig
+    play = _spec("run_command", command_id="tidal.play")
+    ask = types.SimpleNamespace(output="I have more than one playlist — did you mean…?", error=None, success=True)
+    ok = types.SimpleNamespace(output="Playing that playlist on TIDAL.", error=None, success=True)
+    resume = types.SimpleNamespace(output="Resuming.", error=None, success=True)
+    assert _tool_sig(play, ask) == _tool_sig(play, ask)        # same call, same response → stuck signal
+    assert _tool_sig(play, ask) != _tool_sig(play, ok)         # progress (different result) → distinct
+    assert _tool_sig(play, resume) == _tool_sig(play, resume)  # identical no-op still collapses (caught)
+
+
+# -- loop detector: stuck-loop bail + sequential escalation ----------------------------------------
+
+async def test_tool_loop_bails_with_honest_line(home):
+    """The live 2026-06-20 failure: the model fired tidal.play 13× in one turn, each a no-op, and the
+    user heard nothing. With no ladder to climb (router off), the loop guard must STOP after the repeat
+    threshold and speak an honest line instead of hammering the same call forever."""
+    proj = home / "proj"; proj.mkdir()
+    one = [[_spec("read_file", path="nope.txt")]]           # one tool-call round (chunk = list of specs)
+    ctx = make_ctx(proj, [one, one, one])                  # 3 identical rounds → stuck → bail (no climb)
+    evs = await run_turn(ctx, "read that file over and over")
+    spoken = "".join(e.text for e in evs if e.type == "token")
+    assert "trouble" in spoken.lower()                     # the honest give-up line, not silence
+    assert evs[-1].type == "done"                          # turn ended cleanly
+    assert ctx.client.responses == []                      # consumed exactly the 3 — did not run away
+
+
+async def test_command_loop_escalates_one_rung_then_recovers(home):
+    """A command-intent turn that loops on the floor climbs ONE rung (least-escalation-first) to a more
+    tool-capable model, which then breaks the loop. Proves the dead command-escalation path is wired to
+    the sequential climb above whatever the floor is."""
+    proj = home / "proj"; proj.mkdir()
+    play = [[_spec("run_command", command_id="tidal.play", playlist="Retro Favorites")]]
+    ctx = make_ctx(proj, [
+        play, play, play,                                  # 3 identical rounds → stuck → climb one rung
+        ["Got your Retro Favorites playlist going."],      # the higher rung breaks the loop with a reply
+    ])
+    # Enable the assembled cross-backend ladder (gab floor → claude rungs) and serve every backend the
+    # same fake client so the climb is observable without real network.
+    ctx.config.router.enabled = True
+    ctx.config.router.cross_backend = True
+    ctx.config.claude.api_key = "sk-test"
+    ctx.clients = {"gab": ctx.client, "claude": ctx.client}
+    evs = await run_turn(ctx, "play my retro favorites playlist")   # looks_like_command → command_intent
+    assert ctx.active_backend == "claude"                  # climbed off the arya floor
+    assert ctx.active_model != "arya"                      # onto a higher, tool-capable rung
+    spoken = "".join(e.text for e in evs if e.type == "token")
+    assert "retro favorites" in spoken.lower()             # the higher rung broke the loop and answered
+
+
 # -- C: shutdown honesty lives in the prompt -------------------------------------------------------
 
 def test_addendum_has_shutdown_and_sleep_honesty():
