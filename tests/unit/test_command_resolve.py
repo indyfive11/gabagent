@@ -151,3 +151,21 @@ async def test_execute_redirects_wrapped_tool_name(patch_inv, tool_name):
     assert res.error and "its own tool" in res.error
     assert f"call {tool_name} directly" in res.error
     assert f"Try {tool_name}" not in res.error  # not the old self-defeating message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cid,expect_mode", [
+    ("media.shuffle", "on"), ("music.randomize", "on"), ("tidal.shuffle_on", "on"),
+    ("media.unshuffle", "off"), ("player.shuffle_off", "off"),
+])
+async def test_shuffle_routes_to_tidal_shuffle(patch_inv, cid, expect_mode):
+    patch_inv([_Src("tidal", "playing")])
+    res = await resolve.resolve_media_intent(None, cid)
+    assert res == ("tidal.shuffle", {"mode": expect_mode})
+
+
+@pytest.mark.asyncio
+async def test_shuffle_falls_through_for_jellyfin(patch_inv):
+    # No Jellyfin tracklist-shuffle equivalent we drive → don't route it.
+    patch_inv([_Src("jellyfin", "playing")])
+    assert await resolve.resolve_media_intent(None, "media.shuffle") is None

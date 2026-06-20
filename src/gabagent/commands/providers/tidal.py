@@ -24,6 +24,11 @@ if TYPE_CHECKING:
     from gabagent.agent.context import AgentContext
 
 _RPC_TIMEOUT = 30.0   # search and mix/album expand hit TIDAL's live API, not the local cache
+# The warm-cache retry (see _rpc_resilient) should return in ~0.5s once the first call has warmed TIDAL's
+# cache. Bound it well under _RPC_TIMEOUT so a SECOND full timeout can't stack onto the first — a cold
+# search that timed out at 30s then retried at 30s produced a 60s dead turn (live 2026-06-18, the worst
+# single turn of the run). 8s is generous for an already-warmed call yet caps the worst case at ~38s.
+_RETRY_TIMEOUT = 8.0
 
 # Cached playback state so /media/state (→ inventory → sources()) can be served WITHOUT a live get_state
 # RPC. Mopidy serializes JSON-RPC, so a get_state issued mid-search/play QUEUES behind that op and blocks
@@ -112,18 +117,24 @@ class TidalProvider:
             ),
             Command(
                 id="tidal.play", domain="media", tier=1, featured=True,
-                summary="Play music on TIDAL — a track, or a whole album (album=true), or resume",
+                summary="Play music on TIDAL — a track, a whole album/playlist/mix, or resume. "
+                        "Pass shuffle=true to play a playlist/album/mix in random order "
+                        "(use this for 'shuffle my playlist').",
                 backend=PyBackend(ref=ref + "play"),
                 params=[
                     Slot("query", "string", False, description="what to play, e.g. 'Kind of Blue'"),
-                    Slot("uri", "string", False, description="a tidal: URI from tidal.search to play exactly"),
+                    Slot("uri", "string", False,
+                         description="a tidal: URI from tidal.search/tidal.playlists to play exactly"),
                     Slot("album", "boolean", False,
                          description="true to queue the whole album instead of a single track"),
+                    Slot("shuffle", "boolean", False,
+                         description="true to play a playlist/album/mix in RANDOM order — set this "
+                                     "whenever the request is to 'shuffle' a playlist or album"),
                 ],
                 examples=["play some Miles Davis on tidal", "play the album Dizzy Up the Girl",
                           "play kind of blue", "play music",
                           "play my Metallica playlist (uri from tidal.playlists)",
-                          "play my New Arrivals mix (uri from tidal.recommendations)"],
+                          "shuffle my New Arrivals mix (uri from tidal.recommendations, shuffle=true)"],
             ),
             Command(
                 id="tidal.playlists", domain="media", tier=1, structured=True, featured=True,
@@ -162,6 +173,17 @@ class TidalProvider:
             Command(id="tidal.now_playing", domain="media", tier=1, structured=True,
                     summary="What's playing on TIDAL right now",
                     backend=PyBackend(ref=ref + "now_playing"), examples=["what's playing", "what song is this"]),
+            Command(
+                id="tidal.shuffle", domain="media", tier=1, featured=True,
+                summary="Shuffle the music that's ALREADY playing — reorders the current TIDAL queue, "
+                        "turns on random play, and jumps to a fresh track; or turns shuffle off. (To "
+                        "start a specific playlist shuffled, use tidal.play with shuffle=true instead.)",
+                backend=PyBackend(ref=ref + "shuffle"),
+                params=[Slot("mode", "string", False,
+                             description="on, off, or toggle (default on)")],
+                examples=["shuffle the music", "put it on shuffle", "randomize what's playing",
+                          "mix it up", "turn off shuffle", "stop shuffling"],
+            ),
         ]
 
 
@@ -198,13 +220,15 @@ def _human_err(e: Exception) -> str:
 
 async def _rpc_resilient(tc, method: str, params: dict | None = None, timeout: float = _RPC_TIMEOUT):
     """_rpc, but retry once on a timeout — TIDAL's first live-API call often warms a cache and the
-    second succeeds (a direct browse then returns in ~0.5s)."""
+    second succeeds (a direct browse then returns in ~0.5s). The retry uses a SHORT timeout
+    (_RETRY_TIMEOUT): the cache is warm now, so it should return fast, and bounding it stops a second
+    full 30s timeout from stacking into a ~60s dead turn."""
     try:
         return await _rpc(tc, method, params, timeout)
     except Exception as e:
         if not _is_timeout(e):
             raise
-        return await _rpc(tc, method, params, timeout)
+        return await _rpc(tc, method, params, min(timeout, _RETRY_TIMEOUT))
 
 
 def _artist_names(track: dict) -> str:
@@ -294,10 +318,13 @@ async def _playback_started(tc) -> bool:
         return False
 
 
-async def _play_uris(tc, uris: list[str]) -> dict:
+async def _play_uris(tc, uris: list[str], shuffle: bool = False) -> dict:
     """Clear the tracklist, queue the URIs, and start playback. Returns per-step timings (ms) so the
     caller can localize where TIDAL play latency lands — `queue_ms` (tracklist.add, which resolves each
-    track) vs `play_ms` (playback.play, which fetches the first stream URL from TIDAL's live API)."""
+    track) vs `play_ms` (playback.play, which fetches the first stream URL from TIDAL's live API).
+    `shuffle=True` randomizes the queued order BEFORE play, so playback starts on a random track and
+    `core.tracklist.shuffle` (the in-place reorder) is the right primitive here — NOT set_random alone,
+    which would leave track 1 first and only randomize what follows."""
     t = {}
     s = time.monotonic()
     await _rpc(tc, "core.tracklist.clear")
@@ -305,10 +332,17 @@ async def _play_uris(tc, uris: list[str]) -> dict:
     s = time.monotonic()
     await _rpc(tc, "core.tracklist.add", {"uris": uris})
     t["queue_ms"] = int((time.monotonic() - s) * 1000)
+    if shuffle:
+        await _rpc(tc, "core.tracklist.shuffle")                 # reorder the queue so play starts random
+        await _rpc(tc, "core.tracklist.set_random", {"value": True})  # keep what follows random too
     s = time.monotonic()
     await _rpc(tc, "core.playback.play")
     t["play_ms"] = int((time.monotonic() - s) * 1000)
     return t
+
+
+def _play_verb(shuffle: bool) -> str:
+    return "Shuffling" if shuffle else "Playing"
 
 
 def _play_timing(ctx, **fields) -> None:
@@ -353,12 +387,12 @@ async def _hold_ambient(ctx, new_track: bool = True) -> None:
         pass
 
 
-async def play(ctx, query="", uri="", album=False) -> ToolResult:
+async def play(ctx, query="", uri="", album=False, shuffle=False) -> ToolResult:
     tc = ctx.config.tidal
     # Container intent: a whole album/playlist/mix, not a single track. `album=true` with a query
     # searches for the album; a tidal:album/playlist/mix URI plays that exact container.
     if bool(album) or _is_container_uri(uri):
-        return await _play_container(ctx, tc, query, uri, album=bool(album))
+        return await _play_container(ctx, tc, query, uri, album=bool(album), shuffle=bool(shuffle))
     # Mark the op in flight and optimistically cache "playing" so /media/state reflects it within ~100ms
     # (the gate reacts on time) instead of blocking ~30s behind the search/play (see _tidal_op). A failed
     # search/play self-heals: the cache reverts on the next idle poll once nothing's actually playing.
@@ -399,7 +433,7 @@ async def play(ctx, query="", uri="", album=False) -> ToolResult:
             await _hold_ambient(ctx, new_track=False)   # resume in place — same sink, no reconcile poll
             return ToolResult(output=f"Resuming {label} on TIDAL." if label else "Resuming on TIDAL.")
         try:
-            timings = await _play_uris(tc, [uri])
+            timings = await _play_uris(tc, [uri], shuffle=bool(shuffle))
         except Exception as e:
             # Reconcile a timed-out play against real playback state — a slow track resolve can blow the
             # RPC timeout after streaming has already begun (see _playback_started).
@@ -415,9 +449,10 @@ async def play(ctx, query="", uri="", album=False) -> ToolResult:
         return ToolResult(output=f"Playing {label} on TIDAL." if label else "Playing on TIDAL.")
 
 
-async def _play_container(ctx, tc, query="", uri="", album=False) -> ToolResult:
+async def _play_container(ctx, tc, query="", uri="", album=False, shuffle=False) -> ToolResult:
     """Play a whole album / playlist / mix. A container URI plays exactly; `album=true` with a
-    query searches the album catalog first."""
+    query searches the album catalog first. `shuffle=true` randomizes the queued order before play
+    so it starts on a random track."""
     # In-flight + optimistic "playing" so /media/state is served from cache during the search/expand/play
     # rather than blocking the gate's poll behind the op (see _tidal_op).
     async with _tidal_op(ctx, optimistic="playing"):
@@ -446,22 +481,22 @@ async def _play_container(ctx, tc, query="", uri="", album=False) -> ToolResult:
             expand_ms = int((time.monotonic() - _e) * 1000)
             if not uris:
                 return ToolResult(output="", error=f"that {noun} has no playable tracks")
-            timings = await _play_uris(tc, uris)
+            timings = await _play_uris(tc, uris, shuffle=bool(shuffle))
         except Exception as e:
             # A slow live-API call can blow the RPC timeout after Mopidy already started streaming —
             # reconcile against real playback state before calling it a failure (see _playback_started).
             if _is_timeout(e) and await _playback_started(tc):
                 await _hold_ambient(ctx)
-                return ToolResult(output=f"Playing the {noun} {label} on TIDAL." if label
-                                  else f"Playing that {noun} on TIDAL.")
+                return ToolResult(output=f"{_play_verb(shuffle)} the {noun} {label} on TIDAL." if label
+                                  else f"{_play_verb(shuffle)} that {noun} on TIDAL.")
             return ToolResult(output="", error=f"couldn't play that {noun}: {_human_err(e)}")
         _h = time.monotonic()
         await _hold_ambient(ctx)
         _play_timing(ctx, phase="play_container", search_ms=search_ms, expand_ms=expand_ms, **timings,
                      hold_ms=int((time.monotonic() - _h) * 1000),
                      total_ms=int((time.monotonic() - t0) * 1000))
-        return ToolResult(output=f"Playing the {noun} {label} on TIDAL." if label
-                          else f"Playing that {noun} on TIDAL.")
+        return ToolResult(output=f"{_play_verb(shuffle)} the {noun} {label} on TIDAL." if label
+                          else f"{_play_verb(shuffle)} that {noun} on TIDAL.")
 
 
 _TRANSPORT_RESULT = {
@@ -587,11 +622,56 @@ async def now_playing(ctx) -> ToolResult:
     return ToolResult(output=json.dumps(info))
 
 
+_SHUFFLE_OFF_WORDS = {"off", "false", "no", "stop", "disable", "unshuffle", "0"}
+_SHUFFLE_TOGGLE_WORDS = {"toggle", "flip", "switch"}
+
+
+async def shuffle(ctx, mode="on") -> ToolResult:
+    """Shuffle the TIDAL/Mopidy music that's already playing. `mode` is on | off | toggle (default on).
+
+    ON actually reorders the current queue (`core.tracklist.shuffle` — the in-place reorder), turns on
+    random play for what follows, and, if music is playing, skips to a freshly-shuffled track so the
+    change is immediately audible. `set_random` ALONE is the wrong primitive — it leaves the current
+    track playing and only randomizes the NEXT selection, so 'shuffle it' would keep playing the same
+    song (the 2026-06-19 live bug). OFF turns random play off and leaves the queue order as-is.
+
+    (To START a specific playlist/album shuffled from nothing, use tidal.play with shuffle=true.)"""
+    tc = ctx.config.tidal
+    m = (mode or "on").strip().lower()
+    try:
+        if m in _SHUFFLE_TOGGLE_WORDS:
+            target = not bool(await _rpc(tc, "core.tracklist.get_random", timeout=2.0))
+        elif m in _SHUFFLE_OFF_WORDS:
+            target = False
+        else:  # on / true / yes / shuffle / randomize / random / anything else → the natural "shuffle it"
+            target = True
+        if target:
+            await _rpc(tc, "core.tracklist.shuffle", timeout=2.0)          # reorder the queue in place
+            await _rpc(tc, "core.tracklist.set_random", {"value": True}, timeout=2.0)
+            try:  # jump to a fresh track so the reshuffle is audible NOW (Rob: "jump to a new track")
+                if (await _rpc(tc, "core.playback.get_state", timeout=2.0)) == "playing":
+                    await _rpc(tc, "core.playback.next", timeout=2.0)
+            except Exception:
+                pass
+        else:
+            await _rpc(tc, "core.tracklist.set_random", {"value": False}, timeout=2.0)
+    except Exception as e:
+        return ToolResult(output="", error=f"couldn't change shuffle: {_human_err(e)}")
+    return ToolResult(output="Shuffle on." if target else "Shuffle off.")
+
+
 async def playlists(ctx) -> ToolResult:
     """The user's saved TIDAL playlists. Play one by passing its uri to tidal.play."""
     tc = ctx.config.tidal
     try:
-        refs = await _rpc(tc, "core.playlists.as_list")
+        refs = await _rpc_resilient(tc, "core.playlists.as_list")
+        # An EMPTY list is the cold-cache false-negative signature: mopidy-tidal returns [] before its
+        # live playlist set is warmed, and the brain then confidently tells the user a playlist they DO
+        # own "doesn't exist" (live 2026-06-17: "Retro Favorites" reported absent 3×, played fine the next
+        # day). A genuinely empty library just re-returns []; one warm-up retry rules out the cold miss
+        # cheaply. (Every other TIDAL-API call here already goes through _rpc_resilient; this one didn't.)
+        if not refs:
+            refs = await _rpc_resilient(tc, "core.playlists.as_list")
     except Exception as e:
         return ToolResult(output="", error=f"couldn't load your playlists: {_human_err(e)}")
     out = [{"kind": "playlist", "uri": p.get("uri"), "title": (p.get("name") or "").strip()}

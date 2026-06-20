@@ -384,6 +384,44 @@ async def test_play_playlist_uri_expands_via_get_items():
 
 
 @respx.mock
+async def test_play_playlist_shuffle_reorders_before_play():
+    # tidal.play with shuffle=true randomizes the queued order (core.tracklist.shuffle) AND turns on
+    # random play BEFORE core.playback.play, so a "shuffle my playlist" starts on a random track instead
+    # of always track 1 (the 2026-06-19 live bug). The output reads "Shuffling …".
+    seen = []
+
+    def resp(request):
+        body = json.loads(request.content); m = body["method"]; seen.append((m, body.get("params")))
+        result = {"core.playlists.get_items": [{"uri": "tidal:track:1"}, {"uri": "tidal:track:2"}]}.get(m)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), uri="tidal:playlist:a", shuffle=True)
+    assert res.success and res.output.lower().startswith("shuffling")
+    methods = [m for m, _ in seen]
+    assert methods == ["core.playlists.get_items", "core.tracklist.clear", "core.tracklist.add",
+                       "core.tracklist.shuffle", "core.tracklist.set_random", "core.playback.play"]
+    # the reorder happens AFTER queueing but BEFORE play
+    assert methods.index("core.tracklist.shuffle") < methods.index("core.playback.play")
+    assert ("core.tracklist.set_random", {"value": True}) in seen
+
+
+@respx.mock
+async def test_play_playlist_no_shuffle_does_not_reorder():
+    seen = []
+
+    def resp(request):
+        body = json.loads(request.content); m = body["method"]; seen.append(m)
+        result = {"core.playlists.get_items": [{"uri": "tidal:track:1"}]}.get(m)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), uri="tidal:playlist:a")
+    assert res.success and res.output.lower().startswith("playing")
+    assert "core.tracklist.shuffle" not in seen
+
+
+@respx.mock
 async def test_play_mix_uri_expands_via_browse():
     seen = []
 
@@ -481,3 +519,138 @@ async def test_play_playlist_timeout_real_failure_when_not_playing():
     respx.post(RPC).mock(side_effect=resp)
     res = await td.play(_ctx(), uri="tidal:playlist:a")
     assert not res.success and "timed out" in res.error.lower()
+
+
+# -- #1: a timed-out search must not double the dead turn (60s regression) -----
+
+async def test_rpc_resilient_retry_uses_bounded_timeout(monkeypatch):
+    # A cold search that times out at _RPC_TIMEOUT (30s) used to retry at the SAME 30s → a 60s dead
+    # turn. The warm-cache retry must use the SHORT _RETRY_TIMEOUT so the worst case can't stack.
+    seen = []
+
+    async def fake_rpc(tc, method, params=None, timeout=td._RPC_TIMEOUT):
+        seen.append(timeout)
+        if len(seen) == 1:
+            raise httpx.ReadTimeout("")   # cold first call times out
+        return [{"tracks": [_TRACK]}]      # warm retry succeeds
+
+    monkeypatch.setattr(td, "_rpc", fake_rpc)
+    res = await td.search(_ctx(), query="miles")
+    assert res.success
+    assert seen == [td._RPC_TIMEOUT, td._RETRY_TIMEOUT]   # first full, retry bounded
+    assert td._RETRY_TIMEOUT < td._RPC_TIMEOUT
+
+
+# -- #4: cold-cache empty playlist list must not read as "you have no such playlist" --
+
+@respx.mock
+async def test_playlists_cold_empty_retries_then_finds_them():
+    # mopidy-tidal returns [] before its live list is warmed; the brain then tells the user a playlist
+    # they DO own doesn't exist. An empty result must trigger one warm-up retry.
+    calls = {"n": 0}
+
+    def resp(request):
+        calls["n"] += 1
+        result = [] if calls["n"] == 1 else [
+            {"uri": "tidal:playlist:a", "name": "Retro Favorites", "type": "playlist"}]
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    data = json.loads((await td.playlists(_ctx())).output)
+    assert data == [{"kind": "playlist", "uri": "tidal:playlist:a", "title": "Retro Favorites"}]
+    assert calls["n"] == 2   # cold empty → warm-up retry found them
+
+
+@respx.mock
+async def test_playlists_genuinely_empty_is_not_an_error():
+    # A real empty library re-returns [] on the retry — that's a clean empty result, not a failure.
+    respx.post(RPC).mock(side_effect=_rpc_router({"core.playlists.as_list": []}))
+    res = await td.playlists(_ctx())
+    assert res.success and res.output == "[]"
+
+
+# -- tidal.shuffle: Mopidy tracklist random play-mode (Rob's repeated live ask 2026-06-19) --
+
+def test_shuffle_command_is_registered():
+    cmds = {c.id: c for c in td.PROVIDER.commands(_ctx())}
+    assert "tidal.shuffle" in cmds
+    c = cmds["tidal.shuffle"]
+    assert c.tier == 1 and c.domain == "media"
+    assert [s.name for s in c.params] == ["mode"] and c.params[0].required is False
+
+
+def _shuffle_router(get_random=False, state="playing"):
+    """Records the ordered method calls (with params); answers get_random / get_state with the given
+    current values so the on-path's reorder + random + jump can be asserted."""
+    calls = []
+
+    def resp(request):
+        body = json.loads(request.content)
+        method = body["method"]
+        calls.append((method, body.get("params", {})))
+        if method == "core.tracklist.get_random":
+            result = get_random
+        elif method == "core.playback.get_state":
+            result = state
+        else:
+            result = None
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    return calls, resp
+
+
+def _methods(calls):
+    return [m for m, _ in calls]
+
+
+@respx.mock
+async def test_shuffle_on_reorders_sets_random_and_jumps_when_playing():
+    # ON is the in-place reorder (NOT set_random alone), then random play, then a track-jump so the
+    # reshuffle is audible immediately (the 2026-06-19 "same song" live bug).
+    calls, resp = _shuffle_router(state="playing")
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.shuffle(_ctx())
+    assert res.success and res.output == "Shuffle on."
+    assert _methods(calls) == ["core.tracklist.shuffle", "core.tracklist.set_random",
+                               "core.playback.get_state", "core.playback.next"]
+    assert ("core.tracklist.set_random", {"value": True}) in calls
+
+
+@respx.mock
+async def test_shuffle_on_does_not_jump_when_not_playing():
+    # Queue loaded but paused/stopped → reorder + random, but no next() (would start playback unbidden).
+    calls, resp = _shuffle_router(state="stopped")
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.shuffle(_ctx())
+    assert res.success and res.output == "Shuffle on."
+    assert "core.playback.next" not in _methods(calls)
+    assert "core.tracklist.shuffle" in _methods(calls)
+
+
+@respx.mock
+async def test_shuffle_off_only_clears_random():
+    calls, resp = _shuffle_router()
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.shuffle(_ctx(), mode="off")
+    assert res.success and res.output == "Shuffle off."
+    assert _methods(calls) == ["core.tracklist.set_random"]
+    assert calls[0] == ("core.tracklist.set_random", {"value": False})
+
+
+@respx.mock
+async def test_shuffle_toggle_inverts_current_state():
+    calls, resp = _shuffle_router(get_random=True)  # currently on → toggle turns it off
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.shuffle(_ctx(), mode="toggle")
+    assert res.success and res.output == "Shuffle off."
+    assert ("core.tracklist.set_random", {"value": False}) in calls
+    assert "core.tracklist.shuffle" not in _methods(calls)   # off path never reorders
+
+
+@respx.mock
+async def test_shuffle_rpc_failure_is_graceful():
+    def boom(request):
+        return httpx.Response(500, json={"error": "nope"})
+    respx.post(RPC).mock(side_effect=boom)
+    res = await td.shuffle(_ctx())
+    assert not res.success and res.error

@@ -29,6 +29,9 @@ _MEDIA_VERB = {
     # "what's playing" queries the model riffs as media.now_playing / media.current / …
     "now_playing": "now_playing", "nowplaying": "now_playing", "whats_playing": "now_playing",
     "current": "now_playing", "current_track": "now_playing", "current_song": "now_playing",
+    # shuffle/randomize → TIDAL tracklist random mode (the model riffs media.shuffle / music.randomize / …)
+    "shuffle": "shuffle", "randomize": "shuffle", "random": "shuffle", "shuffle_on": "shuffle",
+    "unshuffle": "shuffle_off", "shuffle_off": "shuffle_off",
 }
 
 # normalized intent → real command id per provider. Jellyfin routes through jellyfin.control(action).
@@ -69,6 +72,12 @@ async def resolve_media_intent(ctx: AgentContext, command_id: str) -> tuple[str,
     if intent == "now_playing":
         rid = _NOW_PLAYING.get(prov)
         return (rid, {}) if rid else None
+    if intent in ("shuffle", "shuffle_off"):
+        # Shuffle is a Mopidy/TIDAL tracklist play-mode; Jellyfin's web player has no equivalent we drive,
+        # so only route it for TIDAL and fall through (→ None) otherwise.
+        if prov == "tidal":
+            return ("tidal.shuffle", {"mode": "on" if intent == "shuffle" else "off"})
+        return None
     if intent == "toggle":
         intent = "pause" if active.state == "playing" else "resume"
     if prov == "tidal":
