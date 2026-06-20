@@ -120,9 +120,10 @@ class TidalProvider:
             Command(
                 id="tidal.play", domain="media", tier=1, featured=True,
                 summary="Play music on TIDAL — a track, a whole album/playlist/mix, or resume. "
-                        "For one of the user's OWN saved playlists by name ('play my Jaymes playlist'), "
-                        "set playlist=true — NEVER pass a playlist name as a plain query, which searches "
-                        "for a single track and would play the wrong thing and stop after one song. "
+                        "For one of the user's OWN saved playlists by name ('play my Retro Favorites "
+                        "playlist'), pass playlist='<the playlist name>' and Aria plays the WHOLE "
+                        "playlist — do NOT pass the name as a plain query, which searches for a single "
+                        "track and plays the wrong thing that stops after one song. "
                         "Pass shuffle=true to play a playlist/album/mix in random order "
                         "(use this for 'shuffle my playlist').",
                 backend=PyBackend(ref=ref + "play"),
@@ -132,19 +133,20 @@ class TidalProvider:
                          description="a tidal: URI from tidal.search/tidal.playlists to play exactly"),
                     Slot("album", "boolean", False,
                          description="true to queue the whole album instead of a single track"),
-                    Slot("playlist", "boolean", False,
-                         description="true to play one of the user's OWN saved playlists found BY NAME "
-                                     "(query is the playlist name) — Aria matches it against the saved "
-                                     "playlist list and plays the whole playlist, not a single track"),
+                    Slot("playlist", "string", False,
+                         description="the user's OWN saved playlist NAME to play as a whole playlist, "
+                                     "e.g. playlist='Retro Favorites' for 'play my Retro Favorites "
+                                     "playlist'. Aria fuzzy-matches it against your saved playlists and "
+                                     "plays the entire playlist, not a single track. A tidal: playlist "
+                                     "URI is also accepted here."),
                     Slot("shuffle", "boolean", False,
                          description="true to play a playlist/album/mix in RANDOM order — set this "
                                      "whenever the request is to 'shuffle' a playlist or album"),
                 ],
                 examples=["play some Miles Davis on tidal", "play the album Dizzy Up the Girl",
                           "play kind of blue", "play music",
-                          "play my Jaymes playlist (query='Jaymes', playlist=true)",
-                          "shuffle my Retro Favorites playlist (query='Retro Favorites', playlist=true, "
-                          "shuffle=true)",
+                          "play my Jaymes playlist (playlist='Jaymes')",
+                          "shuffle my Retro Favorites playlist (playlist='Retro Favorites', shuffle=true)",
                           "play one of my mixes (uri from tidal.recommendations)"],
             ),
             Command(
@@ -398,17 +400,23 @@ async def _hold_ambient(ctx, new_track: bool = True) -> None:
         pass
 
 
-async def play(ctx, query="", uri="", album=False, playlist=False, shuffle=False) -> ToolResult:
+async def play(ctx, query="", uri="", album=False, playlist="", shuffle=False) -> ToolResult:
     tc = ctx.config.tidal
     # Container intent: a whole album/playlist/mix, not a single track. A tidal:album/playlist/mix URI
     # plays that exact container; `album=true` with a query searches the album catalog.
     if _is_container_uri(uri):
         return await _play_container(ctx, tc, query, uri, album=bool(album), shuffle=bool(shuffle))
-    # A saved playlist BY NAME: resolve name→uri in code (fuzzy match + confirm) and play the WHOLE
-    # playlist. Without this, the model plays the name as a track query → one wrong track that stops
-    # after it (the 2026-06-20 "wrong playlist, doesn't keep playing" live bug).
-    if bool(playlist) and query:
-        return await _play_named_playlist(ctx, tc, query, shuffle=bool(shuffle))
+    # A saved playlist BY NAME. The model's dominant shape is tidal.play(playlist="<name>") — the name
+    # carried in `playlist`, frequently with NO query. `playlist` used to be a boolean, so bool()-coercion
+    # threw the name away (bool("Retro Favorites") -> True) and the call silently fell through to a bare
+    # resume — the 2026-06-20 live "13 resumes, no music" bug. Now `playlist` carries the name itself; a
+    # tidal: playlist URI handed there plays that exact playlist; the legacy query+playlist=true shape and
+    # a stray bool-ish string still resolve (name lives in `query` then).
+    if isinstance(playlist, str) and _is_container_uri(playlist.strip()):
+        return await _play_container(ctx, tc, uri=playlist.strip(), shuffle=bool(shuffle))
+    pl_name = _playlist_name_arg(playlist, query)
+    if pl_name:
+        return await _play_named_playlist(ctx, tc, pl_name, shuffle=bool(shuffle))
     if bool(album):
         return await _play_container(ctx, tc, query, uri, album=True, shuffle=bool(shuffle))
     # Safety net for a bare "play my <name>" where the model omitted playlist=true (live 2026-06-20:
@@ -483,6 +491,30 @@ _PLAYLIST_PLAY_SCORE = 0.72   # explicit playlist=true: best match clears this t
 _PLAYLIST_STRONG = 0.82       # un-flagged "play my X": only a STRONG match silently beats a track
 _PLAYLIST_ASK_FLOOR = 0.45    # below this the best match is too weak to even offer
 _PLAYLIST_LEAD = 0.12         # best must beat the runner-up by this, else the two are "too close" → ask
+
+_BOOLISH_TRUE = ("true", "1", "yes", "on")
+_BOOLISH_FALSE = ("", "false", "0", "no", "off")
+
+
+def _playlist_name_arg(playlist, query: str) -> str:
+    """The saved-playlist NAME to play, normalized across the shapes the model actually sends.
+
+    `playlist` may be the name itself — tidal.play(playlist="Retro Favorites"), the dominant shape —
+    or a boolean / bool-ish string flag (the legacy shape, where the name lives in `query`), or empty.
+    Returns "" when there's no play-a-named-playlist intent. A container URI handed in `playlist` is
+    handled by the caller, so it resolves to "" here."""
+    q = (query or "").strip()
+    if playlist is True:
+        return q
+    if isinstance(playlist, str):
+        pl = playlist.strip()
+        low = pl.lower()
+        if low in _BOOLISH_TRUE:
+            return q                 # legacy: playlist=true is just a flag, the name is in `query`
+        if low in _BOOLISH_FALSE or _is_container_uri(pl):
+            return ""
+        return pl                    # the name itself
+    return ""
 
 
 def _norm_title(s: str) -> str:

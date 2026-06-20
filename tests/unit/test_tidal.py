@@ -677,7 +677,26 @@ _PLAYLISTS = [
 
 def test_play_has_playlist_slot():
     cmd = {c.id: c for c in td.PROVIDER.commands(_ctx())}["tidal.play"]
-    assert "playlist" in {s.name for s in cmd.params}
+    slot = {s.name: s for s in cmd.params}["playlist"]
+    # Must be a STRING (the playlist NAME), not a boolean — a boolean slot bool()-coerced the name the
+    # model puts there ("Retro Favorites" -> True), losing it and degrading to a bare resume (live bug).
+    assert slot.type == "string"
+
+
+def test_playlist_name_arg_normalizes_every_shape():
+    # The dominant live shape: the NAME carried in `playlist`, no query.
+    assert td._playlist_name_arg("Retro Favorites", "") == "Retro Favorites"
+    assert td._playlist_name_arg("  James  ", "") == "James"
+    # Legacy shape: a boolean flag, name in `query`.
+    assert td._playlist_name_arg(True, "James") == "James"
+    assert td._playlist_name_arg("true", "James") == "James"
+    assert td._playlist_name_arg("yes", "Retro Favorites") == "Retro Favorites"
+    # No playlist intent.
+    assert td._playlist_name_arg("", "kind of blue") == ""
+    assert td._playlist_name_arg(False, "kind of blue") == ""
+    assert td._playlist_name_arg("false", "x") == ""
+    # A container URI handed in `playlist` is the caller's job, not a name to fuzzy-match.
+    assert td._playlist_name_arg("tidal:playlist:retro", "") == ""
 
 
 def test_resolve_playlist_confident_match_plays():
@@ -780,6 +799,46 @@ async def test_play_named_playlist_shuffle_reorders():
     assert res.success and res.output.lower().startswith("shuffling")
     assert "core.tracklist.shuffle" in seen
     assert seen.index("core.tracklist.shuffle") < seen.index("core.playback.play")
+
+
+@respx.mock
+async def test_play_playlist_name_as_string_arg_plays_whole_playlist():
+    # The 2026-06-20 live bug: the model calls tidal.play(playlist="Retro Favorites") with NO query.
+    # The old boolean slot bool()-coerced the name to True, so it fell through to a bare resume 13×
+    # ("Resuming." each time, no music). The name now routes to the whole playlist.
+    seen = []
+
+    def resp(request):
+        body = json.loads(request.content); m = body["method"]; seen.append(m)
+        result = {
+            "core.playlists.as_list": [{"uri": p["uri"], "name": p["title"]} for p in _PLAYLISTS],
+            "core.playlists.get_items": [{"uri": "tidal:track:1"}, {"uri": "tidal:track:2"}],
+        }.get(m)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), playlist="Retro Favorites")   # name in `playlist`, no query
+    assert res.success and "Retro Favorites" in res.output
+    assert "core.playlists.get_items" in seen and "core.tracklist.add" in seen
+    assert "core.playback.resume" not in seen                 # never the silent bare-resume degrade
+
+
+@respx.mock
+async def test_play_playlist_uri_in_playlist_arg_plays_container():
+    # The model also hands a tidal: playlist URI in `playlist` (live 08:16). Route it straight to the
+    # container player instead of trying to fuzzy-match a URI against playlist titles.
+    seen = []
+
+    def resp(request):
+        body = json.loads(request.content); m = body["method"]; seen.append(m)
+        result = {"core.playlists.get_items": [{"uri": "tidal:track:1"}, {"uri": "tidal:track:2"}]}.get(m)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), playlist="tidal:playlist:retro")
+    assert res.success
+    assert "core.playlists.as_list" not in seen               # didn't fuzzy-match — used the URI directly
+    assert "core.tracklist.add" in seen and "core.playback.play" in seen
 
 
 def test_clean_playlist_query_strips_my_the_playlist():
