@@ -286,7 +286,7 @@ async def test_no_fallback_when_already_on_simple(home):
     ctx = make_ctx(home, [])
     ctx.client = _FallbackClient(fail_always=True)
     ctx.active_model = "arya"
-    evs = await run_turn(ctx, "hi")
+    evs = await run_turn(ctx, "play something")      # a real command (a bare "hi" is now wake-only → silent)
     assert ctx.client.calls == ["arya"]             # exactly one attempt, no fallback loop
     assert any(e.type == "error" for e in evs)
 

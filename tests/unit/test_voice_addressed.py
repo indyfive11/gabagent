@@ -131,6 +131,19 @@ def test_fast_verdict_name_in_narration_still_defers(text):
     assert _fast_verdict(text) is None
 
 
+@pytest.mark.parametrize("text", [
+    "we are hey aria",      # ambient STT noise + a TRAILING wake phrase — the 2026-06-19 "Hello, I'm here." leak
+    "hey aria",             # bare wake — naming her alone no longer fast-passes as addressed
+    "aria",                 # bare vocative
+    "hello aria",           # greeting + name, no command
+])
+def test_fast_verdict_bare_wake_defers_not_fastpass(text):
+    # Naming/greeting Aria with no command must NOT fast-pass to "addressed" — a trailing "<greeting> aria"
+    # is a wake phrase, not feedback, and a lead name is skipped so only a real command after it fast-passes.
+    # (Suppression itself is decided by is_addressed/_is_bare_wake; here we assert the heuristic defers.)
+    assert _fast_verdict(text) is None
+
+
 def _ctx(tag, *, raises=False, seen=None, provider="gab"):
     class _Client:
         async def complete_simple(self, messages, model=None):
@@ -190,6 +203,36 @@ async def test_is_addressed_classifier_error_fails_open():
     # classifier failure (e.g. a Gab model name sent to the Claude backend) isn't silently hidden.
     addressed, via = await is_addressed(_ctx("[ASIDE]", raises=True), "some aside here")
     assert addressed is True and via.startswith("error:")
+
+
+# ---- listen-first: a wake/greeting with no command never gets a spoken reply (VAC ask 2026-06-19) ----
+
+@pytest.mark.parametrize("text", ["hey aria", "hello", "okay aria", "aria", "hey, aria."])
+async def test_is_addressed_bare_wake_is_silent_without_llm(text):
+    # A wake/greeting with no command is decisively wake-only — stay silent, and DON'T pay an LLM classify
+    # (raises=True would blow up if the classifier were consulted).
+    addressed, via = await is_addressed(_ctx("[ADDRESSED]", raises=True), text)
+    assert addressed is False and via == "wake_only"
+
+
+async def test_is_addressed_ambient_merged_wake_reaches_llm_and_asides():
+    # STT merged ambient audio with the wake ("we are hey aria") so it isn't all-ignorable → not decisive;
+    # it reaches the LLM, which asides it. This is the exact 2026-06-19 leak ("We are Hey, Aria." → reply).
+    addressed, via = await is_addressed(_ctx("[ASIDE]"), "we are hey aria")
+    assert addressed is False and via == "llm:aside"
+
+
+async def test_is_addressed_wake_then_command_still_answers():
+    # A real command after the wake must still fast-pass (the guard never eats a command).
+    addressed, via = await is_addressed(_ctx("[ASIDE]", raises=True), "hey aria play some music")
+    assert addressed is True and via == "fast"
+
+
+async def test_is_addressed_bare_affirmation_is_not_wake_suppressed():
+    # "yes"/"no" carry no greeting or name → NOT decisively wake-only, so a spoken confirm answer is never
+    # silently eaten by this guard; it defers to the LLM instead.
+    _, via = await is_addressed(_ctx("[ADDRESSED]"), "yes")
+    assert via != "wake_only"
 
 
 # ---- turn-level: a not-addressed utterance closes silently, never reaching the LLM ----

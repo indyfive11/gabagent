@@ -55,6 +55,29 @@ _FILLER_LEADS = frozenset((
 _NAME_TOKENS = frozenset(("aria", "arya"))
 _NARRATION_PRE = frozenset(("to", "with", "about", "and", "or", "tell", "told"))
 
+# Greeting tokens (a subset is also filler). Used two ways: (1) a trailing "<greeting> aria" is a WAKE
+# phrase, not direct-address feedback, so it must NOT trailing-vocative fast-pass; (2) the bare-wake check.
+_GREETING = frozenset(("hey", "hi", "hello", "heya", "hiya", "yo"))
+# Tokens that, ALONE, make an utterance wake-only (nothing to act on): filler/politeness + greetings + the name.
+_WAKE_ONLY_TOKENS = _FILLER_LEADS | _NAME_TOKENS | _GREETING
+
+
+def _is_bare_wake(text: str) -> bool:
+    """Decisively wake-only: the utterance is NOTHING but wake/greeting/filler tokens, and carries at
+    least one greeting or the assistant's name — e.g. "hey aria", "hello", "okay aria". There is no
+    command to act on, so per Rob's listen-first rule (VAC ask 2026-06-19) the brain stays silent rather
+    than greeting back ("Hello, I'm here."). This is the ONE narrow case where the heuristic decides
+    NOT-addressed; it requires EVERY token to be ignorable, so it can never eat a command (any substantive
+    word — a verb, an object, ambient content like "we are" — defeats it and defers to the LLM instead).
+    The merged-ambient case "we are hey aria" is NOT all-ignorable, so it falls through to the LLM."""
+    words = [w.strip(".,!?;:\"'“”‘’") for w in text.strip().lower().split()]
+    words = [w for w in words if w]
+    if not words:
+        return False
+    if not all(w in _WAKE_ONLY_TOKENS for w in words):
+        return False
+    return any(w in _GREETING or w in _NAME_TOKENS for w in words)
+
 # First-person openers that explicitly direct the request AT the assistant ("you"). These miss the
 # lead-word fast-pass because the lead word is "I", so a clear command like "I want you to play a
 # playlist" otherwise pays a ~12.7s LLM classify (a quarter of Rob's 2026-06-16 42s play). They name
@@ -105,12 +128,18 @@ Decisive rule: speech that REFERS TO Aria but is aimed at someone else is an ASI
 Also an ASIDE: the user explicitly DICTATING or narrating for the record — saying he's "just dictating",
 that "you don't need to respond / do anything", or noting something "for your overseers" / "for the
 record". These are declarations, NOT requests for Aria to act NOW, even if phrased like "make a note…".
+
+Also an ASIDE: a bare greeting or simply being NAMED with no request — "hey Aria", "hello", or her name
+surrounded by ambient words ("we are hey Aria"). Waking her is not a question; she listens, she does not
+greet back. Only answer once an actual command or question follows.
 Examples:
 - "that was a false positive" → [ASIDE] (commentary about her)
 - "the goal is it doesn't trip when I'm just talking" → [ASIDE]
 - "he still hasn't bothered to respond, if you noticed" → [ASIDE] (narrating to someone else, "you" is about her)
 - "isn't that incredible?" → [ASIDE] (rhetorical, not a request)
 - "Mel, tell me something interesting" → [ASIDE] (addressed to Mel)
+- "hey Aria" → [ASIDE] (wake-only — just being named, no request)
+- "we are hey Aria" → [ASIDE] (ambient noise merged with the wake word, no request)
 - "make a note for your Claude overseers that the volume is off" → [ASIDE] (dictating for the record, not a live request)
 - "the music is… you don't need to do anything, I'm just dictating" → [ASIDE] (explicit non-command)
 - "I'm gonna dictate something so it's on the record, you don't need to respond" → [ASIDE]
@@ -143,26 +172,27 @@ def _fast_verdict(text: str) -> bool | None:
     # are asides, so anything question-shaped but not led by a question word goes to the classifier.
     # Genuine questions still fast-pass via their leading question word (what/how/is/are/can…) below.
     words = [w.strip(".,!?;:\"'") for w in t.split()]
-    # Skip leading filler/politeness to read the real lead word.
+    # Skip leading filler/politeness AND a leading vocative name to read the real lead word, so
+    # "Aria, play X" / "hey Aria pause" fast-pass on the COMMAND that follows the name. A bare vocative
+    # with nothing actionable after it ("aria", "hey aria") falls through to None and is handled by the
+    # decisive _is_bare_wake / the LLM — naming her alone is no longer a fast-pass to "addressed" (it
+    # produced the "Hello, I'm here." greeting-reply VAC flagged 2026-06-19). A mid-utterance MENTION
+    # ("you have to say hey aria and then…") still defers: its lead word isn't filler/name.
     i = 0
-    while i < len(words) and words[i] in _FILLER_LEADS:
+    while i < len(words) and (words[i] in _FILLER_LEADS or words[i] in _NAME_TOKENS):
         i += 1
     lead = words[i] if i < len(words) else ""
-    # Vocative address ONLY: "Aria …" / "hey Aria …" — the name in the lead position. A bare MENTION
-    # elsewhere ("you have to say hey Aria and then…", 3rd-person commentary about her) is NOT vocative
-    # and defers to the classifier. The old aria-anywhere fast-pass leaked exactly such asides live
-    # (round-1 gap a, recurred 2026-06-08: "you have to say, hey, Aria, and then give her a second").
-    if lead == "aria":
-        return True
     if lead in _COMMAND_LEADS:
         return True
     # Trailing/embedded VOCATIVE address: the assistant's name as the FINAL word ("what do you think, Arya?",
     # "your performance was solid, Aria") is a strong direct-address signal the lead-word check misses — these
     # were getting mis-asided by the LLM when no leading question/command word was present. Exclude narration
-    # ABOUT her ("talking TO aria", "with aria") where a preposition precedes the name. Leans addressed, per
-    # the conservative design (tolerate the rare aside-answer; never drop a real address). The self-label guard
-    # above already defers a dictation that happens to end on the name.
-    if len(words) >= 2 and words[-1] in _NAME_TOKENS and words[-2] not in _NARRATION_PRE:
+    # ABOUT her ("talking TO aria", "with aria") where a preposition precedes the name, AND a trailing WAKE
+    # phrase ("…hey aria" — a greeting right before the name) which is wake-only, not feedback (the
+    # ambient-merged "we are hey aria" leak, VAC 2026-06-19). Leans addressed otherwise (tolerate the rare
+    # aside-answer; never drop a real address).
+    if (len(words) >= 2 and words[-1] in _NAME_TOKENS
+            and words[-2] not in _NARRATION_PRE and words[-2] not in _GREETING):
         return True
     return None
 
@@ -171,6 +201,10 @@ async def is_addressed(ctx: AgentContext, user_text: str) -> tuple[bool, str]:
     """Decide whether `user_text` is directed at the assistant. Returns (addressed, via) where `via`
     is one of 'fast' | 'llm:addressed' | 'llm:aside' | 'error'. Never raises; fails open (addressed)
     so a classifier hiccup can never drop a command."""
+    # Decisive wake-only: a bare greeting / being named with no command never gets a spoken reply
+    # (listen-first). Narrow by construction — every token must be ignorable — so it can't eat a command.
+    if _is_bare_wake(user_text):
+        return False, "wake_only"
     fast = _fast_verdict(user_text)
     if fast:
         return True, "fast"
