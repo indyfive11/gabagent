@@ -95,8 +95,9 @@ async def test_play_searches_then_queues_and_plays():
     finally:
         _dl.dlog = _orig
     assert res.success and "So What" in res.output and "Miles Davis" in res.output
-    # search -> (F2 current-track check; not current here) -> clear -> add -> play, in order
-    assert seen == ["core.library.search", "core.playback.get_current_track",
+    # opportunistic saved-playlist check (as_list, no match here) -> search -> (F2 current-track check;
+    # not current here) -> clear -> add -> play, in order
+    assert seen == ["core.playlists.as_list", "core.library.search", "core.playback.get_current_track",
                     "core.tracklist.clear", "core.tracklist.add", "core.playback.play"]
     # latency sub-timing emitted with per-phase ms so a slow tidal turn can be localized
     assert logged and logged[0][0] == "tidal_timing"
@@ -654,3 +655,197 @@ async def test_shuffle_rpc_failure_is_graceful():
     respx.post(RPC).mock(side_effect=boom)
     res = await td.shuffle(_ctx())
     assert not res.success and res.error
+
+
+# -- play a SAVED playlist BY NAME: code-side fuzzy match + confirm (2026-06-20 live bug) --
+# Symptom: "play my Jaymes playlist" played one wrong track and stopped after it, because the model
+# passed the NAME as a track query (queues a single track). Now playlist=true resolves name→uri in
+# code and plays the whole playlist, asking to disambiguate weak/ambiguous matches.
+
+# A slice of Rob's real library, including the genuinely ambiguous pairs.
+_PLAYLISTS = [
+    {"uri": "tidal:playlist:jay", "title": "Jaymes"},
+    {"uri": "tidal:playlist:retro", "title": "Retro Favorites"},
+    {"uri": "tidal:playlist:metal", "title": "Metallica"},
+    {"uri": "tidal:playlist:afm", "title": "All For Metal"},
+    {"uri": "tidal:playlist:f1", "title": "Foreigner"},
+    {"uri": "tidal:playlist:f2", "title": "foreigner"},
+    {"uri": "tidal:playlist:rh", "title": "red hot"},
+    {"uri": "tidal:playlist:rhcp", "title": "Red Hot Chili Pepper Best"},
+]
+
+
+def test_play_has_playlist_slot():
+    cmd = {c.id: c for c in td.PROVIDER.commands(_ctx())}["tidal.play"]
+    assert "playlist" in {s.name for s in cmd.params}
+
+
+def test_resolve_playlist_confident_match_plays():
+    # STT routinely renders "Jaymes" as "James" — a fuzzy match still lands it, unambiguously.
+    assert td._resolve_playlist(_PLAYLISTS, "James")[:3] == ("play", "tidal:playlist:jay", "Jaymes")
+    # British spelling vs the stored title, still a confident single match.
+    assert td._resolve_playlist(_PLAYLISTS, "Retro Favourites")[1] == "tidal:playlist:retro"
+    # "Metallica" must NOT be eaten by "All For Metal" — clear lead → play.
+    assert td._resolve_playlist(_PLAYLISTS, "Metallica")[1] == "tidal:playlist:metal"
+
+
+def test_resolve_playlist_near_tie_asks():
+    # Two playlists named "foreigner"/"Foreigner" — too close to pick → ask.
+    kind, _, _, opts = td._resolve_playlist(_PLAYLISTS, "Foreigner")
+    assert kind == "ask" and "Foreigner" in opts and "foreigner" in opts
+    # "red hot" exactly matches one but is a token-subset of another → ask, not a silent wrong pick.
+    kind2, _, _, opts2 = td._resolve_playlist(_PLAYLISTS, "red hot")
+    assert kind2 == "ask" and "red hot" in opts2 and "Red Hot Chili Pepper Best" in opts2
+
+
+def test_resolve_playlist_no_match_is_none():
+    assert td._resolve_playlist(_PLAYLISTS, "polka party zzz")[0] == "none"
+    assert td._resolve_playlist([], "anything")[0] == "none"
+
+
+@respx.mock
+async def test_play_named_playlist_queues_whole_playlist_and_names_it():
+    # The fix for BOTH symptoms: the whole playlist is queued (keeps playing past track 1) and the
+    # reply names the real title (a wrong pick is immediately audible).
+    seen = []
+
+    def resp(request):
+        body = json.loads(request.content); m = body["method"]; seen.append((m, body.get("params")))
+        result = {
+            "core.playlists.as_list": [{"uri": p["uri"], "name": p["title"]} for p in _PLAYLISTS],
+            "core.playlists.get_items": [{"uri": "tidal:track:1"}, {"uri": "tidal:track:2"},
+                                         {"uri": "tidal:track:3"}],
+        }.get(m)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), query="James", playlist=True)
+    assert res.success and "Jaymes" in res.output
+    methods = [m for m, _ in seen]
+    # resolved the name (as_list), expanded the playlist (get_items), queued ALL tracks, played
+    assert methods == ["core.playlists.as_list", "core.playlists.get_items",
+                       "core.tracklist.clear", "core.tracklist.add", "core.playback.play"]
+    assert ("core.tracklist.add",
+            {"uris": ["tidal:track:1", "tidal:track:2", "tidal:track:3"]}) in seen
+
+
+@respx.mock
+async def test_play_named_playlist_ambiguous_asks_without_playing():
+    seen = []
+
+    def resp(request):
+        m = json.loads(request.content)["method"]; seen.append(m)
+        result = [{"uri": p["uri"], "name": p["title"]} for p in _PLAYLISTS] \
+            if m == "core.playlists.as_list" else None
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), query="Foreigner", playlist=True)
+    assert res.success and "did you mean" in res.output.lower()
+    # NEVER touches playback on an ambiguous match — no queue, no play.
+    assert "core.tracklist.add" not in seen and "core.playback.play" not in seen
+
+
+@respx.mock
+async def test_play_named_playlist_no_match_errors_no_track_fallback():
+    seen = []
+
+    def resp(request):
+        m = json.loads(request.content)["method"]; seen.append(m)
+        result = [{"uri": p["uri"], "name": p["title"]} for p in _PLAYLISTS] \
+            if m == "core.playlists.as_list" else None
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), query="nonexistent zzz", playlist=True)
+    assert not res.success and "couldn't find" in res.error.lower()
+    # Crucially: a playlist request that misses does NOT degrade into a single-track search.
+    assert "core.library.search" not in seen and "core.tracklist.add" not in seen
+
+
+@respx.mock
+async def test_play_named_playlist_shuffle_reorders():
+    seen = []
+
+    def resp(request):
+        body = json.loads(request.content); m = body["method"]; seen.append(m)
+        result = {
+            "core.playlists.as_list": [{"uri": p["uri"], "name": p["title"]} for p in _PLAYLISTS],
+            "core.playlists.get_items": [{"uri": "tidal:track:1"}, {"uri": "tidal:track:2"}],
+        }.get(m)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), query="Retro Favorites", playlist=True, shuffle=True)
+    assert res.success and res.output.lower().startswith("shuffling")
+    assert "core.tracklist.shuffle" in seen
+    assert seen.index("core.tracklist.shuffle") < seen.index("core.playback.play")
+
+
+def test_clean_playlist_query_strips_my_the_playlist():
+    assert td._clean_playlist_query("play my Retro Favorites playlist") == "retro favorites"
+    assert td._clean_playlist_query("my James") == "james"
+    assert td._clean_playlist_query("the Jaymes playlist") == "jaymes"
+    assert td._clean_playlist_query("Metallica") == "metallica"
+
+
+@respx.mock
+async def test_play_bare_name_redirects_to_strong_playlist_match():
+    # The live gap: "Play my James" with NO playlist=true flag played the TRACK "James Joint". The
+    # opportunistic safety net now plays the whole Jaymes playlist instead (strong, unambiguous match),
+    # naming it — and never single-track searches.
+    seen = []
+
+    def resp(request):
+        body = json.loads(request.content); m = body["method"]; seen.append(m)
+        result = {
+            "core.playlists.as_list": [{"uri": p["uri"], "name": p["title"]} for p in _PLAYLISTS],
+            "core.playlists.get_items": [{"uri": "tidal:track:1"}, {"uri": "tidal:track:2"}],
+        }.get(m)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), query="James")            # bare query, no playlist=true
+    assert res.success and "Jaymes" in res.output
+    assert "core.playlists.get_items" in seen and "core.tracklist.add" in seen
+    assert "core.library.search" not in seen              # never degraded to a track search
+
+
+@respx.mock
+async def test_play_bare_name_no_playlist_match_falls_through_to_track_search():
+    # A bare query that does NOT strongly match a saved playlist still plays the track (unchanged
+    # behavior) — the safety net only fires on a strong, unambiguous playlist match.
+    seen = []
+
+    def resp(request):
+        body = json.loads(request.content); m = body["method"]; seen.append(m)
+        result = {
+            "core.playlists.as_list": [{"uri": p["uri"], "name": p["title"]} for p in _PLAYLISTS],
+            "core.library.search": [{"tracks": [_TRACK]}],
+        }.get(m)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), query="kind of blue")     # matches no playlist
+    assert res.success and "So What" in res.output        # the track played
+    assert "core.library.search" in seen and "core.tracklist.add" in seen
+
+
+@respx.mock
+async def test_play_bare_name_ambiguous_playlist_does_not_redirect():
+    # "Foreigner" matches TWO saved playlists (near-tie) → the un-flagged safety net does NOT silently
+    # pick one; it falls through to a normal track search (only an explicit playlist=true would ask).
+    seen = []
+
+    def resp(request):
+        body = json.loads(request.content); m = body["method"]; seen.append(m)
+        result = {
+            "core.playlists.as_list": [{"uri": p["uri"], "name": p["title"]} for p in _PLAYLISTS],
+            "core.library.search": [{"tracks": [_TRACK]}],
+        }.get(m)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), query="Foreigner")
+    assert res.success and "So What" in res.output        # fell through to the track search
+    assert "core.playlists.get_items" not in seen         # did NOT play a playlist on the near-tie

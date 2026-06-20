@@ -11,7 +11,9 @@ server. See SETUP_TIDAL.md.
 from __future__ import annotations
 import asyncio
 import contextlib
+import difflib
 import json
+import re
 import time
 from typing import TYPE_CHECKING
 
@@ -118,6 +120,9 @@ class TidalProvider:
             Command(
                 id="tidal.play", domain="media", tier=1, featured=True,
                 summary="Play music on TIDAL — a track, a whole album/playlist/mix, or resume. "
+                        "For one of the user's OWN saved playlists by name ('play my Jaymes playlist'), "
+                        "set playlist=true — NEVER pass a playlist name as a plain query, which searches "
+                        "for a single track and would play the wrong thing and stop after one song. "
                         "Pass shuffle=true to play a playlist/album/mix in random order "
                         "(use this for 'shuffle my playlist').",
                 backend=PyBackend(ref=ref + "play"),
@@ -127,14 +132,20 @@ class TidalProvider:
                          description="a tidal: URI from tidal.search/tidal.playlists to play exactly"),
                     Slot("album", "boolean", False,
                          description="true to queue the whole album instead of a single track"),
+                    Slot("playlist", "boolean", False,
+                         description="true to play one of the user's OWN saved playlists found BY NAME "
+                                     "(query is the playlist name) — Aria matches it against the saved "
+                                     "playlist list and plays the whole playlist, not a single track"),
                     Slot("shuffle", "boolean", False,
                          description="true to play a playlist/album/mix in RANDOM order — set this "
                                      "whenever the request is to 'shuffle' a playlist or album"),
                 ],
                 examples=["play some Miles Davis on tidal", "play the album Dizzy Up the Girl",
                           "play kind of blue", "play music",
-                          "play my Metallica playlist (uri from tidal.playlists)",
-                          "shuffle my New Arrivals mix (uri from tidal.recommendations, shuffle=true)"],
+                          "play my Jaymes playlist (query='Jaymes', playlist=true)",
+                          "shuffle my Retro Favorites playlist (query='Retro Favorites', playlist=true, "
+                          "shuffle=true)",
+                          "play one of my mixes (uri from tidal.recommendations)"],
             ),
             Command(
                 id="tidal.playlists", domain="media", tier=1, structured=True, featured=True,
@@ -387,12 +398,27 @@ async def _hold_ambient(ctx, new_track: bool = True) -> None:
         pass
 
 
-async def play(ctx, query="", uri="", album=False, shuffle=False) -> ToolResult:
+async def play(ctx, query="", uri="", album=False, playlist=False, shuffle=False) -> ToolResult:
     tc = ctx.config.tidal
-    # Container intent: a whole album/playlist/mix, not a single track. `album=true` with a query
-    # searches for the album; a tidal:album/playlist/mix URI plays that exact container.
-    if bool(album) or _is_container_uri(uri):
+    # Container intent: a whole album/playlist/mix, not a single track. A tidal:album/playlist/mix URI
+    # plays that exact container; `album=true` with a query searches the album catalog.
+    if _is_container_uri(uri):
         return await _play_container(ctx, tc, query, uri, album=bool(album), shuffle=bool(shuffle))
+    # A saved playlist BY NAME: resolve name→uri in code (fuzzy match + confirm) and play the WHOLE
+    # playlist. Without this, the model plays the name as a track query → one wrong track that stops
+    # after it (the 2026-06-20 "wrong playlist, doesn't keep playing" live bug).
+    if bool(playlist) and query:
+        return await _play_named_playlist(ctx, tc, query, shuffle=bool(shuffle))
+    if bool(album):
+        return await _play_container(ctx, tc, query, uri, album=True, shuffle=bool(shuffle))
+    # Safety net for a bare "play my <name>" where the model omitted playlist=true (live 2026-06-20:
+    # "Play my James" played the track "James Joint", not the Jaymes playlist). If the query STRONGLY +
+    # unambiguously matches a saved playlist, play the whole playlist (named, so a wrong guess is
+    # audible) instead of a single track. A weak/ambiguous/no match falls through to the track search.
+    if query and not uri:
+        hit = await _maybe_saved_playlist(tc, query)
+        if hit:
+            return await _play_container(ctx, tc, uri=hit[0], shuffle=bool(shuffle), label=hit[1])
     # Mark the op in flight and optimistically cache "playing" so /media/state reflects it within ~100ms
     # (the gate reacts on time) instead of blocking ~30s behind the search/play (see _tidal_op). A failed
     # search/play self-heals: the cache reverts on the next idle poll once nothing's actually playing.
@@ -449,15 +475,122 @@ async def play(ctx, query="", uri="", album=False, shuffle=False) -> ToolResult:
         return ToolResult(output=f"Playing {label} on TIDAL." if label else "Playing on TIDAL.")
 
 
-async def _play_container(ctx, tc, query="", uri="", album=False, shuffle=False) -> ToolResult:
+# -- saved-playlist-by-name resolution (fuzzy match + confirm) -------------
+# The model used to play "my Jaymes playlist" by passing the NAME as a track query → one wrong track
+# that stops after it. Resolve the name to a playlist URI in CODE instead, with a confidence gate so a
+# weak/ambiguous match asks "did you mean …?" rather than confidently playing the wrong playlist.
+_PLAYLIST_PLAY_SCORE = 0.72   # explicit playlist=true: best match clears this to auto-play (else ask)
+_PLAYLIST_STRONG = 0.82       # un-flagged "play my X": only a STRONG match silently beats a track
+_PLAYLIST_ASK_FLOOR = 0.45    # below this the best match is too weak to even offer
+_PLAYLIST_LEAD = 0.12         # best must beat the runner-up by this, else the two are "too close" → ask
+
+
+def _norm_title(s: str) -> str:
+    """Lowercase, strip punctuation to spaces, collapse — so 'Retro Favourites' ≈ 'Retro Favorites'."""
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def _clean_playlist_query(q: str) -> str:
+    """Reduce a spoken playlist request to just the NAME: drop a leading 'my/the/play' and a
+    leading/trailing 'playlist' so 'play my Retro Favorites playlist' and 'my James' match cleanly."""
+    toks = _norm_title(q).split()
+    while toks and toks[0] in ("my", "the", "play", "playlist"):
+        toks.pop(0)
+    while toks and toks[-1] == "playlist":
+        toks.pop()
+    return " ".join(toks)
+
+
+def _score_title(qn: str, tn: str) -> float:
+    """Similarity of a normalized spoken name vs a normalized playlist title, 0..1."""
+    if not qn or not tn:
+        return 0.0
+    score = difflib.SequenceMatcher(None, qn, tn).ratio()
+    qt, tt = qn.split(), tn.split()
+    if qt and set(qt) <= set(tt):                       # every spoken word appears in the title
+        score = max(score, 0.9)
+    elif len(qn) >= 4 and (qn in tn or tn in qn):       # clean substring (guard tiny tokens)
+        score = max(score, 0.85)
+    return score
+
+
+def _resolve_playlist(playlists: list[dict], query: str, *,
+                      play_score: float = _PLAYLIST_PLAY_SCORE, ask: bool = True):
+    """Pick the saved playlist that best matches `query`. Returns one of:
+    ("play", uri, title, [])         — confident, unambiguous best match (>= play_score, clear lead)
+    ("ask", "", "", [titles])        — weak or near-tied; offer these to pick (only when ask=True)
+    ("none", "", "", [])             — nothing close enough (or ambiguous with ask=False)."""
+    qn = _clean_playlist_query(query)
+    if not qn:
+        return ("none", "", "", [])
+    scored = sorted(
+        ((_score_title(qn, _norm_title(p.get("title", ""))), p) for p in playlists if p.get("title")),
+        key=lambda x: x[0], reverse=True)
+    if not scored:
+        return ("none", "", "", [])
+    best_s, best = scored[0]
+    second_s = scored[1][0] if len(scored) > 1 else 0.0
+    if best_s >= play_score and (best_s - second_s) >= _PLAYLIST_LEAD:
+        return ("play", best["uri"], best["title"], [])
+    if ask and best_s >= _PLAYLIST_ASK_FLOOR:
+        close = [p["title"] for s, p in scored
+                 if s >= _PLAYLIST_ASK_FLOOR and (best_s - s) <= 0.15][:3]
+        return ("ask", "", "", close or [best["title"]])
+    return ("none", "", "", [])
+
+
+async def _maybe_saved_playlist(tc, query: str):
+    """Opportunistic, bounded: if `query` is a STRONG, unambiguous match to a saved playlist name,
+    return (uri, title); else None. This is the safety net for a bare "play my <name>" where the model
+    DIDN'T set playlist=true — a saved playlist beats a lone track that plays the wrong song and stops
+    after it. Never stalls the track-play hot path (short timeout, no retry) and never raises."""
+    try:
+        refs = await _rpc(tc, "core.playlists.as_list", timeout=3.0)
+    except Exception:
+        return None
+    pls = [{"uri": p.get("uri"), "title": (p.get("name") or "").strip()}
+           for p in (refs or []) if isinstance(p, dict) and p.get("uri")]
+    kind, uri, title, _ = _resolve_playlist(pls, query, play_score=_PLAYLIST_STRONG, ask=False)
+    return (uri, title) if kind == "play" else None
+
+
+def _english_list(items: list[str]) -> str:
+    items = [i for i in items if i]
+    if not items:
+        return "one of your playlists"
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} or {items[1]}"
+    return ", ".join(items[:-1]) + f", or {items[-1]}"
+
+
+async def _play_named_playlist(ctx, tc, query: str, shuffle: bool = False) -> ToolResult:
+    """Resolve a saved-playlist NAME to its URI in code and play the whole playlist. Asks to
+    disambiguate on a weak/ambiguous match, and NEVER falls back to a single track — a playlist
+    request that can't be matched says so rather than confidently playing the wrong song."""
+    try:
+        pls = await _load_playlists(tc)
+    except Exception as e:
+        return ToolResult(output="", error=f"couldn't load your playlists: {_human_err(e)}")
+    kind, uri, title, options = _resolve_playlist(pls, query)
+    if kind == "play":
+        return await _play_container(ctx, tc, uri=uri, shuffle=bool(shuffle), label=title)
+    if kind == "ask":
+        return ToolResult(output=f"I have more than one playlist that could match — did you mean "
+                                 f"{_english_list(options)}?")
+    return ToolResult(output="", error=f"I couldn't find a saved playlist called '{query}'.")
+
+
+async def _play_container(ctx, tc, query="", uri="", album=False, shuffle=False, label="") -> ToolResult:
     """Play a whole album / playlist / mix. A container URI plays exactly; `album=true` with a
     query searches the album catalog first. `shuffle=true` randomizes the queued order before play
-    so it starts on a random track."""
+    so it starts on a random track. `label` names the container in the spoken reply when the caller
+    already resolved it (e.g. a playlist matched by name) — so a wrong pick is immediately audible."""
     # In-flight + optimistic "playing" so /media/state is served from cache during the search/expand/play
     # rather than blocking the gate's poll behind the op (see _tidal_op).
     async with _tidal_op(ctx, optimistic="playing"):
         t0 = time.monotonic()
-        label = ""
         search_ms = None
         container_uri = uri if _is_container_uri(uri) else ""
         if not container_uri and album and query:
@@ -660,22 +793,27 @@ async def shuffle(ctx, mode="on") -> ToolResult:
     return ToolResult(output="Shuffle on." if target else "Shuffle off.")
 
 
+async def _load_playlists(tc) -> list[dict]:
+    """The user's saved TIDAL playlists as [{uri, title}]. An EMPTY first result is the cold-cache
+    false-negative signature: mopidy-tidal returns [] before its live playlist set is warmed, and the
+    brain then confidently tells the user a playlist they DO own "doesn't exist" (live 2026-06-17:
+    "Retro Favorites" reported absent 3×, played fine the next day). A genuinely empty library just
+    re-returns []; one warm-up retry rules out the cold miss cheaply. Raises on a transport error."""
+    refs = await _rpc_resilient(tc, "core.playlists.as_list")
+    if not refs:
+        refs = await _rpc_resilient(tc, "core.playlists.as_list")
+    return [{"uri": p.get("uri"), "title": (p.get("name") or "").strip()}
+            for p in (refs or []) if isinstance(p, dict) and p.get("uri")]
+
+
 async def playlists(ctx) -> ToolResult:
     """The user's saved TIDAL playlists. Play one by passing its uri to tidal.play."""
     tc = ctx.config.tidal
     try:
-        refs = await _rpc_resilient(tc, "core.playlists.as_list")
-        # An EMPTY list is the cold-cache false-negative signature: mopidy-tidal returns [] before its
-        # live playlist set is warmed, and the brain then confidently tells the user a playlist they DO
-        # own "doesn't exist" (live 2026-06-17: "Retro Favorites" reported absent 3×, played fine the next
-        # day). A genuinely empty library just re-returns []; one warm-up retry rules out the cold miss
-        # cheaply. (Every other TIDAL-API call here already goes through _rpc_resilient; this one didn't.)
-        if not refs:
-            refs = await _rpc_resilient(tc, "core.playlists.as_list")
+        pls = await _load_playlists(tc)
     except Exception as e:
         return ToolResult(output="", error=f"couldn't load your playlists: {_human_err(e)}")
-    out = [{"kind": "playlist", "uri": p.get("uri"), "title": (p.get("name") or "").strip()}
-           for p in (refs or []) if isinstance(p, dict) and p.get("uri")]
+    out = [{"kind": "playlist", "uri": p["uri"], "title": p["title"]} for p in pls]
     return ToolResult(output=json.dumps(out))
 
 
