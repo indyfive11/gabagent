@@ -335,30 +335,42 @@ async def search(ctx, genre=None, min_rating=None, query=None, unwatched=False) 
     return ToolResult(output=json.dumps(results))
 
 
+# Let a freshly-opened movie window settle (appear, take its HTML5 fullscreen) BEFORE the screen move.
+# Moving too early is the 2026-06-17 regression: the move landed, then 'f'/fullscreen pinned the still-
+# settling window back to the output it opened on. Move-LAST on a settled window sticks.
+_FS_SETTLE_SECS = 0.6
+
+
 async def _enter_fullscreen(ctx) -> ToolResult:
-    """Enter full screen — the mirror of _exit_fullscreen, across the same two stacked layers. Owned page:
-    press the player's own fullscreen shortcut ('f' — a TRUSTED key gesture, like Space for pause;
-    video.requestFullscreen() via evaluate is blocked without user activation) and raise the window to KWin
-    fullscreen. Unowned window: KWin fullscreen only, and be honest the player's own layer may need a manual 'f'."""
+    """Enter full screen, then move to the movie screen LAST. Two stacked layers as before — the Jellyfin
+    web player's own (HTML5) fullscreen via the TRUSTED 'f' key gesture (video.requestFullscreen() via
+    evaluate is blocked without user activation), and the KWin window fullscreen — but the screen move now
+    happens AFTER both, on a settled window, and atomically with re-asserting fullscreen on the target
+    output (see desktop.to_movie_screen). This fixes the move-then-fullscreen race that left movies stuck
+    on whatever monitor they opened on after the 2026-06-17 KWin/frameworks update. Unowned window: KWin
+    fullscreen + move, and be honest the player's own layer may need a manual 'f'."""
     from gabagent.commands.providers.desktop import (
         fullscreen as _kwin_fullscreen, to_movie_screen, _movie_window_hint)
     from gabagent.voice.debuglog import dlog
-    # The caption we'll target. `kwin_ok` only reports that the KWin script RAN (KWin scripting gives no
-    # readable match result), so log the hint too: a movie title means we aimed at the self-named movie
-    # window; an empty/server-name hint is the signature of the wrong-window bug this path replaced.
+    # The caption we'll target. A movie title means we aimed at the self-named movie window; an empty/
+    # server-name hint is the signature of the wrong-window bug this path replaced.
     hint = await _movie_window_hint(ctx)
-    moved = await to_movie_screen(ctx)   # put it on the configured movie screen (DP-1) first, if it's connected
-    where = f" on {moved}" if moved else ""
     page = _live_jellyfin_page(ctx)
     if page is not None:
         try:
-            await page.keyboard.press("f")
+            await page.keyboard.press("f")          # 1. player's own HTML5 fullscreen
         except Exception:
             pass
-        kwin = await _kwin_fullscreen(ctx)   # also raise the window to KWin fullscreen
+        kwin = await _kwin_fullscreen(ctx)          # 2. KWin-fullscreen the window where it is
+        await asyncio.sleep(_FS_SETTLE_SECS)        # 3. let it settle
+        moved = await to_movie_screen(ctx)          # 4. move to the movie screen LAST (+ re-assert fullscreen)
+        where = f" on {moved}" if moved else ""
         dlog(ctx, "fullscreen", path="owned", moved=moved, kwin_ok=kwin.success, hint=hint)
         return ToolResult(output=f"Set the movie to full screen{where}.")
-    res = await _kwin_fullscreen(ctx)
+    res = await _kwin_fullscreen(ctx)               # unowned: KWin fullscreen, settle, then move last
+    await asyncio.sleep(_FS_SETTLE_SECS)
+    moved = await to_movie_screen(ctx)
+    where = f" on {moved}" if moved else ""
     dlog(ctx, "fullscreen", path="unowned", moved=moved, kwin_ok=res.success, hint=hint)
     if not res.error:
         return ToolResult(output=f"I've put the movie window in full screen{where}. If the player itself isn't "

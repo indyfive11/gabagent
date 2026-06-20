@@ -66,6 +66,32 @@ _JS_MOVE_NAMED = (
     "if(!w)return;var s=workspace.screens;for(var j=0;j<s.length;j++){"
     "if(s[j].name===tn){workspace.sendClientToScreen(w,s[j]);return;}}})();"
 )
+# Move the BROWSER movie window (caption %NAME%) to output %TNAME% AND fullscreen it there, ATOMICALLY
+# in one script: sendClientToScreen first, then fullScreen=true on the (now-relocated) window. This is
+# the move-LAST fix for the 2026-06-17 KWin/frameworks regression — the old path moved, THEN pressed
+# 'f'/fullscreened as separate ops, and the fullscreen pinned the freshly-opened, not-yet-settled window
+# to the output it opened on, undoing the move. Doing both in one script with the move first guarantees
+# the fullscreen lands on the target output.
+_JS_MOVE_FS_NAMED = (
+    "(function(){" + _JS_IS_BROWSER +
+    "var n=%NAME%;var tn=%TNAME%;var ws=workspace.windowList();var w=null;"
+    "for(var i=0;i<ws.length;i++){var c=(ws[i].caption||'').toLowerCase();"
+    "if(_isB(ws[i].resourceClass)&&c.indexOf(n)>=0){w=ws[i];break;}}"
+    "if(!w)return;var s=workspace.screens;for(var j=0;j<s.length;j++){"
+    "if(s[j].name===tn){workspace.sendClientToScreen(w,s[j]);break;}}"
+    "w.fullScreen=true;})();"
+)
+# Read back which output the BROWSER movie window (caption %NAME%) is ACTUALLY on, via print() to the
+# journal — KWin scripting has no synchronous return channel, so this is the only way to VERIFY a move
+# landed instead of trusting that the script merely ran. Telemetry/verification only; never gates UX.
+_JS_WINDOW_OUTPUT_NAMED = (
+    "(function(){" + _JS_IS_BROWSER +
+    "var n=%NAME%;var ws=workspace.windowList();for(var i=0;i<ws.length;i++){"
+    "var c=(ws[i].caption||'').toLowerCase();"
+    "if(_isB(ws[i].resourceClass)&&c.indexOf(n)>=0){"
+    "print('GABA_WINOUT '+(ws[i].output?ws[i].output.name:'?'));return;}}"
+    "print('GABA_WINOUT none');})();"
+)
 # Fullscreen the first BROWSER window whose caption contains %NAME% (lowercased substring).
 _JS_FULLSCREEN_NAMED = (
     "(function(){" + _JS_IS_BROWSER +
@@ -120,6 +146,31 @@ async def _run_kwin_script(js: str) -> bool:
             os.unlink(path)
         except Exception:
             pass
+
+
+async def _movie_window_output(hint: str) -> str:
+    """Best-effort: the connector the movie window is ACTUALLY on right now, or "" if we can't read it.
+    Runs a KWin introspection script that print()s the window's output name to the journal (KWin scripting
+    has no synchronous return channel), then reads it back. Pure verification/telemetry — every failure
+    path returns "" and never changes behavior, so a missing/slow journald just yields an unconfirmed move."""
+    if not hint:
+        return ""
+    try:
+        js = _JS_WINDOW_OUTPUT_NAMED.replace("%NAME%", json.dumps(hint.lower()))
+        if not await _run_kwin_script(js):
+            return ""
+        await asyncio.sleep(0.15)   # let the print() reach the journal
+        rc, out = await _run(
+            ["journalctl", "--user", "--since", "5 seconds ago", "-o", "cat", "--no-pager"], timeout=3.0)
+        if rc != 0:
+            return ""
+        hits = [ln for ln in out.splitlines() if "GABA_WINOUT " in ln]
+        if not hits:
+            return ""
+        val = hits[-1].split("GABA_WINOUT ", 1)[1].strip()
+        return "" if val in ("none", "?", "") else val
+    except Exception:
+        return ""
 
 
 async def _kscreen_outputs() -> list[dict]:
@@ -274,15 +325,22 @@ async def to_screen(ctx, screen="") -> ToolResult:
     return await _move_to_target(ctx, target)
 
 
+_MOVE_FS_ATTEMPTS = 2          # one move, plus one retry if a readback shows it raced onto another output
+_MOVE_FS_RETRY_SETTLE = 0.4    # seconds to let the window settle before re-asserting the move
+
+
 async def to_movie_screen(ctx) -> str:
-    """Move the movie window to the user's configured movie screen (`desktop.movie_screen`, default
-    DP-1) before fullscreening it. Best-effort: returns the output name it targeted, or "" when there's
-    no movie window, no display info, the setting is blank, or the configured screen isn't currently
+    """Move the movie window to the configured movie screen (`desktop.movie_screen`, default DP-1) AND
+    fullscreen it there, as the LAST step of going fullscreen. Returns the output name it targeted, or ""
+    when there's no movie window, no display info, the setting is blank, or the configured screen isn't
     connected — so auto-fullscreen-on-play degrades quietly instead of erroring the play.
 
-    Emits a `movie_screen` debug event with a `reason` at every exit so a live verify run can see WHY a
-    move did or didn't happen (the prior version was invisible in the brain log — we could only infer it
-    from what the bot said)."""
+    Move-LAST + atomic move-then-fullscreen is the fix for the 2026-06-17 KWin/frameworks regression: the
+    old order (move, THEN press 'f'/fullscreen as separate ops) raced — the fullscreen pinned the freshly-
+    opened, not-yet-settled window to the output it opened on, undoing the move. Moving a settled window and
+    fullscreening it on the target in one script sticks (proven live). Reads back the window's REAL output
+    (best-effort) and retries once if it landed elsewhere, then emits a `movie_screen` event with both the
+    target AND where it actually `landed`, so a verify run sees the truth instead of just "the script ran"."""
     from gabagent.voice.debuglog import dlog
     if ctx is None:
         return ""
@@ -303,11 +361,29 @@ async def to_movie_screen(ctx) -> str:
     if not hint:
         dlog(ctx, "movie_screen", reason="no_movie_window", want=want, target=target["name"], moved="")
         return ""
-    js = _JS_MOVE_NAMED.replace("%NAME%", json.dumps(hint.lower())) \
-                       .replace("%TNAME%", json.dumps(target["name"]))
-    ok = await _run_kwin_script(js)
-    dlog(ctx, "movie_screen", reason="moved" if ok else "kwin_move_failed",
-         want=want, target=target["name"], window=hint, moved=target["name"] if ok else "")
+    js = _JS_MOVE_FS_NAMED.replace("%NAME%", json.dumps(hint.lower())) \
+                          .replace("%TNAME%", json.dumps(target["name"]))
+    ok = False
+    landed = ""
+    for attempt in range(_MOVE_FS_ATTEMPTS):
+        ok = await _run_kwin_script(js)
+        if not ok:
+            break
+        landed = await _movie_window_output(hint)
+        if not landed or landed == target["name"]:
+            break                              # landed correctly, or can't confirm — don't thrash
+        if attempt + 1 < _MOVE_FS_ATTEMPTS:
+            await asyncio.sleep(_MOVE_FS_RETRY_SETTLE)  # raced onto another output → settle and retry
+    if not ok:
+        reason = "kwin_move_failed"
+    elif not landed:
+        reason = "moved_unconfirmed"           # script ran, journald readback unavailable (best-effort)
+    elif landed == target["name"]:
+        reason = "moved"
+    else:
+        reason = "moved_elsewhere"             # script ran but window is on a different output — race telltale
+    dlog(ctx, "movie_screen", reason=reason, want=want, target=target["name"],
+         window=hint, landed=landed, moved=target["name"] if ok else "")
     return target["name"] if ok else ""
 
 

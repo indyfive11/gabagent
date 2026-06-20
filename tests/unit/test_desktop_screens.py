@@ -29,16 +29,21 @@ def _ctx(movie_screen="DP-1", aliases=None):
     return types.SimpleNamespace(config=cfg)
 
 
-def _wire(monkeypatch, *, hint="wayne's world", screens=_SCREENS, ok=True):
-    seen = {"js": None}
+def _wire(monkeypatch, *, hint="wayne's world", screens=_SCREENS, ok=True, landed="DP-1"):
+    """Wire the KWin/display seams. `landed` is what the best-effort readback reports the window's actual
+    output is ("" = readback unavailable); the move JS itself is captured in seen["js"] / seen["runs"]."""
+    seen = {"js": None, "runs": 0}
     async def _outputs(): return list(screens)
     async def _hint(_ctx): return hint
     async def _run(js):
         seen["js"] = js
+        seen["runs"] += 1
         return ok
+    async def _out(_hint): return landed
     monkeypatch.setattr(dk, "_kscreen_outputs", _outputs)
     monkeypatch.setattr(dk, "_movie_window_hint", _hint)
     monkeypatch.setattr(dk, "_run_kwin_script", _run)
+    monkeypatch.setattr(dk, "_movie_window_output", _out)
     return seen
 
 
@@ -47,6 +52,31 @@ async def test_to_movie_screen_moves_to_configured_connector(monkeypatch):
     assert await dk.to_movie_screen(_ctx("DP-1")) == "DP-1"
     assert '"DP-1"' in seen["js"]            # the move script targets the configured output
     assert "wayne's world" in seen["js"]     # ...by the movie window's caption
+    assert "fullScreen=true" in seen["js"]   # ...and fullscreens it there atomically (move-last fix)
+
+
+async def test_to_movie_screen_retries_when_it_lands_elsewhere(monkeypatch):
+    # Readback says the window raced onto a DIFFERENT output → move is re-asserted once, reason is honest.
+    events = _capture_dlog(monkeypatch)
+    seen = _wire(monkeypatch, landed="HDMI-A-1")
+    assert await dk.to_movie_screen(_ctx("DP-1")) == "DP-1"
+    assert seen["runs"] == 2                  # one move + one retry
+    assert events[-1][1]["reason"] == "moved_elsewhere" and events[-1][1]["landed"] == "HDMI-A-1"
+
+
+async def test_to_movie_screen_landed_confirmed_does_not_retry(monkeypatch):
+    seen = _wire(monkeypatch, landed="DP-1")
+    assert await dk.to_movie_screen(_ctx("DP-1")) == "DP-1"
+    assert seen["runs"] == 1                   # confirmed on the first move → no retry
+
+
+async def test_to_movie_screen_unconfirmed_readback_is_best_effort(monkeypatch):
+    # journald readback unavailable ("" ) → no retry, honest "moved_unconfirmed", still returns the target.
+    events = _capture_dlog(monkeypatch)
+    seen = _wire(monkeypatch, landed="")
+    assert await dk.to_movie_screen(_ctx("DP-1")) == "DP-1"
+    assert seen["runs"] == 1
+    assert events[-1][1]["reason"] == "moved_unconfirmed"
 
 
 async def test_to_movie_screen_resolves_alias(monkeypatch):
@@ -104,7 +134,8 @@ async def test_to_movie_screen_logs_reason_on_skip(monkeypatch, movie_screen, hi
 
 # -- window-targeting matchers are scoped to a BROWSER window (the Conky/wrong-window fix) ----------
 
-@pytest.mark.parametrize("js", [dk._JS_MOVE_NAMED, dk._JS_FULLSCREEN_NAMED, dk._JS_UNFULLSCREEN_NAMED])
+@pytest.mark.parametrize("js", [dk._JS_MOVE_NAMED, dk._JS_MOVE_FS_NAMED, dk._JS_WINDOW_OUTPUT_NAMED,
+                                dk._JS_FULLSCREEN_NAMED, dk._JS_UNFULLSCREEN_NAMED])
 async def test_movie_matchers_are_browser_scoped(js):
     # Every movie-window matcher gates on the browser-class predicate, so a Conky/desktop window whose
     # caption carries the hostname can never be the one moved/fullscreened.
