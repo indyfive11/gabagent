@@ -191,9 +191,11 @@ def _cli_ctx(enabled=True, n_user=4):
 
 
 @pytest.mark.asyncio
-async def test_persona_reflect_spawns_detached_child(monkeypatch):
-    # Shutdown reflection must NOT run in-process (it loses the race to the front-end's 5s SIGKILL);
-    # it spawns a detached child that outlives the brain.
+async def test_persona_reflect_spawns_in_systemd_scope(monkeypatch):
+    # Shutdown reflection must NOT run in-process (it loses the race to the front-end's 5s SIGKILL). On a
+    # systemd host it spawns into its OWN transient scope (separate cgroup) so it survives the
+    # voice-agent.service cgroup being cycled on every brain teardown — process-group escape alone is reaped.
+    import shutil
     import subprocess
     from gabagent import cli
     captured = {}
@@ -202,15 +204,48 @@ async def test_persona_reflect_spawns_detached_child(monkeypatch):
         def __init__(self, argv, **kw):
             captured["argv"], captured["kw"] = argv, kw
 
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None)
     monkeypatch.setattr(subprocess, "Popen", _FakePopen)
     await cli._persona_reflect(_cli_ctx(enabled=True, n_user=4))
 
-    assert captured["argv"][1:3] == ["-m", "gabagent.persona.reflect_detached"]
-    assert captured["kw"]["start_new_session"] is True  # own session → survives the kill
-    handoff = Path(captured["argv"][-1])
+    argv = captured["argv"]
+    assert argv[0] == "/usr/bin/systemd-run"
+    assert "--user" in argv and "--scope" in argv  # own transient cgroup, escapes the unit's cgroup
+    assert "gabagent.persona.reflect_detached" in argv
+    assert captured["kw"]["start_new_session"] is True
+    handoff = Path(argv[-1])
     assert handoff.exists()
     payload = json.loads(handoff.read_text())
     assert len(payload["turns"]) == 8 and payload["turns"][0]["role"] == "user"
+    handoff.unlink()
+
+
+@pytest.mark.asyncio
+async def test_persona_reflect_falls_back_without_systemd_run(monkeypatch):
+    # No systemd-run (non-systemd host / TUI dev box) → fall back to a plain detached child (bare argv,
+    # process-group escape only). Reflection still runs where there's no cgroup to dodge.
+    import shutil
+    import subprocess
+    from gabagent import cli
+    captured = {}
+
+    class _FakePopen:
+        def __init__(self, argv, **kw):
+            captured["argv"], captured["kw"] = argv, kw
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    await cli._persona_reflect(_cli_ctx(enabled=True, n_user=4))
+
+    argv = captured["argv"]
+    assert "systemd-run" not in argv[0]
+    assert argv[1:3] == ["-m", "gabagent.persona.reflect_detached"]  # bare child, no wrapper
+    assert captured["kw"]["start_new_session"] is True
+    handoff = Path(argv[-1])
+    assert handoff.exists()
+    payload = json.loads(handoff.read_text())
+    assert len(payload["turns"]) == 8
     handoff.unlink()
 
 

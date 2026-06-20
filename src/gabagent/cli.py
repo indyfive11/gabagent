@@ -229,6 +229,7 @@ async def _persona_reflect(ctx) -> None:
     try:
         import json
         import os
+        import shutil
         import subprocess
         import tempfile
         from gabagent.persona.manager import _MIN_TURNS, _TRANSCRIPT_TURNS
@@ -242,12 +243,33 @@ async def _persona_reflect(ctx) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f)
 
-        subprocess.Popen(
-            [sys.executable, "-m", "gabagent.persona.reflect_detached", path],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,  # own session/process group — survives the brain's SIGTERM/SIGKILL
-            close_fds=True,
-        )
+        argv = [sys.executable, "-m", "gabagent.persona.reflect_detached", path]
+        # The voice front-end runs the brain inside the `voice-agent.service` systemd cgroup
+        # (Type=simple, default KillMode=control-group). A normal voice shutdown exits non-zero →
+        # Restart=on-failure cycles the WHOLE cgroup, and `systemctl --user stop` SIGTERMs it outright.
+        # `start_new_session=True` escapes the process GROUP but NOT the cgroup, so a plain detached child
+        # is reaped on every teardown. Run reflection in its own transient systemd SCOPE so it lands in a
+        # separate cgroup under the user manager and outlives the brain's cgroup being killed.
+        systemd_run = shutil.which("systemd-run")
+        spawned = False
+        if systemd_run:
+            try:
+                subprocess.Popen(
+                    [systemd_run, "--user", "--scope", "--quiet", "--collect", "--", *argv],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True, close_fds=True,
+                )
+                spawned = True
+            except Exception:
+                spawned = False  # systemd-run present but unusable → fall back below
+        if not spawned:
+            # No systemd-run (non-systemd host / TUI dev box): best-effort process-group escape. Survives a
+            # direct terminate() but NOT a systemd cgroup cycle — acceptable where there's no cgroup to dodge.
+            subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True, close_fds=True,
+            )
     except Exception:
         pass
 
