@@ -19,7 +19,12 @@ sends transcribed user utterances, and renders the streamed response as speech.
 | POST | `/confirm` | `{session_id, id, approved, passphrase?}` | **SSE** continuation stream. `404` unknown session, `409` nothing awaiting confirmation / no match. |
 | POST | `/cancel` | `{session_id}` | `{"ok":true}` — aborts the in-flight turn (barge-in). |
 | POST | `/media/duck` | `{session_id, on, mute?}` | `{"ok":true,"ducked":[…]}` — quiet/restore local media while the user speaks (`ducked` is opaque, brain-internal). |
-| GET  | `/media/state` | — | `{"playing":bool,"state":"playing"|"paused"|"idle","kind":"audio"|"video"|null}` |
+| GET  | `/media/state` | query: `bot_speaking=true\|false` (optional) | `{"playing":bool,"state":"playing"|"paused"|"idle","kind":"audio"|"video"|null}` |
+
+`/media/state` doubles as a ~1 Hz heartbeat. Pass `bot_speaking=true` while the assistant's TTS is actively
+playing: it lets the brain keep its duck-watchdog from auto-restoring the bed mid-reply (a long spoken answer
+has no incoming user speech to keep the duck alive). Omit it or send `false` otherwise. Optional — a brain that
+ignores it still works.
 
 ## SSE events
 
@@ -33,6 +38,9 @@ omitted. `type` is always present.
 | `confirm` | `id, tier, method, summary, reason?, prompt_is_complete?` | A gate confirmation. `method` ∈ `spoken_yesno`\|`keyboard`\|`passphrase`. By convention `summary` is a bare action and the front-end appends the yes/no; if `prompt_is_complete` is true, speak `summary` verbatim. Reply via `POST /confirm`. |
 | `blocked` | `action, reason` | An action was refused by policy. |
 | `error`   | `text, summary` | Turn-level failure — `text` is speakable, `summary` is the structured cause. |
+| `wake_hold` | `ttl_secs` | Keep the wake/follow-up window open for `ttl_secs` after a media-control turn, so the user can chain commands ("louder", "skip") without re-waking. |
+| `convo_hold` | `release` | `release=true` on a terminal reply: restore the bed-duck at TTS-stop instead of holding it the full conversation-hold window. A reply that expects an answer (a question) omits this so the hold stays open. |
+| `voice_volume` | `op, value?` | Change the **assistant's own** TTS gain (not media volume). `op` ∈ `up`\|`down`\|`set`; on `set`, `value` is an absolute level `0..1` (1.0 = full, 0.0 = silent). |
 | `done`    | — | Terminal: the turn (or confirm continuation) is complete. |
 
 ## Design principles

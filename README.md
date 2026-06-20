@@ -56,11 +56,14 @@ gab --voice-serve            # start the brain on 127.0.0.1:8765
 
 By voice you can control:
 
-- **Music — TIDAL (via Mopidy):** play tracks, albums, playlists and mixes; set an
-  absolute volume; pause/resume. Music auto-ducks (or fully mutes) while you speak.
+- **Music — TIDAL (via Mopidy):** play tracks, albums, playlists and mixes (by name,
+  with shuffle); set an absolute volume; pause/resume. Music auto-ducks (or fully
+  mutes) while you speak, and stays ducked through a long spoken reply.
 - **Movies — Jellyfin:** search, play on a chosen monitor, pause/resume, leave full
   screen, and adjust volume — in a browser the brain controls.
 - **Desktop — KDE/Wayland:** move windows between monitors, close windows by name.
+- **Aria's own voice:** "lower your voice" / "speak up" adjusts the assistant's own
+  speaking volume — distinct from the music or system volume.
 
 The brain only ducks or controls media playing on **this** machine — playback on
 other devices/rooms is left untouched. Irreversible actions require a spoken
