@@ -80,6 +80,18 @@ def keepalive(ttl_secs: int) -> VoiceEvent:
     return VoiceEvent(type="wake_hold", extra={"hold": True, "ttl_secs": int(ttl_secs)})
 
 
+def convo_hold() -> VoiceEvent:
+    """Conversation-hold release (brain → voice client). Emitted BEFORE `done` on a TERMINAL turn — a
+    self-contained reply with no expected follow-up (one-shot Q&A, an acknowledgement, or an explicit
+    dismiss) — so the voice side drops the bed-duck immediately instead of holding it the full
+    conversation-hold window after an addressed reply over playing media. Arrival-keyed: the voice side
+    keys on the event TYPE (a serializer dropping the literal `true` can't disarm it — the same robustness
+    rule as `addressed`); `release` is carried via `extra` for logging and survives to_dict's empty-value
+    filter. Safe to omit — a missing event degrades to the voice-side timed hold, so this is a pure
+    optimization; the turn loop emits it conservatively (never on a media-control turn or a question)."""
+    return VoiceEvent(type="convo_hold", extra={"release": True})
+
+
 def timer_fired(timer_id: str, label: str = "", set_secs: int = 0) -> VoiceEvent:
     """A countdown timer (G2) came due (brain → voice client). The voice side rings on receipt and its
     stop-word cancels the ring (the LVA pattern). Carries id/label/set_secs via `extra` so the wire shape

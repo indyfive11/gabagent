@@ -393,6 +393,17 @@ async def _handle_meta(ctx: AgentContext, mc: commands.MetaCommand, emit) -> Non
     await emit(events.done())
 
 
+def _is_terminal_reply(text: str) -> bool:
+    """Heuristic for a TERMINAL turn (for the conversation-hold release hint): a self-contained spoken
+    reply with no expected follow-up. Conservative — a reply that ENDS in a question (a clarification,
+    an option list, 'anything else?') is NOT terminal, so the voice-side hold stays open for the answer.
+    Trailing quotes/emphasis/brackets are stripped before the final-punctuation check."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    return not t.rstrip("\"')]>*_` ").endswith("?")
+
+
 async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
     """Drive one turn, emitting VoiceEvents into vs.queue. Suspends naturally at a
     confirm (inside voice_approve's await) and resumes when /confirm resolves it.
@@ -639,6 +650,17 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
         if media_ran and keepalive_secs > 0:
             await emit(events.keepalive(keepalive_secs))
             dlog(ctx, "keepalive", ttl_secs=keepalive_secs)
+
+        # Conversation-hold release: tell the voice side to drop the bed-duck early when THIS turn is a
+        # terminal one-shot reply, instead of holding it the full conversation-hold window after an
+        # addressed reply over playing media. NOT on a media-control turn (more commands likely — the
+        # keepalive above already holds the window) and NOT when the reply ends in a question (a
+        # clarification/option list awaiting an answer). Arrival-keyed + safe to omit (degrades to the
+        # voice-side timer), so emit conservatively. text_buf holds the final reply (loop broke on no tools).
+        if (getattr(ctx.config, "voice_convo_hold_release", True)
+                and not media_ran and _is_terminal_reply(text_buf)):
+            await emit(events.convo_hold())
+            dlog(ctx, "convo_hold", release=True)
 
         await emit(events.done())
     except asyncio.CancelledError:

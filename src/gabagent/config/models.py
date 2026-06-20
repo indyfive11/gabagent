@@ -210,6 +210,13 @@ class GabAgentConfig(BaseSettings):
     # asides). 0 disables. The voice side caps it with its own max-hold ceiling so a missed refresh
     # self-heals. Env: GABAI_MEDIA_KEEPALIVE_SECS.
     media_keepalive_secs: int = 30
+    # Conversation-hold release: on a TERMINAL one-shot reply (a self-contained answer with no expected
+    # follow-up — not a media-control turn, not a reply ending in a question), emit a `convo_hold` event
+    # so the voice side drops the bed-duck immediately instead of holding it the full conversation-hold
+    # window after an addressed reply over playing media. Pure optimization — a missed/absent event
+    # degrades to the voice-side timed hold, so it's emitted conservatively. False disables the hint.
+    # Env: GABAI_VOICE_CONVO_HOLD_RELEASE.
+    voice_convo_hold_release: bool = True
     # The sink-input % a freshly-played Jellyfin movie should start at. 100 = neutral (no per-stream
     # attenuation; the device/player volume governs actual loudness) — NOT "loud". This un-strands the
     # movie-starts-quiet bug: PipeWire's stream-restore replays the PRIOR movie's ducked/low level (e.g. 18%,

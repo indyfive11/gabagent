@@ -436,3 +436,81 @@ async def test_keepalive_disabled_when_secs_zero(home, monkeypatch):
     ], media_keepalive_secs=0)
     evs = await run_turn(ctx, "play my playlist")
     assert not any(e.type == "wake_hold" for e in evs)
+
+
+# -- convo_hold: release the voice conversation-hold on a TERMINAL one-shot reply (VAC Phase-2 ask) --
+
+def test_convo_hold_event_wire_shape():
+    from gabagent.voice import events
+    ev = events.convo_hold()
+    assert ev.type == "convo_hold"
+    assert ev.to_dict() == {"type": "convo_hold", "release": True}   # arrival-keyed; release present
+
+
+def test_is_terminal_reply_heuristic():
+    from gabagent.voice.turn import _is_terminal_reply
+    assert _is_terminal_reply("It's three o'clock.") is True          # self-contained answer
+    assert _is_terminal_reply("You're welcome.") is True              # acknowledgement
+    assert _is_terminal_reply("Which playlist did you mean?") is False  # awaiting an answer
+    assert _is_terminal_reply('Did you mean "Jaymes"?') is False      # trailing quote stripped, still a Q
+    assert _is_terminal_reply("") is False                            # nothing said → nothing to release
+
+
+async def test_terminal_qa_emits_convo_hold_before_done(home, monkeypatch):
+    """A terminal one-shot reply (no tools, not a question) emits exactly one `convo_hold` right before
+    `done`, so the voice side can drop the bed-duck early instead of holding the full window."""
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+    ctx = make_ctx(home, [["It's three o'clock."]])
+    evs = await run_turn(ctx, "what time is it")
+    holds = [e for e in evs if e.type == "convo_hold"]
+    assert len(holds) == 1
+    assert holds[0].to_dict() == {"type": "convo_hold", "release": True}
+    types_ = [e.type for e in evs]
+    assert types_.index("convo_hold") < types_.index("done")
+    assert types_[-1] == "done"
+
+
+async def test_question_reply_does_not_emit_convo_hold(home, monkeypatch):
+    """A reply that ends in a question is NOT terminal — keep the hold open for the user's answer."""
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+    ctx = make_ctx(home, [["Which playlist did you mean?"]])
+    evs = await run_turn(ctx, "play my playlist")
+    assert not any(e.type == "convo_hold" for e in evs)
+
+
+async def test_media_turn_does_not_emit_convo_hold(home, monkeypatch):
+    """A media-control turn keeps the conversation-hold (more commands likely; the keepalive holds the
+    window) — convo_hold is only for a terminal one-shot, never a media turn."""
+    from gabagent.api.models import ToolResult
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, *a, **k):
+        return [ToolResult(output="Paused.") for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+    ctx = _media_ctx(home, [
+        [[_spec("run_command", command_id="jellyfin.control", action="pause")]],
+        ["Paused the music for you."],
+    ], media_keepalive_secs=30)
+    evs = await run_turn(ctx, "pause the music")
+    assert not any(e.type == "convo_hold" for e in evs)
+    assert any(e.type == "wake_hold" for e in evs)        # the media keepalive still fires
+
+
+async def test_convo_hold_disabled_by_flag(home, monkeypatch):
+    """voice_convo_hold_release=False suppresses the hint entirely (degrades to the voice-side timer)."""
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+    ctx = make_ctx(home, [["It's three o'clock."]], voice_convo_hold_release=False)
+    evs = await run_turn(ctx, "what time is it")
+    assert not any(e.type == "convo_hold" for e in evs)
