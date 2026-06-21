@@ -693,6 +693,10 @@ def test_coerce_secs_and_fmt_hms():
     assert jf._coerce_secs(None) is None and jf._coerce_secs("") is None and jf._coerce_secs("oops") is None
     assert jf._coerce_secs(2700) == 2700 and jf._coerce_secs("4800") == 4800 and jf._coerce_secs(-5) == 0
     assert jf._coerce_secs(90.7) == 90
+    # ms-slip guard: a value past the sane-seconds ceiling is folded down (the live FF regression).
+    assert jf._coerce_secs(1_800_000) == 1800       # "30 minutes" handed to us as milliseconds
+    assert jf._coerce_secs(60_000) == 60            # "1 minute" as ms
+    assert jf._coerce_secs(14_400) == 14_400        # a legit 4h seconds value is NOT folded
     assert jf._fmt_hms(4800) == "1 hour 20 minutes"
     assert jf._fmt_hms(2700) == "45 minutes"
     assert jf._fmt_hms(150) == "2 minutes 30 seconds"
@@ -710,8 +714,19 @@ async def test_seek_to_owned_page_jumps_to_absolute_time():
 async def test_seek_to_owned_page_clamps_to_duration():
     page = _FakePlayPage(paused=False, current_time=10.0, duration=7200.0)
     ctx = _ctx(); ctx.jellyfin_playing_page = page
-    r = await jf.control(ctx, action="seek_to", position=99999)
+    # 10000s is a real (if past-the-end) seconds value — below the ms-fold ceiling — so it exercises the
+    # duration clamp, not the unit guard.
+    r = await jf.control(ctx, action="seek_to", position=10000)
     assert r.success and abs(page.currentTime - 7200) < 1e-9
+
+
+async def test_seek_to_folds_milliseconds_to_seconds():
+    # The live regression: model passes "30 minutes" as 1_800_000 (ms). Must land at 30:00, not 500 hours.
+    page = _FakePlayPage(paused=False, current_time=10.0, duration=7200.0)
+    ctx = _ctx(); ctx.jellyfin_playing_page = page
+    r = await jf.control(ctx, action="seek_to", position=1_800_000)
+    assert r.success and abs(page.currentTime - 1800) < 1e-9 and "30 minutes" in r.output
+    assert "hour" not in r.output                      # never narrates the absurd "500 hours"
 
 
 async def test_seek_to_without_position_asks_for_a_time():

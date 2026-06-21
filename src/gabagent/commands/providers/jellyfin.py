@@ -36,15 +36,25 @@ _DIVERTABLE = set(_REMOTE_VOLUME) | {"pause", "stop"}
 _PLAY_POLL_TRIES = 24   # ~12s waiting for the opened web client to register a session
 
 
+# No film runs past ~6h, so a seek/start target above this ceiling means the model handed us MILLISECONDS
+# instead of seconds ("30 minutes" → 1_800_000 not 1800). Left raw it sought to "500 hours" off the end and
+# the confirmation said so — a live regression (arya intermittently ignores the SECONDS slot doc). Fold ms→s.
+_MAX_SANE_POS_SECS = 6 * 3600
+
+
 def _coerce_secs(position) -> int | None:
-    """A spoken position arrives as a number of SECONDS from the start (the model converts '1h20m' → 4800).
-    Coerce defensively (str/float/None) to a non-negative int; None if absent/unparseable."""
+    """A spoken position is a number of SECONDS from the start (the model converts '1h20m' → 4800). Coerce
+    defensively (str/float/None) to a non-negative int; None if absent/unparseable. A value past
+    `_MAX_SANE_POS_SECS` is treated as milliseconds and folded down to seconds (model unit-slip guard)."""
     if position is None or position == "":
         return None
     try:
-        return max(0, int(float(position)))
+        secs = max(0, int(float(position)))
     except (TypeError, ValueError):
         return None
+    while secs > _MAX_SANE_POS_SECS:        # ms (or worse) slipped in for seconds → fold to seconds
+        secs //= 1000
+    return secs
 
 
 def _fmt_hms(secs: int) -> str:
