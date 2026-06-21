@@ -172,6 +172,19 @@ class GabAgentConfig(BaseSettings):
     # escalate to Claude); a non-empty voice_model pins that single model.
     voice_model: str = ""
     voice_port: int = 8765
+    # Bind address for the voice-brain HTTP+SSE server. Default 127.0.0.1 = loopback-only (the brain and
+    # the voice front-end share a host, the historical assumption). For a remote satellite (a thin voice
+    # box on the LAN talking to this brain — Pi Topology B), bind a SPECIFIC host IP (e.g. the EM LAN
+    # address "192.168.1.155"), NOT 0.0.0.0 — a specific bind narrows the exposed surface to one interface.
+    # Pair a non-loopback bind with `voice_auth_token` (a LAN-reachable /respond is a remote command surface).
+    # CLI --voice-host overrides this. Env: GABAI_VOICE_HOST.
+    voice_host: str = "127.0.0.1"
+    # Optional shared-secret bearer token for the voice-brain endpoints. Empty (default) = no auth, correct
+    # for a loopback bind. When set, every endpoint except /health requires `Authorization: Bearer <token>`
+    # (constant-time compared); a missing/wrong token gets 401. REQUIRED in practice whenever `voice_host`
+    # is non-loopback, so a LAN-exposed /respond can't be driven by anything but the paired satellite (which
+    # carries the same token in its .env). Env: GABAI_VOICE_AUTH_TOKEN.
+    voice_auth_token: str = ""
     voice_safe_zones: list[str] = Field(default_factory=list)
     voice_passphrase: str = ""
     voice_persona: str = ""

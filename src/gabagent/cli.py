@@ -129,6 +129,7 @@ def main(
     cwd: Path = typer.Option(Path.cwd(), "--cwd", hidden=True, help="Working directory"),
     voice_serve: bool = typer.Option(False, "--voice-serve", help="Run as a voice brain (HTTP+SSE server)"),
     port: int = typer.Option(0, "--port", help="Voice server port (default: config voice_port)"),
+    voice_host: str = typer.Option("", "--voice-host", help="Voice server bind address (default: config voice_host, 127.0.0.1). Set a LAN IP for a remote satellite; pair with GABAI_VOICE_AUTH_TOKEN."),
     set_claude_key: str = typer.Option("", "--set-claude-key", help="Save an Anthropic key, switch to the Claude backend, and exit"),
     version: bool = typer.Option(False, "--version", "-v", help="Show version"),
 ) -> None:
@@ -175,7 +176,7 @@ def main(
     ctx.force_model = bool(model)
 
     if voice_serve:
-        _start_voice(ctx, model=model, port=port)
+        _start_voice(ctx, model=model, port=port, host=voice_host)
         raise typer.Exit()
 
     if not headless:
@@ -322,7 +323,7 @@ async def _run(ctx, prompt: str | None) -> None:
             stop_brain(ctx)
 
 
-def _start_voice(ctx, model: str, port: int) -> None:
+def _start_voice(ctx, model: str, port: int, host: str = "") -> None:
     from gabagent.config.paths import data_dir
     from gabagent.permissions.voice_approve import voice_approve
 
@@ -344,7 +345,14 @@ def _start_voice(ctx, model: str, port: int) -> None:
         ctx.force_model = False
 
     bind_port = port or ctx.config.voice_port
-    typer.echo(f"Voice brain listening on http://127.0.0.1:{bind_port}  (Ctrl-C to stop)")
+    bind_host = host or ctx.config.voice_host or "127.0.0.1"
+    if bind_host != "127.0.0.1" and not (ctx.config.voice_auth_token or "").strip():
+        typer.echo(
+            f"WARNING: binding the voice brain to {bind_host} (non-loopback) with NO auth token — "
+            "set GABAI_VOICE_AUTH_TOKEN so the LAN-reachable endpoints require a bearer token.",
+            err=True,
+        )
+    typer.echo(f"Voice brain listening on http://{bind_host}:{bind_port}  (Ctrl-C to stop)")
 
     import signal
     try:
@@ -360,7 +368,7 @@ def _start_voice(ctx, model: str, port: int) -> None:
         pass
 
     try:
-        asyncio.run(_run_voice(ctx, host="127.0.0.1", port=bind_port))
+        asyncio.run(_run_voice(ctx, host=bind_host, port=bind_port))
     except KeyboardInterrupt:
         pass
 

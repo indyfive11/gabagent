@@ -249,3 +249,54 @@ async def test_media_state_bot_speaking_refreshes_duck_watchdog(tmp_path):
         st["last_duck_refresh_mono"] = 1.0
         await client.get("/media/state", params={"bot_speaking": "false"})
         assert st["last_duck_refresh_mono"] == 1.0
+
+
+async def test_no_auth_token_leaves_endpoints_open(tmp_path):
+    # Default (loopback, empty token) => no guard installed, every endpoint reachable with no header.
+    ctx = make_ctx(tmp_path, [])
+    assert ctx.config.voice_auth_token == ""
+    app = build_app(ctx)
+    async with _client(app) as client:
+        assert (await client.get("/health")).status_code == 200
+        assert (await client.get("/media/state")).status_code == 200
+
+
+async def test_bearer_token_required_when_configured(tmp_path):
+    # A configured token guards every endpoint except /health: missing/wrong => 401, correct => through.
+    ctx = make_ctx(tmp_path, [])
+    ctx.config.voice_auth_token = "s3cret"
+    app = build_app(ctx)
+    async with _client(app) as client:
+        # /health stays an open liveness probe.
+        assert (await client.get("/health")).status_code == 200
+        # No Authorization header => 401.
+        r = await client.get("/media/state")
+        assert r.status_code == 401 and r.json() == {"error": "unauthorized"}
+        # Wrong token => 401.
+        assert (await client.get(
+            "/media/state", headers={"Authorization": "Bearer wrong"})).status_code == 401
+        # A bare token without the Bearer scheme => 401.
+        assert (await client.get(
+            "/media/state", headers={"Authorization": "s3cret"})).status_code == 401
+        # Correct bearer => through to the handler.
+        assert (await client.get(
+            "/media/state", headers={"Authorization": "Bearer s3cret"})).status_code == 200
+
+
+async def test_bearer_token_guards_respond_post(tmp_path):
+    # The guard covers the mutating POST endpoints too, not just the GET probes.
+    ctx = make_ctx(tmp_path, [["Done."]])
+    ctx.config.voice_auth_token = "tok"
+    app = build_app(ctx)
+    async with _client(app) as client:
+        r = await client.post("/respond", json={"session_id": "s", "text": "hi"})
+        assert r.status_code == 401
+        # With the bearer the turn streams (drains to a done event).
+        async with client.stream(
+            "POST", "/respond",
+            headers={"Authorization": "Bearer tok"},
+            json={"session_id": "s", "text": "hi"},
+        ) as resp:
+            assert resp.status_code == 200
+            events = await _drain(resp)
+        assert any(e["type"] == "done" for e in events)

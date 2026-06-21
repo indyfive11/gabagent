@@ -1,6 +1,10 @@
-"""Loopback HTTP+SSE brain-protocol server for voice mode.
+"""HTTP+SSE brain-protocol server for voice mode.
 
-Endpoints (bind 127.0.0.1 only):
+Binds 127.0.0.1 by default (brain + voice front-end share a host). Can bind a specific LAN IP
+(`voice_host` / --voice-host) to serve a remote thin satellite; pair that with `voice_auth_token`
+so the LAN-exposed endpoints require a shared-secret bearer token (see `_BearerAuth`).
+
+Endpoints:
   GET  /health   -> {"status":"ok","mode":"voice"}
   POST /respond  -> starts a turn; SSE streams VoiceEvents until confirm/done
   POST /confirm  -> resolves a paused confirm; SSE streams the continuation
@@ -22,6 +26,35 @@ _SSE_HEADERS = {
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
 }
+
+
+class _BearerAuth:
+    """Pure-ASGI bearer-token guard for a non-loopback (LAN) brain bind.
+
+    When a token is configured every endpoint EXCEPT /health requires `Authorization: Bearer <token>`
+    (constant-time compared); anything else gets 401. /health stays open as an unauthenticated liveness
+    probe (it leaks nothing). Pure ASGI — not BaseHTTPMiddleware — so it only inspects request headers
+    and never wraps the response body: the SSE streams (`/respond`, `/confirm`) pass through untouched.
+    No token (the default, loopback) => this is never installed and the server is fully open, as before.
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.token = token
+        self._expected = f"Bearer {token}"
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("path") == "/health":
+            await self.app(scope, receive, send)
+            return
+        import hmac
+        headers = dict(scope.get("headers") or ())
+        presented = headers.get(b"authorization", b"").decode("latin-1")
+        if presented and hmac.compare_digest(presented, self._expected):
+            await self.app(scope, receive, send)
+            return
+        from starlette.responses import JSONResponse
+        await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
 
 
 def build_app(ctx: AgentContext):
@@ -139,6 +172,15 @@ def build_app(ctx: AgentContext):
             note_duck_activity(ctx)
         return JSONResponse(await _media_state(ctx))
 
+    # A shared-secret bearer guard only when a token is configured (i.e. a LAN bind). Loopback default
+    # leaves it off → zero behavior change. Added via Starlette's middleware= so build_app still returns
+    # the Starlette instance (tests drive app.state.sessions directly).
+    middleware = []
+    token = (getattr(ctx.config, "voice_auth_token", "") or "").strip()
+    if token:
+        from starlette.middleware import Middleware
+        middleware.append(Middleware(_BearerAuth, token=token))
+
     app = Starlette(routes=[
         Route("/health", health, methods=["GET"]),
         Route("/respond", respond, methods=["POST"]),
@@ -146,7 +188,7 @@ def build_app(ctx: AgentContext):
         Route("/cancel", cancel, methods=["POST"]),
         Route("/media/duck", media_duck, methods=["POST"]),
         Route("/media/state", media_state, methods=["GET"]),
-    ])
+    ], middleware=middleware)
     app.state.sessions = sessions
     return app
 
