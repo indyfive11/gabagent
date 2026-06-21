@@ -85,7 +85,7 @@ async def test_aside_emits_addressed_false_then_done(home, monkeypatch):
     """A suppressed aside emits a standalone `addressed:false` event (the A1 movie-duck-release signal
     the voice client acts on) immediately before `done`, with no reply token and no history append."""
     import gabagent.voice.addressed as addr
-    async def _aside(ctx, text):
+    async def _aside(ctx, text, wake=None):
         return False, "llm:aside"
     monkeypatch.setattr(addr, "is_addressed", _aside)
     proj = home / "proj"; proj.mkdir()
@@ -376,6 +376,20 @@ def test_addendum_has_shutdown_and_sleep_honesty():
     assert "don't invent reasons for being slow" in a
 
 
+def test_addendum_drops_greeting_welded_to_a_command():
+    # Item C compound case: STT welds a phantom "how are you?" in front of a real command
+    # ("Hey, how are you? Play my retro favorites") — the model must skip the social reply and
+    # just do the request, NOT prepend "I'm doing well". (Pairs with the acoustic wake-signal,
+    # which can only suppress a WHOLE turn and so can't strip a greeting off a command turn.)
+    from gabagent.voice.turn import VOICE_ADDENDUM
+    a = VOICE_ADDENDUM.lower()
+    # A greeting fused in front of a command/question is treated as a mis-hear, not answered.
+    assert "skip the social reply" in a
+    assert "mis-hear" in a
+    # The single-rule carve-out: only answer "how are you" when it's the whole utterance.
+    assert "whole utterance with nothing to act on" in a
+
+
 class _EscTextThenFail:
     """Escalated model emits a token then dies (inference_failed) — the in-loop guard won't replay
     after speech, so the error reaches the OUTER handler with the model still escalated. arya's
@@ -440,7 +454,7 @@ async def test_media_command_emits_keepalive_before_done(home, monkeypatch):
         return [ToolResult(output="Paused.") for _ in tool_calls]
     monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
     import gabagent.voice.addressed as _addr
-    async def _yes(ctx, text):
+    async def _yes(ctx, text, wake=None):
         return True, "fast"
     monkeypatch.setattr(_addr, "is_addressed", _yes)
     ctx = _media_ctx(home, [
@@ -464,7 +478,7 @@ async def test_non_media_command_emits_no_keepalive(home, monkeypatch):
         return [ToolResult(output="ok") for _ in tool_calls]
     monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
     import gabagent.voice.addressed as _addr
-    async def _yes(ctx, text):
+    async def _yes(ctx, text, wake=None):
         return True, "fast"
     monkeypatch.setattr(_addr, "is_addressed", _yes)
     ctx = _media_ctx(home, [
@@ -483,7 +497,7 @@ async def test_keepalive_disabled_when_secs_zero(home, monkeypatch):
         return [ToolResult(output="Playing.") for _ in tool_calls]
     monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
     import gabagent.voice.addressed as _addr
-    async def _yes(ctx, text):
+    async def _yes(ctx, text, wake=None):
         return True, "fast"
     monkeypatch.setattr(_addr, "is_addressed", _yes)
     ctx = _media_ctx(home, [
@@ -523,7 +537,7 @@ async def test_terminal_qa_emits_convo_hold_before_done(home, monkeypatch):
     """A terminal one-shot reply (no tools, not a question) emits exactly one `convo_hold` right before
     `done`, so the voice side can drop the bed-duck early instead of holding the full window."""
     import gabagent.voice.addressed as _addr
-    async def _yes(ctx, text):
+    async def _yes(ctx, text, wake=None):
         return True, "fast"
     monkeypatch.setattr(_addr, "is_addressed", _yes)
     ctx = make_ctx(home, [["It's three o'clock."]])
@@ -539,7 +553,7 @@ async def test_terminal_qa_emits_convo_hold_before_done(home, monkeypatch):
 async def test_question_reply_does_not_emit_convo_hold(home, monkeypatch):
     """A reply that ends in a question is NOT terminal — keep the hold open for the user's answer."""
     import gabagent.voice.addressed as _addr
-    async def _yes(ctx, text):
+    async def _yes(ctx, text, wake=None):
         return True, "fast"
     monkeypatch.setattr(_addr, "is_addressed", _yes)
     ctx = make_ctx(home, [["Which playlist did you mean?"]])
@@ -558,7 +572,7 @@ async def test_terminal_media_turn_emits_both_keepalive_and_convo_hold(home, mon
         return [ToolResult(output="Paused.") for _ in tool_calls]
     monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
     import gabagent.voice.addressed as _addr
-    async def _yes(ctx, text):
+    async def _yes(ctx, text, wake=None):
         return True, "fast"
     monkeypatch.setattr(_addr, "is_addressed", _yes)
     ctx = _media_ctx(home, [
@@ -579,7 +593,7 @@ async def test_media_turn_ending_in_question_keeps_the_hold(home, monkeypatch):
         return [ToolResult(output="more than one match") for _ in tool_calls]
     monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
     import gabagent.voice.addressed as _addr
-    async def _yes(ctx, text):
+    async def _yes(ctx, text, wake=None):
         return True, "fast"
     monkeypatch.setattr(_addr, "is_addressed", _yes)
     ctx = _media_ctx(home, [
@@ -594,7 +608,7 @@ async def test_media_turn_ending_in_question_keeps_the_hold(home, monkeypatch):
 async def test_convo_hold_disabled_by_flag(home, monkeypatch):
     """voice_convo_hold_release=False suppresses the hint entirely (degrades to the voice-side timer)."""
     import gabagent.voice.addressed as _addr
-    async def _yes(ctx, text):
+    async def _yes(ctx, text, wake=None):
         return True, "fast"
     monkeypatch.setattr(_addr, "is_addressed", _yes)
     ctx = make_ctx(home, [["It's three o'clock."]], voice_convo_hold_release=False)
@@ -614,7 +628,7 @@ async def test_voice_set_volume_emits_voice_volume_before_done(home, monkeypatch
         return [await vc.set_volume(ctx, op="down") for _ in tool_calls]
     monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
     import gabagent.voice.addressed as _addr
-    async def _yes(ctx, text):
+    async def _yes(ctx, text, wake=None):
         return True, "fast"
     monkeypatch.setattr(_addr, "is_addressed", _yes)
     ctx = _media_ctx(home, [
@@ -638,7 +652,7 @@ async def test_voice_volume_kill_switch_suppresses_event(home, monkeypatch):
         return [await vc.set_volume(ctx, op="up") for _ in tool_calls]
     monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
     import gabagent.voice.addressed as _addr
-    async def _yes(ctx, text):
+    async def _yes(ctx, text, wake=None):
         return True, "fast"
     monkeypatch.setattr(_addr, "is_addressed", _yes)
     ctx = _media_ctx(home, [

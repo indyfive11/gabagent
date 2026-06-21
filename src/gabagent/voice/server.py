@@ -59,6 +59,13 @@ def build_app(ctx: AgentContext):
         body = await request.json()
         sid = body.get("session_id", "default")
         text = body.get("text", "")
+        # Item C: optional out-of-band acoustic wake signal (voice side attaches it only on a fresh
+        # acoustic wake-open where its own text wake-strip failed). A dict {bare_wake_likelihood,
+        # confidence, post_wake_voiced_ms, speech_dur_ms}; absent => exact current behavior. Only a dict
+        # is honored (a stray non-object can't perturb the turn).
+        wake = body.get("wake")
+        if not isinstance(wake, dict):
+            wake = None
         vs = get_session(sid)
         ctx.voice_session = vs
         # Marks that the brain RECEIVED an utterance — fires even on a 409 busy (no turn_start follows
@@ -74,7 +81,7 @@ def build_app(ctx: AgentContext):
             return JSONResponse(
                 {"error": "a turn is already in progress for this session"}, status_code=409
             )
-        start_turn(ctx, vs, text)
+        start_turn(ctx, vs, text, wake=wake)
         return _sse(drain(vs))
 
     async def confirm(request):

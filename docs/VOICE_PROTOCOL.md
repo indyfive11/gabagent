@@ -15,7 +15,7 @@ sends transcribed user utterances, and renders the streamed response as speech.
 | Method | Path | Body | Response |
 |--------|------|------|----------|
 | GET  | `/health` | — | `{"status":"ok","mode":"voice"}` |
-| POST | `/respond` | `{session_id, text}` | **SSE** stream of events (below). `409` if a turn is already in progress for the session. |
+| POST | `/respond` | `{session_id, text, wake?}` | **SSE** stream of events (below). `409` if a turn is already in progress for the session. |
 | POST | `/confirm` | `{session_id, id, approved, passphrase?}` | **SSE** continuation stream. `404` unknown session, `409` nothing awaiting confirmation / no match. |
 | POST | `/cancel` | `{session_id}` | `{"ok":true}` — aborts the in-flight turn (barge-in). |
 | POST | `/media/duck` | `{session_id, on, mute?}` | `{"ok":true,"ducked":[…]}` — quiet/restore local media while the user speaks (`ducked` is opaque, brain-internal). |
@@ -25,6 +25,16 @@ sends transcribed user utterances, and renders the streamed response as speech.
 playing: it lets the brain keep its duck-watchdog from auto-restoring the bed mid-reply (a long spoken answer
 has no incoming user speech to keep the duck alive). Omit it or send `false` otherwise. Optional — a brain that
 ignores it still works.
+
+`/respond`'s optional **`wake`** object carries an out-of-band acoustic wake signal, for the case where a bare
+wake ("Hey Aria") is fluently mis-transcribed into a question ("Hey, how are you?") — text alone can't tell that
+apart from a genuine query, but the audio can. The front-end attaches it only on a *fresh* acoustic wake-open
+whose own text wake-strip found no wake word:
+`{ "bare_wake_likelihood": 0.9, "confidence": 0.97, "post_wake_voiced_ms": 120, "speech_dur_ms": 700 }`. Only
+`bare_wake_likelihood` (the front-end's fused 0..1 confidence that the utterance is *nothing but* the wake) is
+load-bearing; the rest are raw features for threshold-tuning. When it clears the brain's threshold, the brain
+treats a content-free greeting as wake-only and stays silent. Optional and back-compat — absent `wake` is exact
+normal behavior, and the signal can never by itself suppress a real command.
 
 ## SSE events
 

@@ -127,6 +127,35 @@ async def test_respond_streams_tokens(tmp_path, monkeypatch):
     assert dest.read_text() == "hello"
 
 
+@pytest.mark.parametrize("body_wake,expected", [
+    ({"bare_wake_likelihood": 0.9, "confidence": 0.97}, {"bare_wake_likelihood": 0.9, "confidence": 0.97}),
+    ("not-a-dict", None),     # item C: a stray non-object is dropped, never perturbs the turn
+    (None, None),             # absent => no signal
+])
+async def test_respond_threads_wake_signal_to_start_turn(tmp_path, monkeypatch, body_wake, expected):
+    # /respond parses the optional out-of-band `wake` object and threads it (dict-only) into start_turn.
+    import gabagent.voice.turn as turnmod
+    real = turnmod.start_turn
+    captured = {}
+
+    def spy(ctx, vs, text, wake=None):
+        captured["wake"] = wake
+        return real(ctx, vs, text, wake=wake)
+
+    monkeypatch.setattr(turnmod, "start_turn", spy)  # lazy-imported in build_app → picks up the spy
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    app = build_app(make_ctx(proj, [["Done."]]))
+    payload = {"session_id": "s1", "text": "how are you"}
+    if body_wake is not None:
+        payload["wake"] = body_wake
+    async with _client(app) as client:
+        async with client.stream("POST", "/respond", json=payload) as resp:
+            await _drain(resp)
+    assert captured["wake"] == expected
+
+
 async def test_respond_confirm_returns_continuation(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     proj = tmp_path / "proj"

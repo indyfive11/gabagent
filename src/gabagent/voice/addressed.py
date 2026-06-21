@@ -112,6 +112,41 @@ def _has_aside_self_label(t: str) -> bool:
     assistant he's just dictating / it needn't respond. Blocks the heuristic fast-pass; the LLM decides."""
     return any(p in t for p in _ASIDE_SELF_LABELS)
 
+
+def _wake_only_likely(wake: object, threshold: float) -> bool:
+    """Item C: True when the voice side's out-of-band signal says this utterance is very likely NOTHING
+    but the wake word. `wake` is the dict the front-end attaches on /respond — only its (fused, voice-side,
+    duration-dominant) `bare_wake_likelihood` drives the decision; the raw features (confidence,
+    speech_dur_ms, …) ride along for receipt-tuning only. Defensive: a missing/non-numeric likelihood
+    reads as 0.0 (no suppression), so a malformed signal can never trip the guard."""
+    if not isinstance(wake, dict):
+        return False
+    try:
+        likelihood = float(wake.get("bare_wake_likelihood"))
+    except (TypeError, ValueError):
+        return False
+    return likelihood >= threshold
+
+
+# Item C — wake-context hint, prepended to _ADDRESSED_PROMPT ONLY when the acoustic signal says this turn
+# is very likely a bare wake. Text alone can't tell a fluently mis-transcribed "Hey Aria" ("how are you?")
+# from a genuine pleasantry — the duration-dominant `bare_wake_likelihood` already gated us here; the model
+# just confirms the text is content-free. NEVER suppresses on its own: a genuine request still returns
+# [ADDRESSED], so a wrong signal costs one cheap classify, never a dropped command.
+_WAKE_CONTEXT_HINT = """\
+CONTEXT: The voice front-end's wake detector fired for this turn and signals the audio was very likely
+JUST the wake word, with little or no speech following — i.e. a bare wake ("Hey Aria") that speech-to-text
+may have fluently mis-transcribed into a longer phrase. On these short wake clips the transcriber frequently
+garbles or drops the words, so the text below may be a content-free greeting ("how are you", "good morning"),
+a fragment, or even unrelated words — none of which is a real request.
+
+The audio is the reliable evidence here, so DEFAULT to [ASIDE] (wake-only — she listens, she does not greet
+back) UNLESS the text clearly carries an actionable request, a question to act on, or a command (e.g. "stop",
+"play jazz", "what's the weather"). This OVERRIDES the usual "when unsure, answer" default: under a fired
+wake, unsure means wake-only. Only a clear, genuine request earns [ADDRESSED].
+
+"""
+
 _ADDRESSED_PROMPT = """\
 You decide whether the user is speaking TO a voice assistant named Aria, or NOT.
 Aria's wake-word window is open, so speech NOT meant for her can leak in.
@@ -197,17 +232,31 @@ def _fast_verdict(text: str) -> bool | None:
     return None
 
 
-async def is_addressed(ctx: AgentContext, user_text: str) -> tuple[bool, str]:
+async def is_addressed(ctx: AgentContext, user_text: str, wake: dict | None = None) -> tuple[bool, str]:
     """Decide whether `user_text` is directed at the assistant. Returns (addressed, via) where `via`
-    is one of 'fast' | 'llm:addressed' | 'llm:aside' | 'error'. Never raises; fails open (addressed)
-    so a classifier hiccup can never drop a command."""
+    is one of 'wake_only' | 'fast' | 'llm:addressed' | 'llm:aside' | 'llm:wake_only' | 'error'. Never
+    raises; fails open (addressed) so a classifier hiccup can never drop a command. `wake` is the optional
+    out-of-band acoustic wake signal (item C); absent => exact current behavior."""
     # Decisive wake-only: a bare greeting / being named with no command never gets a spoken reply
     # (listen-first). Narrow by construction — every token must be ignorable — so it can't eat a command.
     if _is_bare_wake(user_text):
         return False, "wake_only"
-    fast = _fast_verdict(user_text)
-    if fast:
-        return True, "fast"
+    # Item C: when the voice side's acoustic signal says this turn is very likely a bare wake (a "Hey Aria"
+    # the STT fluently rewrote into a question), DON'T trust the text fast-pass — "how are you" would
+    # otherwise fast-pass on the question word "how". Demote to the LLM classify with a wake-context hint.
+    # This NEVER suppresses on its own (a real command still classifies ADDRESSED below); the worst a wrong
+    # signal does is cost one cheap classify on a genuine command the LLM still answers.
+    wake_suspect = (
+        getattr(ctx.config, "voice_wake_confidence_filter", True)
+        and _wake_only_likely(wake, getattr(ctx.config, "voice_bare_wake_threshold", 0.8))
+    )
+    if wake_suspect:
+        from gabagent.voice.debuglog import dlog
+        dlog(ctx, "wake_signal", suspect=True, wake=wake)
+    if not wake_suspect:
+        fast = _fast_verdict(user_text)
+        if fast:
+            return True, "fast"
     try:
         from gabagent.agent.loop import _active_client
         # Backend-appropriate cheap model. On the Claude backend the simple model is the ladder's bottom
@@ -216,10 +265,14 @@ async def is_addressed(ctx: AgentContext, user_text: str) -> tuple[bool, str]:
         # 28 asides leaked because every deferred classify errored). Mirrors turn.py's `simple` pick.
         is_claude = ctx.config.provider == "claude"
         model = ctx.config.claude.ladder[0].model if is_claude else ctx.config.router.simple_model
-        messages = [ChatMessage(role="user", content=_ADDRESSED_PROMPT.format(text=user_text.strip()))]
+        prompt = _ADDRESSED_PROMPT.format(text=user_text.strip())
+        if wake_suspect:
+            prompt = _WAKE_CONTEXT_HINT + prompt
+        messages = [ChatMessage(role="user", content=prompt)]
         tag = await _active_client(ctx).complete_simple(messages, model=model)
         if "[ASIDE]" in tag.upper() and "[ADDRESSED]" not in tag.upper():
-            return False, "llm:aside"
+            # Mark a wake-signal-assisted suppression distinctly from an ordinary aside, for receipt tuning.
+            return False, "llm:wake_only" if wake_suspect else "llm:aside"
         return True, "llm:addressed"
     except Exception as exc:
         # Fail OPEN (never eat a command) but surface WHY in `via` — a bare "error" hid the model-mismatch

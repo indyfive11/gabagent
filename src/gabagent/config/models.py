@@ -223,6 +223,22 @@ class GabAgentConfig(BaseSettings):
     # False disables the emit (the command still speaks its confirm but no event crosses). Kill-switch.
     # Env: GABAI_VOICE_VOLUME_CONTROL.
     voice_volume_control: bool = True
+    # Item C — STT wake-expansion guard. A bare wake ("Hey Aria", ~0.7s) can be fluently mis-transcribed
+    # into a question ("Hey, how are you?"), defeating the text-only listen-first guard (no wake token
+    # survives the rewrite; "how" even fast-passes as a question word). The voice side carries the
+    # acoustic fact out of band on /respond: a nested `wake` object whose `bare_wake_likelihood` (fused
+    # voice-side, duration-dominant — duration being evidence the brain can't see) says how likely the
+    # utterance is NOTHING but the wake. When it's >= the threshold, is_addressed suppresses the
+    # zero-latency fast-pass and routes to the one-shot LLM classify with a wake-context hint, so a
+    # content-free pleasantry resolves to wake-only/silence. The signal can NEVER directly suppress a turn
+    # (it only ever demotes a fast-pass to the careful classify), so a wrong likelihood costs at most one
+    # cheap classify on a real command the LLM still answers — the addressed.py "never eat a command"
+    # invariant holds. Absent `wake` => exact current behavior (arrival-keyed, safe ahead of the producer).
+    # False disables the whole consumer. Env: GABAI_VOICE_WAKE_CONFIDENCE_FILTER.
+    voice_wake_confidence_filter: bool = True
+    # Suppression floor for `bare_wake_likelihood` (0..1). Co-tuned against dlog receipts in a joint drive;
+    # the voice-side scale is monotonic so this stays meaningful. Env: GABAI_VOICE_BARE_WAKE_THRESHOLD.
+    voice_bare_wake_threshold: float = 0.8
     # The sink-input % a freshly-played Jellyfin movie should start at. 100 = neutral (no per-stream
     # attenuation; the device/player volume governs actual loudness) — NOT "loud". This un-strands the
     # movie-starts-quiet bug: PipeWire's stream-restore replays the PRIOR movie's ducked/low level (e.g. 18%,

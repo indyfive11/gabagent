@@ -2,7 +2,7 @@ import types
 import pytest
 
 from gabagent.config.models import GabAgentConfig
-from gabagent.voice.addressed import _fast_verdict, is_addressed
+from gabagent.voice.addressed import _fast_verdict, _wake_only_likely, is_addressed
 
 
 # ---- _fast_verdict: heuristic short-circuit (True = obviously addressed, None = defer to model) ----
@@ -233,6 +233,74 @@ async def test_is_addressed_bare_affirmation_is_not_wake_suppressed():
     # silently eaten by this guard; it defers to the LLM instead.
     _, via = await is_addressed(_ctx("[ADDRESSED]"), "yes")
     assert via != "wake_only"
+
+
+# ---- item C: out-of-band acoustic wake signal (STT wake-expansion: "Hey Aria" → "how are you?") ----
+
+_HI_WAKE = {"bare_wake_likelihood": 0.9, "confidence": 0.97, "post_wake_voiced_ms": 120, "speech_dur_ms": 700}
+_LO_WAKE = {"bare_wake_likelihood": 0.3, "confidence": 0.97, "post_wake_voiced_ms": 900, "speech_dur_ms": 1700}
+
+
+@pytest.mark.parametrize("wake,expected", [
+    (_HI_WAKE, True),
+    ({"bare_wake_likelihood": 0.8}, True),     # boundary: >= threshold
+    (_LO_WAKE, False),
+    ({"bare_wake_likelihood": None}, False),   # malformed → never suppresses
+    ({"confidence": 0.99}, False),             # likelihood missing → 0.0
+    ({"bare_wake_likelihood": "x"}, False),    # non-numeric → never suppresses
+    (None, False),
+    ("not-a-dict", False),
+])
+def test_wake_only_likely(wake, expected):
+    assert _wake_only_likely(wake, 0.8) is expected
+
+
+async def test_high_wake_signal_demotes_fastpass_and_suppresses_misheard_bare_wake():
+    # "how are you" would normally fast-pass on the question word "how". A high bare-wake signal demotes it
+    # to the LLM classify (with the wake-context hint), which asides it → wake-only/silent. THE item-C fix.
+    addressed, via = await is_addressed(_ctx("[ASIDE]"), "how are you", wake=_HI_WAKE)
+    assert addressed is False and via == "llm:wake_only"
+
+
+async def test_high_wake_signal_suppresses_garbled_fragment():
+    # The common case (VAC's STT eval): a high wake signal but the STT garbled the name into a fragment /
+    # unrelated words (not a tidy pleasantry). Under a fired wake the hint defaults non-actionable text to
+    # wake-only, so the classifier asides it → silence (not the base "unsure → answer" default).
+    addressed, via = await is_addressed(_ctx("[ASIDE]"), "the where of it", wake=_HI_WAKE)
+    assert addressed is False and via == "llm:wake_only"
+
+
+async def test_high_wake_signal_still_answers_a_real_command():
+    # Even with a (wrongly) high wake signal, a genuine command survives: the signal only demotes the
+    # fast-pass to the LLM, which returns ADDRESSED. The "never eat a command" invariant holds.
+    addressed, via = await is_addressed(_ctx("[ADDRESSED]"), "play some jazz", wake=_HI_WAKE)
+    assert addressed is True and via == "llm:addressed"
+
+
+async def test_low_wake_signal_leaves_fastpass_intact():
+    # Below threshold → behaves exactly as today: "how are you" fast-passes (raises=True proves no LLM call).
+    addressed, via = await is_addressed(_ctx("[ADDRESSED]", raises=True), "how are you", wake=_LO_WAKE)
+    assert addressed is True and via == "fast"
+
+
+async def test_wake_signal_killswitch_off_leaves_fastpass_intact():
+    # voice_wake_confidence_filter=False ignores the signal entirely → fast-pass survives (no LLM call).
+    ctx = _ctx("[ADDRESSED]", raises=True)
+    ctx.config.voice_wake_confidence_filter = False
+    addressed, via = await is_addressed(ctx, "how are you", wake=_HI_WAKE)
+    assert addressed is True and via == "fast"
+
+
+async def test_no_wake_signal_is_exact_current_behavior():
+    # Absent `wake` => arrival-keyed no-op: "how are you" fast-passes as today (safe ahead of the producer).
+    addressed, via = await is_addressed(_ctx("[ADDRESSED]", raises=True), "how are you")
+    assert addressed is True and via == "fast"
+
+
+async def test_high_wake_signal_does_not_override_decisive_bare_wake():
+    # A clean "hey aria" is still caught by the text-only _is_bare_wake first (no LLM), signal or not.
+    addressed, via = await is_addressed(_ctx("[ASIDE]", raises=True), "hey aria", wake=_HI_WAKE)
+    assert addressed is False and via == "wake_only"
 
 
 # ---- turn-level: a not-addressed utterance closes silently, never reaching the LLM ----

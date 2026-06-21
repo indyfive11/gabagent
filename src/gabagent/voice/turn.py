@@ -47,6 +47,12 @@ VOICE_ADDENDUM = (
     "else — do NOT open with how you're doing, what you're 'just' up to, or any volunteered status about "
     "yourself ('I'm doing well, …', 'just keeping track of your music, …'); that reads as ignoring the "
     "request. Share your own state ONLY when they actually ask how you are. "
+    "If a turn BOTH greets you or asks how you're doing AND also carries a command or a question to act on "
+    "(e.g. 'hey, how are you? play my retro favorites', 'good morning, what's the weather'), skip the social "
+    "reply entirely and just handle the request — a leading 'hi', 'how are you', or 'good morning' in front "
+    "of a real command is almost always a mis-hear, not a genuine question, so do NOT answer it or prepend "
+    "'I'm doing well'. Reply to 'how are you' only when that greeting is the WHOLE utterance with nothing to "
+    "act on. "
     "Don't narrate what you're about to do or your reasoning ('let me check…', 'I need to search "
     "for…', 'one moment while I…') — just do it and give the result in one short clause; this matters "
     "most while a movie or music is playing, where the user wants a quick 'Done.' not a play-by-play. "
@@ -453,7 +459,7 @@ def _is_terminal_reply(text: str) -> bool:
     return not t.rstrip("\"')]>*_` ").endswith("?")
 
 
-async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
+async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = None) -> None:
     """Drive one turn, emitting VoiceEvents into vs.queue. Suspends naturally at a
     confirm (inside voice_approve's await) and resumes when /confirm resolves it.
     Always terminates the event stream with a `done`."""
@@ -478,7 +484,7 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
         # (or false-wake) window. Conservative: answers when unsure, so it never eats a real command.
         if getattr(ctx.config, "voice_intent_filter", True):
             from gabagent.voice.addressed import is_addressed
-            addressed, via = await is_addressed(ctx, user_text)
+            addressed, via = await is_addressed(ctx, user_text, wake=wake)
             dlog(ctx, "addressed", match=addressed, via=via)
             if not addressed:
                 # A1 movie-duck release: tell the voice client this turn is an aside the instant the
@@ -845,15 +851,16 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str) -> None:
         dlog(ctx, "turn_done", dur_ms=int((time.monotonic() - _t0) * 1000))
 
 
-def start_turn(ctx: AgentContext, vs, user_text: str) -> "asyncio.Task":
-    """Begin a turn: fresh event queue + background task. Returns the task."""
+def start_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = None) -> "asyncio.Task":
+    """Begin a turn: fresh event queue + background task. Returns the task. `wake` is the optional
+    out-of-band acoustic wake signal (item C); None => no signal, current behavior."""
     vs.queue = asyncio.Queue()
 
     async def emit(ev: VoiceEvent) -> None:
         await vs.queue.put(ev)
 
     ctx.voice_emit = emit
-    vs.turn_task = asyncio.create_task(_run_turn(ctx, vs, user_text))
+    vs.turn_task = asyncio.create_task(_run_turn(ctx, vs, user_text, wake=wake))
     return vs.turn_task
 
 
