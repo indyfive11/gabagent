@@ -678,7 +678,8 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
 
             text_buf = ""
             tool_calls: list = []
-            stream = _active_client(ctx, ctx.active_backend).stream_complete(
+            _call_client = _active_client(ctx, ctx.active_backend)
+            stream = _call_client.stream_complete(
                 all_messages, tools or None, model=request_model, effort=request_effort,
                 retry_model=retry_model, fallback_model=fallback_model,
             )
@@ -759,6 +760,13 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
                         continue
                     raise
             await _emit_filtered(sfilter, sfilter.flush(), emit)
+
+            # Phase-0 latency localization: one line per model call with prefill-vs-generation timing and
+            # (if the endpoint reports it) prompt/cached tokens — tells whether the seconds are prefill,
+            # generation, or API queue, and whether the backend caches the prompt prefix. Best-effort.
+            _stats = getattr(_call_client, "last_call_stats", None)
+            if _stats is not None:
+                dlog(ctx, "gab_call", round=tool_rounds, backend=ctx.active_backend, **_stats)
 
             if text_buf:
                 ctx.session.append_message(

@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 import uuid as _uuid_mod
 from collections import defaultdict
 from typing import AsyncIterator
@@ -163,12 +164,36 @@ class GabAIClient:
         self.rate_limiter = rate_limiter
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.tools_supported: bool = True  # set False if model rejects tool schemas
+        self._usage_supported: bool = True  # set False if the endpoint rejects stream_options
+        # Per-call telemetry from the LAST stream_complete (latency localization, Phase-0 instrumentation).
+        # Single-user voice turns are sequential, so a single slot is safe; the voice layer reads it after
+        # draining each stream and dlogs a `gab_call` line. None until the first streamed call completes.
+        self.last_call_stats: dict | None = None
         # Ollama-only: per-request VRAM keep-alive (e.g. "1m"). Sent via extra_body so it
         # scopes to gabagent's requests without touching the global OLLAMA_KEEP_ALIVE default.
         self.keep_alive = keep_alive
 
     def _extra_body(self) -> dict | None:
         return {"keep_alive": self.keep_alive} if self.keep_alive else None
+
+    def _record_call_stats(self, active_model, used_model, t_send, ttft_ms, usage) -> None:
+        """Stash per-call telemetry for the voice layer to dlog. Pure best-effort — usage may be absent
+        (endpoint without include_usage), and cached_tokens may be absent even when usage is present."""
+        ptoks = ctoks = cached = None
+        if usage is not None:
+            ptoks = getattr(usage, "prompt_tokens", None)
+            ctoks = getattr(usage, "completion_tokens", None)
+            details = getattr(usage, "prompt_tokens_details", None)
+            if details is not None:
+                cached = getattr(details, "cached_tokens", None)
+        self.last_call_stats = {
+            "model": used_model or active_model,
+            "ptoks": ptoks,
+            "ctoks": ctoks,
+            "cached": cached,
+            "ttft_ms": ttft_ms,
+            "total_ms": int((time.monotonic() - t_send) * 1000),
+        }
 
     async def stream_complete(
         self,
@@ -182,6 +207,7 @@ class GabAIClient:
     ) -> AsyncIterator[str | list[ToolCallSpec]]:
         active_model = model or self.model
         self.rate_limiter.record(active_model)
+        self.last_call_stats = None  # cleared per call so a stale value is never read after a failure
 
         raw_messages = [m.to_dict() for m in messages]
 
@@ -271,6 +297,11 @@ class GabAIClient:
             "messages": raw_messages,
             "stream": True,
         }
+        # Ask the endpoint to emit a final usage chunk (prompt/cached/completion tokens) so we can localize
+        # latency (prefill vs generation) and tell whether the backend caches the prompt prefix. Best-effort:
+        # if the endpoint rejects stream_options it's dropped for the rest of this client's life (see except).
+        if self._usage_supported:
+            kwargs["stream_options"] = {"include_usage": True}
         if self.keep_alive:
             kwargs["extra_body"] = self._extra_body()
         if tools and self.tools_supported:
@@ -287,12 +318,22 @@ class GabAIClient:
             tc_ids: dict[int, str] = defaultdict(str)
             tc_args: dict[int, str] = defaultdict(str)
             yielded_any = False
+            # Phase-0 telemetry for this attempt: time-to-first-token and the final usage chunk.
+            _t_send = time.monotonic()
+            _ttft_ms: int | None = None
+            _usage = None
             try:
                 try:
                     stream_obj = await self._client.chat.completions.create(**kwargs)
                 except Exception as e:
+                    # If the endpoint rejects stream_options, drop it for good and retry (telemetry is
+                    # best-effort and must never break a turn). Checked first so it can't be masked.
+                    if "stream_options" in kwargs and "stream_options" in str(e).lower():
+                        self._usage_supported = False
+                        kwargs.pop("stream_options", None)
+                        stream_obj = await self._client.chat.completions.create(**kwargs)
                     # If the model rejects tool schemas, retry without them (same attempt).
-                    if tools and self.tools_supported and getattr(e, "status_code", None) == 400 and "does not support tools" in str(e):
+                    elif tools and self.tools_supported and getattr(e, "status_code", None) == 400 and "does not support tools" in str(e):
                         self.tools_supported = False
                         kwargs.pop("tools", None)
                         kwargs.pop("tool_choice", None)
@@ -313,16 +354,23 @@ class GabAIClient:
                         raise  # transient / other → handled by the outer except below
 
                 async for chunk in stream_obj:
+                    # The include_usage final chunk carries usage with empty choices — capture then skip it.
+                    if getattr(chunk, "usage", None) is not None:
+                        _usage = chunk.usage
                     choice = chunk.choices[0] if chunk.choices else None
                     if choice is None:
                         continue
                     delta = choice.delta
 
                     if delta.content:
+                        if _ttft_ms is None:
+                            _ttft_ms = int((time.monotonic() - _t_send) * 1000)
                         yield delta.content
                         yielded_any = True
 
                     if delta.tool_calls:
+                        if _ttft_ms is None:
+                            _ttft_ms = int((time.monotonic() - _t_send) * 1000)
                         for tc_delta in delta.tool_calls:
                             idx = tc_delta.index
                             if tc_delta.id:
@@ -347,6 +395,7 @@ class GabAIClient:
                         tc_names.clear()
                         tc_ids.clear()
                         tc_args.clear()
+                self._record_call_stats(active_model, kwargs.get("model"), _t_send, _ttft_ms, _usage)
                 return
             except Exception as e:
                 if (not yielded_any and attempt + 1 < _MAX_GEN_ATTEMPTS

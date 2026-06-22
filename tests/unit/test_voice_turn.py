@@ -192,6 +192,32 @@ async def test_first_token_latency_is_stamped_once(home, monkeypatch):
     assert "ms" in firsts[0][1] and isinstance(firsts[0][1]["ms"], int)
 
 
+async def test_gab_call_dlog_emits_per_model_call(home, monkeypatch):
+    # Phase-0 latency instrumentation: when the client exposes per-call stats (last_call_stats), the turn
+    # loop dlogs one `gab_call` per model call, carrying the prefill/generation timing + token fields.
+    import gabagent.voice.turn as turn_mod
+
+    class _StatsClient(FakeClient):
+        async def stream_complete(self, messages, tools=None, model=None, retry_model=None, **kw):
+            chunks = self.responses.pop(0)
+            for c in chunks:
+                yield c
+            self.last_call_stats = {"model": "arya", "ptoks": 1200, "ctoks": 30,
+                                    "cached": 0, "ttft_ms": 800, "total_ms": 1500}
+
+    seen = []
+    monkeypatch.setattr(turn_mod, "dlog", lambda ctx, event, **kw: seen.append((event, kw)))
+    proj = home / "proj"
+    proj.mkdir()
+    ctx = make_ctx(proj, [["A short reply."]])
+    ctx.client = _StatsClient([["A short reply."]])           # _active_client(gab) returns ctx.client
+    await run_turn(ctx, "say something")
+    calls = [kw for e, kw in seen if e == "gab_call"]
+    assert len(calls) == 1                                     # one per model call this single-round turn
+    assert calls[0]["ptoks"] == 1200 and calls[0]["ttft_ms"] == 800
+    assert calls[0]["cached"] == 0 and "round" in calls[0]
+
+
 async def test_cancel_ends_turn(home):
     proj = home / "proj"
     proj.mkdir()
