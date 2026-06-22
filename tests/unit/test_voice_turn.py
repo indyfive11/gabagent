@@ -359,6 +359,117 @@ async def test_command_loop_escalates_one_rung_then_recovers(home):
     assert "retro favorites" in spoken.lower()             # the higher rung broke the loop and answered
 
 
+# -- internet-outage failover to the local model ---------------------------------------------------
+
+import httpx
+
+
+class _OutageClient:
+    """Cloud client that's unreachable — every call raises a connectivity error (internet down)."""
+    def __init__(self, exc=None):
+        self.model = "arya"; self.calls = 0
+        self._exc = exc or httpx.ConnectError("Temporary failure in name resolution")
+    async def stream_complete(self, messages, tools=None, model=None, **kw):
+        self.calls += 1
+        raise self._exc
+        yield ""   # noqa: unreachable — makes this an async generator
+    async def complete_simple(self, messages, model=None, **kw):
+        raise self._exc
+
+
+def test_is_connectivity_error_distinguishes_outage_from_server_errors():
+    from gabagent.api.client import _is_connectivity_error as C
+    import openai
+    assert C(httpx.ConnectError("Connection refused")) is True
+    assert C(Exception("Temporary failure in name resolution")) is True
+    assert C(openai.APIConnectionError(request=httpx.Request("GET", "http://x"))) is True
+    # A server that ANSWERED (any HTTP status) means the internet is up → NOT a connectivity error.
+    assert C(RuntimeError("code: 402 insufficient credits")) is False
+    assert C(RuntimeError("code: 401 invalid api key")) is False
+    assert C(ValueError("unrelated bug")) is False
+
+
+async def test_outage_fails_over_to_local_and_answers(home, monkeypatch):
+    """A cloud connectivity failure auto-switches to the on-demand local model: speaks the offline notice,
+    answers on local, sets local_mode + offline_failover, and never surfaces an error."""
+    import gabagent.local.ollama as ol
+    async def _ok(ctx): return None
+    monkeypatch.setattr(ol, "ensure_ollama_running", _ok)        # don't actually start Ollama
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [], local_model="devstral:24b", voice_intent_filter=False)
+    ctx.client = _OutageClient()                                  # cloud is down
+    ctx.local_client = FakeClient([["Paris is the capital of France."]])
+    evs = await run_turn(ctx, "what's the capital of France")
+    spoken = "".join(e.text for e in evs if e.type == "token").lower()
+    assert "local brain" in spoken                               # the offline transition notice
+    assert "paris" in spoken                                     # answered, on the local model
+    assert ctx.local_mode and ctx.offline_failover               # latched into offline mode
+    assert not any(e.type == "error" for e in evs)               # no "say that again" error
+    assert ctx.client.calls == 1                                 # tried cloud once, then gave up on it
+
+
+async def test_billing_error_does_not_fail_over(home, monkeypatch):
+    """A 402/billing (server ANSWERED) is not a connectivity outage — it must NOT trigger offline
+    failover (that path is for a dead network only); it surfaces as before."""
+    import gabagent.local.ollama as ol
+    async def _ok(ctx): return None
+    monkeypatch.setattr(ol, "ensure_ollama_running", _ok)
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [], local_model="devstral:24b", voice_intent_filter=False)
+    ctx.client = _OutageClient(exc=RuntimeError("code: 402 insufficient credits"))
+    evs = await run_turn(ctx, "what's the capital of France")
+    spoken = "".join(e.text for e in evs if e.type == "token").lower()
+    assert not ctx.local_mode and not ctx.offline_failover       # stayed on cloud
+    assert "local brain" not in spoken                           # no offline failover
+
+
+async def test_offline_failover_kill_switch_disables_it(home, monkeypatch):
+    """voice_offline_failover=False (or no local_model) ⇒ a connectivity error surfaces as the normal
+    hiccup, no switch to local."""
+    import gabagent.local.ollama as ol
+    async def _ok(ctx): return None
+    monkeypatch.setattr(ol, "ensure_ollama_running", _ok)
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [], local_model="devstral:24b", voice_intent_filter=False,
+                   voice_offline_failover=False)
+    ctx.client = _OutageClient()
+    evs = await run_turn(ctx, "what's the capital of France")
+    assert not ctx.local_mode                                    # disabled → no failover
+    assert any(e.type == "error" for e in evs)
+
+
+async def test_recovery_probe_reverts_to_cloud_when_back(home, monkeypatch):
+    """While offline-failed-over, the per-turn probe checks the cloud at the top of the turn; when it's
+    reachable again, revert to the cloud router, say 'back online', and answer on the cloud model."""
+    import gabagent.voice.turn as turnmod
+    import gabagent.local.ollama as ol
+    async def _reachable(ctx): return True
+    async def _noop(ctx): return None
+    monkeypatch.setattr(turnmod, "_cloud_reachable", _reachable)  # cloud is back
+    monkeypatch.setattr(ol, "unload_local", _noop)               # don't hit a real Ollama to free VRAM
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [["Welcome back — 2 plus 2 is 4."]], voice_intent_filter=False,
+                   local_model="devstral:24b")
+    ctx.local_mode = True; ctx.offline_failover = True           # pretend a prior turn failed over
+    ctx.local_client = FakeClient([["should not be used"]])
+    evs = await run_turn(ctx, "what is two plus two")
+    spoken = "".join(e.text for e in evs if e.type == "token").lower()
+    assert "back online" in spoken                               # the recovery notice
+    assert "4" in spoken                                         # answered on the cloud model
+    assert not ctx.local_mode and not ctx.offline_failover       # reverted cleanly
+
+
+def test_offline_addendum_only_present_when_failed_over(home):
+    """The 'you are offline' system-prompt guidance appears only while offline_failover is set, so a
+    normal online turn is unchanged."""
+    from gabagent.voice.turn import _voice_system
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [])
+    assert "the internet is down" not in _voice_system(ctx).lower()
+    ctx.offline_failover = True
+    assert "the internet is down" in _voice_system(ctx).lower()
+
+
 # -- C: shutdown honesty lives in the prompt -------------------------------------------------------
 
 def test_addendum_has_shutdown_and_sleep_honesty():

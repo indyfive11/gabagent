@@ -252,6 +252,14 @@ class GabAgentConfig(BaseSettings):
     # Suppression floor for `bare_wake_likelihood` (0..1). Co-tuned against dlog receipts in a joint drive;
     # the voice-side scale is monotonic so this stays meaningful. Env: GABAI_VOICE_BARE_WAKE_THRESHOLD.
     voice_bare_wake_threshold: float = 0.8
+    # Internet-outage failover: when a voice turn's cloud LLM call fails with a CONNECTIVITY error (no
+    # network / DNS failure / connect timeout — NOT a 4xx/5xx, which means the server answered), auto-fail
+    # the turn over to the on-demand local model (`local_model`) so Aria still answers offline, and probe
+    # the cloud at the top of each subsequent turn to switch back when it returns. Requires `local_model`
+    # set (else there's nothing to fall to and this is a no-op). A spoken notice marks each transition.
+    # False disables the whole auto-failover (a manual "switch to local" still works). Env:
+    # GABAI_VOICE_OFFLINE_FAILOVER.
+    voice_offline_failover: bool = True
     # The sink-input % a freshly-played Jellyfin movie should start at. 100 = neutral (no per-stream
     # attenuation; the device/player volume governs actual loudness) — NOT "loud". This un-strands the
     # movie-starts-quiet bug: PipeWire's stream-restore replays the PRIOR movie's ducked/low level (e.g. 18%,

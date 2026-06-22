@@ -68,6 +68,37 @@ def _is_hard_backend_error(e: Exception) -> bool:
     ))
 
 
+def _is_connectivity_error(e: Exception) -> bool:
+    """A failure to REACH the backend at all — no internet, DNS failure, connection refused, or a
+    connect/read timeout. This is DISTINCT from an HTTP status error (any 4xx/5xx): a status response
+    means the request reached the server and it answered, so the internet is up and the problem is
+    auth/billing/rate-limit/server-side — NOT connectivity. Only a genuine can't-reach-the-network
+    failure should trigger offline failover to the local model.
+
+    openai wraps transport failures in APIConnectionError (and its APITimeoutError subclass); a wrapped
+    httpx error or a re-raised RuntimeError carrying the cause text is matched by name/message as a
+    backstop. APIStatusError is deliberately NOT matched (it carries an HTTP status → server reachable)."""
+    try:
+        import openai
+        if isinstance(e, openai.APIStatusError):
+            return False                      # got an HTTP status back → internet is up
+        if isinstance(e, openai.APIConnectionError):  # covers APITimeoutError (connect/read timeout)
+            return True
+    except Exception:
+        pass
+    name = type(e).__name__.lower()
+    if any(k in name for k in ("connecterror", "connecttimeout", "readtimeout", "pooltimeout",
+                               "apiconnectionerror", "apitimeouterror")):
+        return True
+    s = str(e).lower()
+    return any(k in s for k in (
+        "connection error", "connection refused", "failed to establish a new connection",
+        "name or service not known", "temporary failure in name resolution",
+        "nodename nor servname", "no route to host", "network is unreachable",
+        "[errno -3]", "[errno -2]", "getaddrinfo failed",
+    ))
+
+
 def _is_network_timeout(e: Exception) -> bool:
     """A transient network/connection timeout reaching the backend (httpx ConnectTimeout/ReadTimeout,
     openai APITimeoutError). Expected-and-handled — the graceful 'say that again' retry covers it, so

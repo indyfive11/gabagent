@@ -20,6 +20,7 @@ from typing import AsyncIterator, TYPE_CHECKING
 from gabagent.api.models import ChatMessage
 from gabagent.api.client import (
     _is_transient_generation_error, _is_hard_backend_error, _is_network_timeout,
+    _is_connectivity_error,
 )
 from gabagent.agent.loop import _execute_tool_calls, _active_client
 from gabagent.voice import events
@@ -136,6 +137,15 @@ def _voice_system(ctx: AgentContext) -> str:
         s += f"\n\nStyle: speak as a {persona}."
     if ctx.local_mode and ctx.local_context_summary:
         s += f"\n\n{ctx.local_context_summary}"
+    if getattr(ctx, "offline_failover", False):
+        # Offline failover: the internet is down and you're running on the local model. Tell it plainly so
+        # it answers from its own knowledge and doesn't reach for tools that need the network (web search,
+        # streaming music, anything fetching remote data) — those will fail until the connection is back.
+        s += ("\n\nYou are currently OFFLINE — the internet is down and you're running on a local model. "
+              "Answer from your own knowledge. Local device control (lights, windows, files, the local "
+              "media player, timers) still works, but anything needing the internet — web search, online "
+              "music/streaming, remote lookups — is unavailable right now, so don't attempt it; if asked, "
+              "say briefly that you're offline and can't do that until your connection is back.")
     return s
 
 
@@ -376,6 +386,26 @@ def _reassemble_floor(ctx: AgentContext):
     return None
 
 
+# Spoken on each internet-outage transition. Terse (protects the duck/short-reply work) and honest about
+# the capability loss so the user isn't surprised when web/streaming requests fail while offline.
+_OFFLINE_NOTICE = "I've lost my internet connection — switching to my local brain. I won't have web access until it's back."
+_BACK_ONLINE_NOTICE = "I'm back online."
+
+
+async def _cloud_reachable(ctx: AgentContext) -> bool:
+    """True if the cloud backend host answers AT ALL (any HTTP status ⇒ the internet is back). A
+    connect/DNS/timeout failure ⇒ still offline. Cheap, short-timeout, never raises — used by the
+    per-turn recovery probe to decide when to leave an offline failover."""
+    import httpx
+    url = ctx.config.base_url or "https://gab.ai/v1"
+    try:
+        async with httpx.AsyncClient() as c:
+            await c.get(url, timeout=2.0)
+        return True
+    except Exception:
+        return False
+
+
 async def _handle_meta(ctx: AgentContext, mc: commands.MetaCommand, emit) -> None:
     if mc.kind == "brain":
         if mc.value == "local":
@@ -475,6 +505,16 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
             await _handle_meta(ctx, mc, emit)
             return
         dlog(ctx, "meta", matched="none", routed="llm")
+
+        # Internet-outage recovery: if a prior turn auto-failed over to the local model, probe the cloud
+        # once at the top of THIS turn. Reachable again ⇒ revert to the cloud router and say so; still down
+        # ⇒ stay on local silently and answer this turn there. Per-turn (not a background task) so it can
+        # never race a turn's backend state. Only fires for an AUTO failover (offline_failover); a manual
+        # "switch to local" is left alone. Skips the ~2s probe entirely when we never failed over.
+        if ctx.offline_failover and await _cloud_reachable(ctx):
+            from gabagent.local.ollama import exit_offline_local
+            await exit_offline_local(ctx)
+            await emit(events.token(_BACK_ONLINE_NOTICE))
 
         # "Addressed-to-me?" filter: the wake window passes follow-on speech for multi-part commands,
         # so undirected speech (a curse, thinking aloud, commentary about the assistant) can land here
@@ -637,6 +677,30 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
                         elif isinstance(chunk, list):
                             tool_calls = [tc for tc in chunk if tc.name]
                 except Exception as e:
+                    # Internet-outage failover (checked FIRST): the cloud LLM is unreachable — no network /
+                    # DNS failure / connect timeout (NOT a 4xx/5xx, which means the server answered, so the
+                    # internet is up). Fail this turn — and subsequent turns until the cloud returns — over to
+                    # the on-demand local model, so Aria still answers offline instead of "say that again" on
+                    # every utterance. Only before any speech (else we'd replay), only with a local model set
+                    # and not already local. The recovery probe at the next turn's top reverts when cloud's back.
+                    if (not text_buf and not ctx.local_mode
+                            and getattr(ctx.config, "voice_offline_failover", True)
+                            and ctx.config.local_model and _is_connectivity_error(e)):
+                        from gabagent.local.ollama import enter_offline_local
+                        # Speak BEFORE the (possibly slow, cold ROCm) Ollama start so the user isn't left in
+                        # silence; sets the expectation that web access is gone until the connection returns.
+                        await emit(events.token(_OFFLINE_NOTICE))
+                        err = await enter_offline_local(ctx)
+                        if not err:
+                            ctx.voice_announced_model = ctx.config.local_model  # don't also announce a "switch"
+                            continue                                            # retry this turn on local
+                        # Local couldn't start either → honest combined line, then end the turn gracefully.
+                        dlog(ctx, "offline_failover", on=False, error=str(err)[:120])
+                        msg = " I can't reach my local brain either, so I'm stuck until the connection's back."
+                        await emit(events.token(msg))
+                        ctx.session.append_message(ChatMessage(role="assistant", content=_OFFLINE_NOTICE + msg))
+                        text_buf = _OFFLINE_NOTICE + msg
+                        break
                     # HARD backend failure (402 billing / auth / missing model) — NEVER silent. Announce
                     # ONCE, mark the backend degraded so the ladder skips it (the floor moves up), and
                     # recover the turn on the next working rung. Only before any speech (else we'd replay).

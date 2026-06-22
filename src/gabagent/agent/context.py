@@ -39,6 +39,10 @@ class AgentContext:
     local_process: Any = field(default=None)
     local_context_summary: str | None = None
     local_floor: bool = False  # local is the persisted warm bottom rung (mirrors config.local_floor)
+    # Set when an internet outage AUTO-failed this session over to the local model (distinct from a
+    # manual "switch to local", which leaves this False). Gates the per-turn cloud-recovery probe so
+    # only an auto-failover reverts to the cloud when the connection returns; a deliberate local pick stays.
+    offline_failover: bool = False
     # Lazily-built per-backend clients keyed "gab" | "claude" | "local", for the cross-backend
     # escalation ladder. `client`/`local_client` remain for back-compat and the exclusive local_mode.
     clients: dict[str, Any] = field(default_factory=dict)

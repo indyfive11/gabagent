@@ -57,6 +57,43 @@ async def ensure_ollama_running(ctx: AgentContext) -> str | None:
     return f"ollama did not respond within {_STARTUP_TIMEOUT}s — check /tmp/ollama.log"
 
 
+async def enter_offline_local(ctx: AgentContext) -> str | None:
+    """Fail over to the local model because the cloud is unreachable (internet outage).
+
+    Unlike the manual `switch_to_local`, this does NO cloud summary call (the cloud is down — that call
+    would just time out and stall the failover); the recent message window the local model already
+    receives carries the context. Starts Ollama on demand (Rob's choice: no warm floor), builds the local
+    client if needed, and routes the CURRENT turn onto local by setting active_backend="local". Sets
+    `offline_failover` so the per-turn recovery probe knows to revert when the connection returns.
+    Returns None on success, else an error string (Ollama wouldn't start)."""
+    if not ctx.config.local_model:
+        return "no local model is configured"
+    err = await ensure_ollama_running(ctx)
+    if err:
+        return err
+    if ctx.local_client is None:
+        ctx.local_client = _build_local_client(ctx, "1m")  # on-demand idle-unload, not a warm floor
+    ctx.clients["local"] = ctx.local_client
+    ctx.local_mode = True
+    ctx.offline_failover = True
+    # Route this turn (and the retry that follows the failover) straight to local.
+    ctx.active_model, ctx.active_effort, ctx.active_backend = ctx.config.local_model, None, "local"
+    from gabagent.voice.debuglog import dlog
+    dlog(ctx, "offline_failover", on=True, model=ctx.config.local_model)
+    return None
+
+
+async def exit_offline_local(ctx: AgentContext) -> None:
+    """Revert an offline failover once the cloud is reachable again: leave local mode, free the local
+    VRAM, and clear the per-turn routing so the next turn re-routes through the cloud ladder normally."""
+    ctx.local_mode = False
+    ctx.offline_failover = False
+    ctx.active_model = ctx.active_effort = ctx.active_backend = None
+    await unload_local(ctx)
+    from gabagent.voice.debuglog import dlog
+    dlog(ctx, "offline_failover", on=False, recovered=True)
+
+
 async def unload_local(ctx: AgentContext) -> None:
     """Evict the local model from VRAM immediately (keep_alive: 0) without stopping the
     Ollama server. Best-effort — used when leaving local mode or on shutdown so the GPU is
