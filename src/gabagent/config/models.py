@@ -119,6 +119,36 @@ class TidalConfig(BaseModel):
     rpc_url: str = "http://localhost:6680/mopidy/rpc"
 
 
+class TmiConfig(BaseModel):
+    """Tiered-Memory-Indexing: a self-reconciling, cross-room memory layer.
+    Tier 0 = shared across ALL Aria processes (the 'one Aria' durable facts), Tier 1 = per-room,
+    Tier 2 = the recent message window (the existing session recency slice, not a new store). An
+    auto-reconciler (riding the persona shutdown trigger) consolidates/prunes per room and escalates
+    only HIGH-weight facts up into Tier 0 under guardrails. DEFAULT OFF ⇒ exact current persona/memory
+    behavior (a single shared persona); nothing here changes a turn until `enabled` is set."""
+    enabled: bool = False  # master switch; off = byte-identical to today
+    # Tier-0 adaptive pressure-banded cap. soft_cap = where back-pressure begins (the admission bar
+    # rises and pruning hardens per band: relaxed 0-19 / medium 20-29 / firm 30-39 / strict 40-49);
+    # hard_cap = absolute ceiling, no net growth past it (must prune below it before a new fact lands).
+    # The band curve (admit multipliers, decay half-lives, prune floors) is an internal default, tuned
+    # later on real logs. Pinned/explicit facts are exempt from decay+prune.
+    tier0_soft_cap: int = 20
+    tier0_hard_cap: int = 50
+    # Habit escalation: a fact graduates to Tier 0 when seen >= habit_count times spanning at least
+    # habit_window_days AND >= 2 distinct weeks (persistence, not a one-week spike). Tunable.
+    habit_count: int = 3
+    habit_window_days: int = 14
+    # Weighted decay: an unused (un-pinned, non-explicit) fact's weight halves every N days and ages out,
+    # so Tier 0 self-corrects a bad escalation and stays 'what's true lately'.
+    decay_halflife_days: int = 30
+    # Privacy switch: rooms whose memories NEVER escalate to shared Tier 0. Empty = allow-all (matches
+    # today's single shared persona). Add a room_id here to keep that room's memory private to itself.
+    tier0_exclude_rooms: list[str] = Field(default_factory=list)
+    # Auto-reconcile cadence for a long-lived room process. 0 = off (v1 reconciles only on the shutdown
+    # trigger, like persona reflection). A periodic in-process reconcile is a later phase.
+    reconcile_interval_secs: int = 0
+
+
 class DesktopConfig(BaseModel):
     """KDE/Wayland desktop control (first-party provider)."""
     # Friendly monitor names → KWin connector (e.g. {"hisense": "DP-1"}). Display make/model isn't
@@ -301,3 +331,4 @@ class GabAgentConfig(BaseSettings):
     jellyfin: JellyfinConfig = Field(default_factory=JellyfinConfig)
     tidal: TidalConfig = Field(default_factory=TidalConfig)
     desktop: DesktopConfig = Field(default_factory=DesktopConfig)
+    tmi: TmiConfig = Field(default_factory=TmiConfig)

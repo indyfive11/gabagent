@@ -19,6 +19,11 @@ class AgentContext:
     session: SessionFile
     session_id: str
     cwd: Path = field(default_factory=Path.cwd)
+    # Durable per-room key for the Tiered-Memory layer (process-per-room topology): which physical
+    # room/satellite this brain serves, e.g. "living_room". Set once at launch (--room-id) and refreshed
+    # from the VoiceSession on each turn. None ⇒ single-room/TUI ⇒ memory uses a shared 'default' bucket
+    # (exact current behavior). Inert until the TMI layer (config.tmi.enabled) reads it.
+    room_id: str | None = None
     system_prompt: str = ""
     plan_mode: bool = False
     plan_file_path: Path | None = None

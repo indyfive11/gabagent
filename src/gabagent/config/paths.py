@@ -42,6 +42,33 @@ def persona_dir() -> Path:
     return p
 
 
+def tmi_dir() -> Path:
+    """Root of the Tiered-Memory-Indexing store (cwd-independent, like persona). Tier 0 (shared across
+    every Aria process) lives in tmi/tier0/; per-room Tier 1 in tmi/rooms/<room_id>/."""
+    p = data_dir() / "tmi"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def tier0_dir() -> Path:
+    """Tier-0 store: the consolidated identity/facts SHARED across all Aria processes (every room).
+    cwd- AND room-independent — the cross-room 'one Aria'."""
+    p = tmi_dir() / "tier0"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def room_dir(room_id: str | None = None) -> Path:
+    """Tier-1 (per-room) store. `room_id` is the durable per-room key; when unset (single-room install
+    / TUI) it falls back to a stable 'default' bucket so behavior is unchanged. The key is sanitized to
+    one safe path segment since it can come from config or an /attach payload."""
+    key = (room_id or "default").strip() or "default"
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in key)
+    p = tmi_dir() / "rooms" / safe
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def history_file() -> Path:
     return config_dir() / "history"
 

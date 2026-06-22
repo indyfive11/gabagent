@@ -116,6 +116,7 @@ def build_app(ctx: AgentContext):
         rid = _coerce_room_id(body.get("room_id"))
         if rid is not None:
             vs.room_id = rid
+            ctx.room_id = rid  # mirror onto ctx so the tiered-memory layer recalls this room's tier
         ctx.voice_session = vs
         # Marks that the brain RECEIVED an utterance — fires even on a 409 busy (no turn_start follows
         # then). Its ABSENCE after a wake means the voice side never reached us (the close-freeze pattern).

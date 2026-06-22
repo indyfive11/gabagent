@@ -130,6 +130,7 @@ def main(
     voice_serve: bool = typer.Option(False, "--voice-serve", help="Run as a voice brain (HTTP+SSE server)"),
     port: int = typer.Option(0, "--port", help="Voice server port (default: config voice_port)"),
     voice_host: str = typer.Option("", "--voice-host", help="Voice server bind address (default: config voice_host, 127.0.0.1). Set a LAN IP for a remote satellite; pair with GABAI_VOICE_AUTH_TOKEN."),
+    room_id: str = typer.Option("", "--room-id", help="Durable room key this brain serves (process-per-room), e.g. 'living_room'. Used by the tiered-memory layer; empty = single-room default."),
     set_claude_key: str = typer.Option("", "--set-claude-key", help="Save an Anthropic key, switch to the Claude backend, and exit"),
     version: bool = typer.Option(False, "--version", "-v", help="Show version"),
 ) -> None:
@@ -176,6 +177,8 @@ def main(
     ctx.force_model = bool(model)
 
     if voice_serve:
+        if room_id.strip():
+            ctx.room_id = room_id.strip()
         _start_voice(ctx, model=model, port=port, host=voice_host)
         raise typer.Exit()
 
