@@ -78,13 +78,20 @@ async def _run(handoff: Path) -> None:
         except Exception:
             pass
 
-    # TMI per-room consolidate + prune (Tier 1). No Tier-0 escalation in this phase.
+    # TMI per-room consolidate + prune (Tier 1), then escalate high-signal facts into shared Tier 0.
     if getattr(getattr(cfg, "tmi", None), "enabled", False):
+        room_id = getattr(ctx, "room_id", None)
         try:
             from gabagent.tmi.reconciler import TmiReconciler
-            await TmiReconciler(getattr(ctx, "room_id", None)).reconcile_from_ctx(ctx)
+            await TmiReconciler(room_id).reconcile_from_ctx(ctx)
         except Exception:
             pass
+        if getattr(cfg.tmi, "tier0_escalation_enabled", False):
+            try:
+                from gabagent.tmi.escalator import TmiEscalator
+                await TmiEscalator(room_id).escalate_from_ctx(ctx)
+            except Exception:
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:

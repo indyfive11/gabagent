@@ -127,6 +127,9 @@ class TmiConfig(BaseModel):
     only HIGH-weight facts up into Tier 0 under guardrails. DEFAULT OFF ⇒ exact current persona/memory
     behavior (a single shared persona); nothing here changes a turn until `enabled` is set."""
     enabled: bool = False  # master switch; off = byte-identical to today
+    # Tier-0 escalation (P3): promote high-signal Tier-1 facts into the shared cross-room store. Off ⇒
+    # no Tier-0 fact store is written and recall stays persona-only, exactly as P1/P2 behave.
+    tier0_escalation_enabled: bool = False
     # Tier-0 adaptive pressure-banded cap. soft_cap = where back-pressure begins (the admission bar
     # rises and pruning hardens per band: relaxed 0-19 / medium 20-29 / firm 30-39 / strict 40-49);
     # hard_cap = absolute ceiling, no net growth past it (must prune below it before a new fact lands).

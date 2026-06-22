@@ -31,10 +31,13 @@ _RECONCILE_SYSTEM = (
     "speech-to-text noise (the transcript is noisy — mine signal, not mis-hearings).\n"
     "Keep it SMALL and crisp: at most ~"
     f"{_MAX_ROOM_FACTS} facts, each ONE short line. Drop facts no longer true. Reinforce facts the "
-    "conversation supports. This set REPLACES the old one.\n\n"
+    "conversation supports. This set REPLACES the old one.\n"
+    "Prefix a line with [explicit] ONLY when the user DIRECTLY instructed it — said remember this, or "
+    "stated an always/never rule (e.g. '[explicit] always dim the lights at night', '[explicit] I'm "
+    "allergic to nuts'). Most facts are observed, NOT explicit — do not over-mark.\n\n"
     "Output EXACTLY this and nothing else:\n"
     "<FACTS>\n"
-    "(the full updated fact set as short markdown bullets — one fact per line)\n"
+    "(the full updated fact set as short markdown bullets — one fact per line, [explicit] prefix where due)\n"
     "</FACTS>\n"
     "<NOTE>\n"
     "(one short line on what changed, or 'no change')\n"
@@ -110,6 +113,9 @@ class TmiReconciler:
         seen_keys = set()
         for line in new_lines:
             text = line.lstrip("-*•").strip()
+            explicit = False
+            if text.lower().startswith("[explicit]"):
+                explicit, text = True, text[len("[explicit]"):].strip()
             key = normalize(text)
             if not key or key in seen_keys:
                 continue
@@ -117,15 +123,16 @@ class TmiReconciler:
             f = by_key.get(key)
             if f is not None:
                 f.text = text  # keep the latest phrasing
+                f.explicit = f.explicit or explicit  # sticky: once explicit, stays explicit
                 f.observe(ts, self._room_id)
             else:
                 f = Fact(text=text, sources=[self._room_id or "default"], first_seen=ts,
-                         last_seen=ts, hits=1, seen_weeks=[wk], pinned=False)
+                         last_seen=ts, hits=1, seen_weeks=[wk], explicit=explicit)
             out.append(f)
-        # Keep pinned facts the model dropped (pinned never prunes); everything else not re-emitted
-        # is pruned by omission.
+        # Keep PROTECTED facts the model dropped (pinned or explicit never prune by omission);
+        # everything else not re-emitted is pruned.
         for f in existing:
-            if f.pinned and f.key not in seen_keys:
+            if f.protected and f.key not in seen_keys:
                 out.append(f)
         return out
 

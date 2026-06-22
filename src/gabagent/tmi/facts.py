@@ -34,11 +34,20 @@ class Fact:
     last_seen: float = 0.0
     hits: int = 1                                      # times re-observed across reconciles
     seen_weeks: list[str] = field(default_factory=list)  # distinct ISO weeks observed (habit signal)
-    pinned: bool = False                              # user-explicit ⇒ never decays/prunes
+    pinned: bool = False                              # never decays/prunes/evicts (hard keep)
+    explicit: bool = False                            # user directly stated/instructed (remember/always/
+    #   never) ⇒ weight↑, escalates immediately, protected from decay/prune like pinned. Sticky once set.
+    volatility: float = 0.0                           # RESERVED (inert): penalize facts the user keeps
+    #   contradicting. No producer yet — true tracking needs a topic/slot model (a later phase).
 
     @property
     def key(self) -> str:
         return normalize(self.text)
+
+    @property
+    def protected(self) -> bool:
+        """Exempt from decay, prune, and eviction — a user-anchored fact (pinned or explicit)."""
+        return self.pinned or self.explicit
 
     def observe(self, ts: float, room_id: str | None) -> None:
         """Record another sighting of this fact: bump hits, extend last_seen, week, and source set."""
