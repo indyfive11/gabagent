@@ -177,6 +177,21 @@ async def test_escalation_emits_status(home):
     assert any(e.type == "status" for e in evs)
 
 
+async def test_first_token_latency_is_stamped_once(home, monkeypatch):
+    # First-audio instrumentation (pairs with VAC's decomposed RESPONSE line): exactly one `first_token`
+    # dlog per turn, carrying the brain's request-in → first-token-out delta in ms.
+    import gabagent.voice.turn as turn_mod
+    seen = []
+    monkeypatch.setattr(turn_mod, "dlog", lambda ctx, event, **kw: seen.append((event, kw)))
+    proj = home / "proj"
+    proj.mkdir()
+    ctx = make_ctx(proj, [["Two sentences here. And a second one."]])
+    await run_turn(ctx, "say something")
+    firsts = [(e, kw) for e, kw in seen if e == "first_token"]
+    assert len(firsts) == 1                                   # stamped once, not per token
+    assert "ms" in firsts[0][1] and isinstance(firsts[0][1]["ms"], int)
+
+
 async def test_cancel_ends_turn(home):
     proj = home / "proj"
     proj.mkdir()

@@ -506,10 +506,24 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
     """Drive one turn, emitting VoiceEvents into vs.queue. Suspends naturally at a
     confirm (inside voice_approve's await) and resumes when /confirm resolves it.
     Always terminates the event stream with a `done`."""
-    emit = ctx.voice_emit
     # Turn lifecycle markers: a `turn_start` with no matching `turn_done` is the signature of a hang
     # (model loop, tool, or page-eval) that left no other trace — the close-movie freeze had none of these.
     _t0 = time.monotonic()
+    # First-audio instrumentation (pairs with VAC's decomposed RESPONSE line): wrap the single emit funnel
+    # so the FIRST `status` (e.g. the "Switching to Claude" escalate filler) and the FIRST `token` (first
+    # speakable audio-bearing text) each get stamped once with their delta from turn start. `respond_recv`
+    # (server.py) is the request-in anchor; `first_token.ms` is the brain's request-in → first-token-out, the
+    # number VAC can't see from the voice side. Cheap, default-on, one dlog line per turn per type.
+    _base_emit = ctx.voice_emit
+    _stamped: set[str] = set()
+
+    async def emit(ev):
+        kind = getattr(ev, "type", None)
+        if kind in ("token", "status") and kind not in _stamped:
+            _stamped.add(kind)
+            dlog(ctx, f"first_{kind}", ms=int((time.monotonic() - _t0) * 1000))
+        await _base_emit(ev)
+
     dlog(ctx, "turn_start", words=len(user_text.split()))
     try:
         mc = commands.detect_meta_command(user_text)
