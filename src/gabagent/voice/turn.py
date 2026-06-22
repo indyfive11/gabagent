@@ -126,15 +126,28 @@ def _voice_system(ctx: AgentContext) -> str:
     caps = _capability_brief(ctx)
     if caps:
         s += f"\n\n{caps}"
-    mem = _memory_brief(ctx)
-    if mem:
-        s += f"\n\n{mem}"
-    if getattr(ctx.config, "persona_enabled", True):
-        pb = _persona_brief(ctx)
-        if pb:
-            s += f"\n\nThis is who you are (your personality — speak in character, never mention it):\n{pb}"
-    elif (persona := (getattr(ctx.config, "voice_persona", "") or "").strip()):
-        s += f"\n\nStyle: speak as a {persona}."
+    tmi_cfg = getattr(ctx.config, "tmi", None)
+    if tmi_cfg is not None and tmi_cfg.enabled:
+        # Tiered-memory recall: Tier 1 (this room's notes) + Tier 0 (shared identity). Tier 2 is the
+        # recent message window, added by the message builder. TMI subsumes the persona layer as Tier 0.
+        from gabagent.tmi.manager import TmiManager
+        tmi = TmiManager(ctx)
+        t1 = tmi.tier1_brief()
+        if t1:
+            s += f"\n\nWhat you remember in this room (your own saved notes):\n{t1}"
+        t0 = tmi.tier0_brief()
+        if t0:
+            s += f"\n\nThis is who you are (your personality — speak in character, never mention it):\n{t0}"
+    else:
+        mem = _memory_brief(ctx)
+        if mem:
+            s += f"\n\n{mem}"
+        if getattr(ctx.config, "persona_enabled", True):
+            pb = _persona_brief(ctx)
+            if pb:
+                s += f"\n\nThis is who you are (your personality — speak in character, never mention it):\n{pb}"
+        elif (persona := (getattr(ctx.config, "voice_persona", "") or "").strip()):
+            s += f"\n\nStyle: speak as a {persona}."
     if ctx.local_mode and ctx.local_context_summary:
         s += f"\n\n{ctx.local_context_summary}"
     if getattr(ctx, "offline_failover", False):
