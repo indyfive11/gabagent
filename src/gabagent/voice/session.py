@@ -10,6 +10,14 @@ class VoiceSession:
         self.session_id = session_id
         self.ctx = ctx
         self.audit_path = audit_path
+        # Multi-room foundation (STT-offload seam). `room_id` is the DURABLE per-room routing key
+        # (stable per physical room/device), distinct from `session_id` which is EPHEMERAL (per brain
+        # process / per voice-client init). Set on /attach, refreshed from any payload's optional
+        # room_id. Ignored for routing today — the brain is still single-conversation (one ctx) — but
+        # wired here so materializing a per-room ctx later isn't a retrofit. `capabilities` is the
+        # client's /attach advertisement ({wake,vad,stt,tts}); logged now, drives placement later.
+        self.room_id: str | None = None
+        self.capabilities: dict = {}
         # Pending confirmation round-trips: confirm id -> Future[(approved, passphrase)]
         self.pending: dict[str, asyncio.Future] = {}
         # Serializes overlapping confirm round-trips (parallel gated tools).

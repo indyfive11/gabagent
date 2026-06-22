@@ -28,6 +28,16 @@ _SSE_HEADERS = {
 }
 
 
+def _coerce_room_id(value):
+    """Optional durable room-routing key off a payload. A non-empty string is kept (stripped);
+    anything else (None, garbage type, empty) => None. Like the `wake` field, a stray value can
+    never perturb a turn — absent/garbage is exactly the single-room default."""
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    return None
+
+
 class _BearerAuth:
     """Pure-ASGI bearer-token guard for a non-loopback (LAN) brain bind.
 
@@ -100,6 +110,12 @@ def build_app(ctx: AgentContext):
         if not isinstance(wake, dict):
             wake = None
         vs = get_session(sid)
+        # Optional durable room key (multi-room foundation). Refresh-only: a payload that omits it must
+        # not clobber a room_id already set by /attach. Ignored for routing today (single-conversation
+        # brain) — kept fresh on the session for the future per-room ctx. See call-out 2 in the seam ADR.
+        rid = _coerce_room_id(body.get("room_id"))
+        if rid is not None:
+            vs.room_id = rid
         ctx.voice_session = vs
         # Marks that the brain RECEIVED an utterance — fires even on a 409 busy (no turn_start follows
         # then). Its ABSENCE after a wake means the voice side never reached us (the close-freeze pattern).
@@ -124,6 +140,9 @@ def build_app(ctx: AgentContext):
             return JSONResponse({"ok": False, "error": "unknown session"}, status_code=404)
         if not _busy(vs):
             return JSONResponse({"ok": False, "error": "no turn awaiting confirmation"}, status_code=409)
+        rid = _coerce_room_id(body.get("room_id"))   # informational here (confirm keys on session_id); kept fresh
+        if rid is not None:
+            vs.room_id = rid
         ctx.voice_session = vs
         ok = vs.resolve(body.get("id", ""), bool(body.get("approved")), body.get("passphrase"))
         if not ok:
@@ -141,11 +160,43 @@ def build_app(ctx: AgentContext):
         # mystery silent drop. Pairs with the `cancelled` dlog in the turn's CancelledError handler.
         from gabagent.voice.debuglog import dlog
         aborted = vs.turn_task is not None and not vs.turn_task.done()
+        rid = _coerce_room_id(body.get("room_id"))   # informational here (cancel keys on session_id); kept fresh
+        if rid is not None:
+            vs.room_id = rid
         dlog(ctx, "cancel_recv", session=body.get("session_id", ""), aborted_live_turn=aborted)
         if aborted:
             vs.turn_task.cancel()
         vs.clear_pending(approved=False)
         return JSONResponse({"ok": True})
+
+    async def attach(request):
+        # Net-new capability handshake (STT-offload / multi-room foundation). The voice client calls this
+        # ONCE after /health, before the first turn, to register its room + what it does locally. Bearer-
+        # guarded like every non-/health endpoint (the middleware wraps this route automatically).
+        #   POST {session_id, room_id, capabilities:{wake,vad,stt,tts}} -> {status, brain:{...}}
+        # Properties (agreed in the seam ADR):
+        #  - Idempotent: get-or-create the session, upsert room_id/capabilities; safe to re-call on a
+        #    client reconnect or brain restart, never errors on repeat.
+        #  - Tolerant: missing/garbage fields default rather than 400, so a newer client adding a
+        #    capability key can't break an older brain.
+        #  - Bidirectional: returns the brain's OWN capabilities so the client can negotiate instead of
+        #    assuming. `accepts_room_id` advertises that payloads may carry the optional room key.
+        body = await request.json()
+        sid = body.get("session_id", "default")
+        rid = _coerce_room_id(body.get("room_id"))
+        caps = body.get("capabilities")
+        if not isinstance(caps, dict):
+            caps = {}
+        vs = get_session(sid)
+        if rid is not None:
+            vs.room_id = rid
+        vs.capabilities = caps
+        from gabagent.voice.debuglog import dlog
+        dlog(ctx, "attach", session=sid, room=rid, caps=sorted(caps.keys()))
+        from gabagent import __version__
+        return JSONResponse(
+            {"status": "ok", "brain": {"version": __version__, "accepts_room_id": True}}
+        )
 
     async def media_duck(request):
         # Called on VAD speech-onset/end: duck music + movie volume so Aria can hear over playback.
@@ -183,6 +234,7 @@ def build_app(ctx: AgentContext):
 
     app = Starlette(routes=[
         Route("/health", health, methods=["GET"]),
+        Route("/attach", attach, methods=["POST"]),
         Route("/respond", respond, methods=["POST"]),
         Route("/confirm", confirm, methods=["POST"]),
         Route("/cancel", cancel, methods=["POST"]),

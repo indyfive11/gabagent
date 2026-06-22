@@ -300,3 +300,75 @@ async def test_bearer_token_guards_respond_post(tmp_path):
             assert resp.status_code == 200
             events = await _drain(resp)
         assert any(e["type"] == "done" for e in events)
+
+
+# --- STT-offload / multi-room foundation: /attach + optional room_id ---------------------------
+
+async def test_attach_handshake_stashes_room_and_returns_brain_caps(tmp_path):
+    # /attach registers the room + client capabilities on the session and returns the brain's own
+    # capability advertisement (bidirectional handshake), so the client negotiates instead of assuming.
+    from gabagent import __version__
+    app = build_app(make_ctx(tmp_path, []))
+    async with _client(app) as client:
+        r = await client.post("/attach", json={
+            "session_id": "s1", "room_id": "kitchen",
+            "capabilities": {"wake": True, "vad": True, "stt": "remote", "tts": True},
+        })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["brain"] == {"version": __version__, "accepts_room_id": True}
+    vs = app.state.sessions["s1"]
+    assert vs.room_id == "kitchen"
+    assert vs.capabilities == {"wake": True, "vad": True, "stt": "remote", "tts": True}
+
+
+async def test_attach_is_idempotent_and_tolerant(tmp_path):
+    # Re-callable (reconnect/restart) and never 400s on missing/garbage fields: a non-dict capabilities
+    # defaults to {}, an absent/garbage room_id => None — a newer client can't break an older brain.
+    app = build_app(make_ctx(tmp_path, []))
+    async with _client(app) as client:
+        r1 = await client.post("/attach", json={
+            "session_id": "s1", "room_id": "office", "capabilities": "not-a-dict",
+        })
+        assert r1.status_code == 200
+        assert app.state.sessions["s1"].room_id == "office"
+        assert app.state.sessions["s1"].capabilities == {}     # garbage caps defaulted
+        # Re-attach (no room_id this time) => no error; capabilities upsert.
+        r2 = await client.post("/attach", json={
+            "session_id": "s1", "capabilities": {"stt": "remote"},
+        })
+        assert r2.status_code == 200
+        assert app.state.sessions["s1"].capabilities == {"stt": "remote"}
+        # room_id omitted on the re-attach must NOT clobber the prior value.
+        assert app.state.sessions["s1"].room_id == "office"
+
+
+async def test_attach_guarded_by_bearer(tmp_path):
+    # /attach is a non-/health endpoint, so the configured token guards it like the rest.
+    ctx = make_ctx(tmp_path, [])
+    ctx.config.voice_auth_token = "tok"
+    app = build_app(ctx)
+    async with _client(app) as client:
+        assert (await client.post("/attach", json={"session_id": "s"})).status_code == 401
+        ok = await client.post(
+            "/attach", headers={"Authorization": "Bearer tok"},
+            json={"session_id": "s", "room_id": "den"},
+        )
+        assert ok.status_code == 200 and ok.json()["status"] == "ok"
+
+
+async def test_respond_threads_room_id_onto_session_refresh_only(tmp_path):
+    # /respond stashes a payload room_id on the session (multi-room routing key), but an omitted room_id
+    # must NOT clobber a value an earlier /attach set (refresh-only semantics).
+    app = build_app(make_ctx(tmp_path, [["Done."], ["Done again."]]))
+    async with _client(app) as client:
+        await client.post("/attach", json={"session_id": "s1", "room_id": "bedroom"})
+        async with client.stream("POST", "/respond",
+                                 json={"session_id": "s1", "text": "hi"}) as resp:
+            await _drain(resp)
+        assert app.state.sessions["s1"].room_id == "bedroom"     # preserved (no room_id in payload)
+        async with client.stream("POST", "/respond",
+                                 json={"session_id": "s1", "text": "hi", "room_id": "garage"}) as resp:
+            await _drain(resp)
+        assert app.state.sessions["s1"].room_id == "garage"      # refreshed from the payload
