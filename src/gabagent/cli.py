@@ -228,8 +228,10 @@ async def _persona_reflect(ctx) -> None:
     The _MIN_TURNS guard is checked here (in-memory, cheap) so a trivial 'hello' session never spawns a
     child; reflect_from_ctx re-applies it defensively in the child."""
     cfg = ctx.config
-    if not (getattr(cfg, "persona_enabled", False) and getattr(cfg, "persona_reflect_on_shutdown", False)):
-        return
+    persona_on = getattr(cfg, "persona_enabled", False) and getattr(cfg, "persona_reflect_on_shutdown", False)
+    tmi_on = getattr(getattr(cfg, "tmi", None), "enabled", False)
+    if not (persona_on or tmi_on):
+        return  # neither learner is active — nothing to hand off
     try:
         import json
         import os
@@ -242,7 +244,10 @@ async def _persona_reflect(ctx) -> None:
         if sum(1 for m in turns if m.role == "user") < _MIN_TURNS:
             return  # nothing worth learning from — don't spawn
 
-        payload = {"turns": [{"role": m.role, "content": m.content} for m in turns[-_TRANSCRIPT_TURNS:]]}
+        payload = {
+            "turns": [{"role": m.role, "content": m.content} for m in turns[-_TRANSCRIPT_TURNS:]],
+            "room_id": getattr(ctx, "room_id", None),  # so the child reconciles the right room's Tier 1
+        }
         fd, path = tempfile.mkstemp(prefix="gabagent_persona_", suffix=".json")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f)

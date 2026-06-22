@@ -36,12 +36,12 @@ def _load_turns(handoff: Path) -> list:
     return [ChatMessage(role=t["role"], content=t["content"]) for t in data.get("turns", [])]
 
 
-def _build_ctx(turns: list):
+def _build_ctx(turns: list, room_id: str | None = None):
     """A minimal context exposing exactly the attributes the reflection path reads: config, a fresh
     client, a session that yields the handed-off turns, and the ladder-routing fields consulted by
     `_reflection_client` → `ModelRouter.assemble` → `_active_client`. local_client is None and
     degraded is empty — reflection wants the TOP (cloud) rung, not the local floor, so this resolves
-    to the same opus/max rung the live brain would pick."""
+    to the same opus/max rung the live brain would pick. `room_id` keys the TMI reconcile."""
     from gabagent.config.loader import load_config
     from gabagent.api.factory import build_client
     from gabagent.api.rate_limit import UsageTracker
@@ -55,7 +55,7 @@ def _build_ctx(turns: list):
         session=types.SimpleNamespace(messages=lambda: list(turns)),
         local_floor=getattr(cfg, "local_floor", False),
         local_client=None, local_mode=False, clients={},
-        degraded_backends=set(),
+        degraded_backends=set(), room_id=room_id,
     )
 
 
@@ -63,9 +63,28 @@ async def _run(handoff: Path) -> None:
     turns = _load_turns(handoff)
     if not turns:
         return
-    from gabagent.persona.manager import PersonaManager
+    try:
+        room_id = json.loads(handoff.read_text(encoding="utf-8")).get("room_id")
+    except Exception:
+        room_id = None
+    ctx = _build_ctx(turns, room_id)
+    cfg = ctx.config
 
-    await PersonaManager().reflect_from_ctx(_build_ctx(turns))
+    # Persona reflection — only when it's actually enabled (the child may have been spawned for TMI alone).
+    if getattr(cfg, "persona_enabled", False) and getattr(cfg, "persona_reflect_on_shutdown", False):
+        try:
+            from gabagent.persona.manager import PersonaManager
+            await PersonaManager().reflect_from_ctx(ctx)
+        except Exception:
+            pass
+
+    # TMI per-room consolidate + prune (Tier 1). No Tier-0 escalation in this phase.
+    if getattr(getattr(cfg, "tmi", None), "enabled", False):
+        try:
+            from gabagent.tmi.reconciler import TmiReconciler
+            await TmiReconciler(getattr(ctx, "room_id", None)).reconcile_from_ctx(ctx)
+        except Exception:
+            pass
 
 
 def main(argv: list[str] | None = None) -> int:

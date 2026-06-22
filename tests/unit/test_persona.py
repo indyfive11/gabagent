@@ -284,13 +284,14 @@ async def test_detached_run_reflects_into_store(persona, monkeypatch, tmp_path):
     from gabagent.persona import reflect_detached
     fake = _FakeClient("<INDEX>\n- dry, the user asked\n</INDEX>\n<JOURNAL>\nasked for dry\n</JOURNAL>")
 
-    def _fake_build_ctx(turns):
+    def _fake_build_ctx(turns, room_id=None):
         monkeypatch.setattr(PersonaManager, "_reflection_client",
                             staticmethod(lambda ctx: (fake, None, None)))
         return types.SimpleNamespace(
             session=types.SimpleNamespace(messages=lambda: list(turns)),
-            config=types.SimpleNamespace(), local_floor=False,
-            local_client=None, degraded_backends=set())
+            config=types.SimpleNamespace(persona_enabled=True, persona_reflect_on_shutdown=True,
+                                         tmi=types.SimpleNamespace(enabled=False)),
+            local_floor=False, local_client=None, degraded_backends=set(), room_id=room_id)
 
     monkeypatch.setattr(reflect_detached, "_build_ctx", _fake_build_ctx)
     h = tmp_path / "h.json"
