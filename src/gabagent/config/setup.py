@@ -132,11 +132,38 @@ async def _setup_claude(cfg: GabAgentConfig, console, session) -> GabAgentConfig
     return cfg
 
 
+def detect_gpu_env() -> dict[str, str]:
+    """One-shot, opt-in GPU-arch detection for the local-model server (called only from the Local
+    backend setup). On an AMD ROCm box, `rocminfo` (the authoritative OS source) reports the gfx
+    target; HSA_OVERRIDE_GFX_VERSION must be a ROCm-supported version string matching the family
+    base ("11.0.0" for the gfx1100 family, "10.3.0" for gfx1030). We derive the conventional family
+    base from the detected target and return it as a SUGGESTION. Returns {} when no AMD GPU /
+    rocminfo is present (NVIDIA needs no override; empty = the universal-safe default). Never raises,
+    never installs anything — pure read."""
+    import shutil
+    import subprocess
+    import re
+
+    if not shutil.which("rocminfo"):
+        return {}
+    try:
+        out = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return {}
+    m = re.search(r"gfx(\d{3,4})\b", out)
+    if not m:
+        return {}
+    # HSA_OVERRIDE "X.Y.Z" mirrors gfxXYZ; the trailing stepping digit folds to 0 (the family base
+    # ROCm ships): gfx1100/gfx1103 -> 11.0.0, gfx1030 -> 10.3.0, gfx900 -> 9.0.0.
+    g = m.group(1).zfill(4)
+    return {"HSA_OVERRIDE_GFX_VERSION": f"{int(g[:2])}.{int(g[2])}.0"}
+
+
 async def _setup_local(cfg: GabAgentConfig, console, session) -> GabAgentConfig:
     console.print(
         "\n[bold]Local (Ollama)[/bold] — runs a model on this machine via Ollama "
-        f"([dim]{cfg.local_base_url}[/dim]). Guided install is on the roadmap; "
-        "for now Ollama must already be installed.\n",
+        f"([dim]{cfg.local_base_url}[/dim]). Opt-in: nothing is installed or downloaded for you. "
+        "Ollama must already be installed, and the model is pulled on first use.\n",
         markup=True,
     )
     default_model = cfg.local_model or "qwen2.5-coder"
@@ -144,4 +171,21 @@ async def _setup_local(cfg: GabAgentConfig, console, session) -> GabAgentConfig:
 
     cfg.provider = "gab"  # primary stays gab-shaped; the local client is OpenAI-compatible
     cfg.local_model = model
+
+    # Detect-and-write the GPU env override (SOP: authoritative source, written once, user-editable).
+    # Only an AMD ROCm card needs one; we suggest the family base and let the user confirm/skip/edit.
+    if not cfg.local_env:
+        suggested = detect_gpu_env().get("HSA_OVERRIDE_GFX_VERSION", "")
+        if suggested:
+            console.print(
+                f"\n[dim]Detected an AMD ROCm GPU. Suggested "
+                f"[bold]HSA_OVERRIDE_GFX_VERSION={suggested}[/bold]. Press Enter to use it, type "
+                "another value, or 'none' to inject nothing.[/dim]\n",
+                markup=True,
+            )
+            val = await _prompt(
+                session, f"HSA_OVERRIDE_GFX_VERSION (default: {suggested}): ", default=suggested
+            )
+            if val and val.lower() != "none":
+                cfg.local_env = {"HSA_OVERRIDE_GFX_VERSION": val}
     return cfg

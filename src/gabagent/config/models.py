@@ -160,6 +160,12 @@ class GabAgentConfig(BaseSettings):
     load_global_claude_md: bool = False
     local_base_url: str = "http://localhost:11434/v1"
     local_model: str = ""
+    # Environment overlay for the spawned local-model server (`ollama serve`). Default empty ⇒
+    # nothing injected, which is the universal-safe behavior: a generic install gets Ollama's own
+    # defaults, never a GPU override that fits only one card. A ROCm box whose arch needs spoofing
+    # sets e.g. {"HSA_OVERRIDE_GFX_VERSION": "11.0.0"} here — detected once and written by the Local
+    # backend setup (from rocminfo), then user-editable. Replaces a former hard-coded HSA_OVERRIDE.
+    local_env: dict[str, str] = Field(default_factory=dict)
     # When True, the local Ollama model is the persisted BOTTOM RUNG of the escalation ladder
     # (the warm floor): trivial turns run on it, harder turns climb to Aria → Claude. When False,
     # Aria is the floor and local is off. Distinct from the ephemeral `local_mode` (exclusive

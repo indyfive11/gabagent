@@ -11,6 +11,15 @@ if TYPE_CHECKING:
 _STARTUP_TIMEOUT = 60  # seconds — ROCm GPU discovery takes ~30s on cold start
 
 
+def _local_subprocess_env(ctx: AgentContext) -> dict[str, str]:
+    """Environment for the spawned `ollama serve`: the inherited env plus the user-configured
+    overlay (`local_env`). Default empty ⇒ nothing injected, the universal-safe behavior (a generic
+    install gets Ollama's own defaults, never a GPU override that fits only one card). A ROCm box
+    whose arch needs spoofing sets e.g. {"HSA_OVERRIDE_GFX_VERSION": "11.0.0"} in config — written
+    once by the Local-backend setup, then editable. Replaces the former hard-coded HSA_OVERRIDE."""
+    return {**os.environ, **ctx.config.local_env}
+
+
 async def ensure_ollama_running(ctx: AgentContext) -> str | None:
     """Ping Ollama; start it as a subprocess if not running.
     Returns None on success, or an error string describing the failure."""
@@ -30,7 +39,7 @@ async def ensure_ollama_running(ctx: AgentContext) -> str | None:
     if await _ping():
         return None
 
-    env = {**os.environ, "HSA_OVERRIDE_GFX_VERSION": "11.0.0"}
+    env = _local_subprocess_env(ctx)
     log_fh = Path("/tmp/ollama.log").open("w")
     try:
         proc = subprocess.Popen(

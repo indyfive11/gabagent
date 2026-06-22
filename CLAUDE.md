@@ -36,6 +36,29 @@ gab --resume <uuid>          # resume specific session
 - Shell state is one persistent bash process per session
 - Session JSONL is append-only; compaction writes a new file
 
+## Hardware & Config Generalization (HARD SOP)
+
+This project must run on **anyone's** hardware with **zero code edits**. No hardware-type or
+installation-specific value may be a bare constant in code. Every such value MUST be:
+
+1. **A config field / env var with a safe universal default**, where the default is the historical
+   no-op behavior — an unconfigured install behaves exactly as before, never worse. Empty/unset must
+   be valid and safe (e.g. no GPU override injected when unset).
+2. **Detected once by an explicit, inspectable setup/detect step that WRITES the value into config** —
+   never a fragile per-startup auto-probe. Per-boot probes misfire on device/startup-order quirks (the
+   pipecat `is_format_supported` output probe shipped a 1.84× "chipmunk" TTS bug). Detection uses the
+   authoritative OS source: `rocminfo`/`nvidia-smi`/`lspci` (GPU), ALSA/PipeWire (audio rates/devices),
+   the primary route interface (LAN IP), `ollama list` (local models).
+3. **User-overridable afterward** — the written config stays plain and editable.
+
+Principle: **the running app reads config (dumb); the setup step detects-and-writes (smart); the user
+edits config (in control).** A genuinely universal constant (e.g. the 16 kHz pipeline rate tied to STT
+model training) may stay hardcoded, but a comment must state WHY it is universal.
+
+Governed values include: GPU env (`HSA_OVERRIDE_GFX_VERSION` — now the `local_env` config map, written by
+the Local-backend setup from `rocminfo`), `local_model` name, audio device sample-rate/channels/names,
+LAN bind IP, install paths. The sibling voice-agent repo follows the same SOP.
+
 ## Testing
 
 ```bash
