@@ -33,6 +33,10 @@ _COMMAND_LEADS = frozenset((
     "play", "pause", "stop", "resume", "skip", "next", "previous", "restart", "turn", "set",
     "volume", "mute", "unmute", "louder", "quieter", "lower", "raise", "open", "close", "launch",
     "start", "switch", "undo", "redo",
+    # B2 (data-mined from real deferred-addressed turns 2026-06-22): common media verbs the gate was
+    # paying an LLM classify on — "push play", "watch the movie", "shuffle the playlist", "jump to 45
+    # minutes", "rewind". All imperative media controls; a rare aside match only costs one LLM call.
+    "push", "watch", "shuffle", "jump", "rewind",
     # info / agent requests
     "show", "find", "search", "list", "read", "tell", "give", "make", "create", "write", "edit",
     "run", "add", "remove", "delete", "move", "copy", "send", "put", "get", "check", "look",
@@ -47,6 +51,10 @@ _COMMAND_LEADS = frozenset((
 _FILLER_LEADS = frozenset((
     "hey", "ok", "okay", "uh", "um", "well", "so", "yeah", "yes", "no", "please", "now", "just",
     "alright", "hi", "hello",
+    # B2: strip a leading "let's"/"lets" so the COMMAND after it is read ("let's play X" → play). The
+    # opener comment always intended this but the token was missing. Safe: "let's see/think" (thinking
+    # aloud) doesn't match — the following word isn't a command lead, so it still defers to the LLM.
+    "let's", "lets",
 ))
 
 # The assistant's name, for a TRAILING vocative fast-pass ("…, Arya?"). STT spells it both ways. A
@@ -232,6 +240,26 @@ def _fast_verdict(text: str) -> bool | None:
     return None
 
 
+def _classify_client_model(ctx):
+    """(client, model) for the is_addressed gate classify. Claude provider → always the Claude floor
+    (haiku). Else arya — EXCEPT in Turbo (a bad-arya day), where if a Claude backend is available the gate
+    routes to the fast haiku classifier too (closes the ~10s arya classify tax). Normal days stay on arya
+    (free). Mirrors the router's own classifier pick."""
+    from gabagent.agent.loop import _active_client
+    cfg = ctx.config
+    if cfg.provider == "claude":
+        return _active_client(ctx), cfg.claude.ladder[0].model
+    if getattr(ctx, "turbo_commands", False):
+        try:
+            from gabagent.api.factory import anthropic_configured
+            if (anthropic_configured(cfg) and (cfg.router.cross_backend or cfg.provider == "claude")
+                    and "claude" not in getattr(ctx, "degraded_backends", set())):
+                return _active_client(ctx, "claude"), cfg.claude.ladder[0].model
+        except Exception:
+            pass
+    return _active_client(ctx), cfg.router.simple_model
+
+
 async def is_addressed(ctx: AgentContext, user_text: str, wake: dict | None = None) -> tuple[bool, str]:
     """Decide whether `user_text` is directed at the assistant. Returns (addressed, via) where `via`
     is one of 'wake_only' | 'fast' | 'llm:addressed' | 'llm:aside' | 'llm:wake_only' | 'error'. Never
@@ -258,18 +286,17 @@ async def is_addressed(ctx: AgentContext, user_text: str, wake: dict | None = No
         if fast:
             return True, "fast"
     try:
-        from gabagent.agent.loop import _active_client
-        # Backend-appropriate cheap model. On the Claude backend the simple model is the ladder's bottom
-        # rung (haiku) — passing the Gab `simple_model` ("arya") to Anthropic 400s, which is caught below
-        # and silently fails OPEN, bypassing the whole filter (the LIVE 2026-06-08 Claude-backend bug:
-        # 28 asides leaked because every deferred classify errored). Mirrors turn.py's `simple` pick.
-        is_claude = ctx.config.provider == "claude"
-        model = ctx.config.claude.ladder[0].model if is_claude else ctx.config.router.simple_model
+        # Backend-appropriate cheap model + its client. On the Claude backend the simple model is the
+        # ladder's bottom rung (haiku) — passing the Gab `simple_model` ("arya") to Anthropic 400s, which
+        # is caught below and silently fails OPEN, bypassing the whole filter (the LIVE 2026-06-08
+        # Claude-backend bug: 28 asides leaked because every deferred classify errored). Mirrors turn.py's
+        # `simple` pick — and in Turbo (bad-arya day) routes this gate onto the fast haiku classifier too.
+        client, model = _classify_client_model(ctx)
         prompt = _ADDRESSED_PROMPT.format(text=user_text.strip())
         if wake_suspect:
             prompt = _WAKE_CONTEXT_HINT + prompt
         messages = [ChatMessage(role="user", content=prompt)]
-        tag = await _active_client(ctx).complete_simple(messages, model=model)
+        tag = await client.complete_simple(messages, model=model)
         if "[ASIDE]" in tag.upper() and "[ADDRESSED]" not in tag.upper():
             # Mark a wake-signal-assisted suppression distinctly from an ordinary aside, for receipt tuning.
             return False, "llm:wake_only" if wake_suspect else "llm:aside"

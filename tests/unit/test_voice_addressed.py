@@ -347,3 +347,75 @@ async def test_not_addressed_turn_closes_silently(tmp_path):
     assert sess.messages() == []                    # nothing appended to history
     assert not any(e.type == "token" for e in evs)  # no spoken reply
     assert evs and evs[-1].type == "done"           # turn closed cleanly
+
+
+# ---- B2: data-mined fast-path widening (real deferred-addressed turns, 2026-06-22) ----------------
+
+@pytest.mark.parametrize("text", [
+    "push play",
+    "push play on the movie",
+    "watch the movie",
+    "shuffle the playlist",
+    "shuffle my retro favorites playlist",
+    "jump to the 45 minute mark",
+    "rewind the movie",
+    "let's play a movie, you pick",
+    "let's watch a movie on jellyfin",
+    "let's jump to the 50 minute mark",
+    "let's pause the movie",
+    "let's close that window",
+    "let's turn the music down to 40%",
+])
+def test_fast_verdict_b2_media_verbs_and_lets_fastpass(text):
+    assert _fast_verdict(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "let's see what happens",          # thinking aloud — "see" isn't a command verb → must still defer
+    "let's think about it",
+])
+def test_fast_verdict_b2_lets_thinking_aloud_still_defers(text):
+    # The safe boundary: stripping "let's" only fast-passes when a COMMAND verb follows, never bare musing.
+    assert _fast_verdict(text) is None
+
+
+# ---- B1: Turbo routes the gate classify to the fast Claude rung (haiku), else stays on arya ----------
+
+def _ctx_turbo(tag, *, seen, turbo, cross_backend=True, anthropic=True):
+    class _GabClient:
+        backend = "gab"
+        async def complete_simple(self, messages, model=None):
+            seen.append(("gab", model)); return tag
+    class _ClaudeClient:
+        backend = "claude"
+        async def complete_simple(self, messages, model=None):
+            seen.append(("claude", model)); return tag
+    cfg = GabAgentConfig(api_key="t")
+    cfg.provider = "gab"
+    cfg.claude.api_key = "ankey" if anthropic else ""
+    cfg.router.cross_backend = cross_backend
+    return types.SimpleNamespace(
+        config=cfg, client=_GabClient(), clients={"claude": _ClaudeClient()},
+        local_mode=False, local_client=None, degraded_backends=set(),
+        turbo_commands=turbo,
+    )
+
+
+async def test_b1_turbo_routes_gate_classify_to_haiku():
+    seen: list = []
+    await is_addressed(_ctx_turbo("[ASIDE]", seen=seen, turbo=True), "some ambiguous thing")
+    assert len(seen) == 1
+    backend, model = seen[0]
+    assert backend == "claude" and model == GabAgentConfig(api_key="t").claude.ladder[0].model
+
+
+async def test_b1_no_turbo_keeps_gate_on_arya():
+    seen: list = []
+    await is_addressed(_ctx_turbo("[ASIDE]", seen=seen, turbo=False), "some ambiguous thing")
+    assert seen == [("gab", GabAgentConfig(api_key="t").router.simple_model)]
+
+
+async def test_b1_turbo_falls_back_to_arya_when_no_claude():
+    seen: list = []
+    await is_addressed(_ctx_turbo("[ASIDE]", seen=seen, turbo=True, anthropic=False), "some ambiguous thing")
+    assert seen == [("gab", GabAgentConfig(api_key="t").router.simple_model)]
