@@ -241,12 +241,20 @@ def _fast_verdict(text: str) -> bool | None:
 
 
 def _classify_client_model(ctx):
-    """(client, model) for the is_addressed gate classify. Claude provider → always the Claude floor
-    (haiku). Else arya — EXCEPT in Turbo (a bad-arya day), where if a Claude backend is available the gate
-    routes to the fast haiku classifier too (closes the ~10s arya classify tax). Normal days stay on arya
-    (free). Mirrors the router's own classifier pick."""
+    """(client, model) for the is_addressed gate classify. Exclusive/offline local mode → the local model
+    (the only one the Ollama endpoint knows). Claude provider → always the Claude floor (haiku). Else arya —
+    EXCEPT in Turbo (a bad-arya day), where if a Claude backend is available the gate routes to the fast
+    haiku classifier too (closes the ~10s arya classify tax). Normal days stay on arya (free). Mirrors the
+    router's own classifier pick."""
     from gabagent.agent.loop import _active_client
     cfg = ctx.config
+    # Exclusive/offline local mode: `_active_client(ctx)` returns the local Ollama client, which only knows
+    # `local_model`. Pairing it with the Gab `simple_model` ("arya") 404s EVERY turn (NotFoundError) — the
+    # gate then silently fails open, so the addressing filter is effectively off whenever she's on local
+    # (incl. after an offline-failover). Classify on the model that's actually loaded. (Local-as-FLOOR is
+    # unaffected: local_mode is False there, so the classify stays on the primary gab client + simple_model.)
+    if getattr(ctx, "local_mode", False) and getattr(cfg, "local_model", ""):
+        return _active_client(ctx), cfg.local_model
     if cfg.provider == "claude":
         return _active_client(ctx), cfg.claude.ladder[0].model
     if getattr(ctx, "turbo_commands", False):

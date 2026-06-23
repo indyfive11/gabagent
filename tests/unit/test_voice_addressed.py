@@ -176,6 +176,26 @@ async def test_classifier_uses_backend_appropriate_model():
     assert seen_gab == [GabAgentConfig(api_key="t").router.simple_model]
 
 
+async def test_classifier_uses_local_model_in_local_mode():
+    # LIVE 2026-06-22: in exclusive/offline local mode the gate handed the Gab simple_model ("arya") to the
+    # local Ollama client → 404 NotFoundError EVERY turn → the filter silently failed open (addressing gate
+    # off whenever she's on local, incl. after an offline-failover). Must classify on the loaded local model.
+    seen: list = []
+
+    class _Local:
+        async def complete_simple(self, messages, model=None):
+            seen.append(model)
+            return "[ASIDE]"
+
+    cfg = GabAgentConfig(api_key="t")
+    cfg.provider = "gab"
+    cfg.local_model = "devstral:24b"
+    ctx = types.SimpleNamespace(config=cfg, client=_Local(), local_mode=True, local_client=_Local())
+    addressed, via = await is_addressed(ctx, "some aside here")
+    assert seen == ["devstral:24b"]                 # classified on the local model, NOT "arya"
+    assert addressed is False and via == "llm:aside"
+
+
 async def test_is_addressed_fast_path_skips_llm():
     # An obvious command never reaches the classifier (would raise if it did).
     addressed, via = await is_addressed(_ctx("[ASIDE]", raises=True), "play Metallica")
