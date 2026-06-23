@@ -136,6 +136,31 @@ def _wake_only_likely(wake: object, threshold: float) -> bool:
     return likelihood >= threshold
 
 
+def _wake_fresh(wake: object) -> bool:
+    """Lever A: True when the front-end marked this turn as a FRESH, clean-strip wake-LED utterance — the
+    wake word led the turn and the voice side cleanly stripped the vocative, so what remains is a command
+    addressed by construction. Mutually exclusive per turn with the garble-path `bare_wake_likelihood`
+    (clean-strip => `fresh`; strip-failed => the likelihood object). The producer never sets `fresh` on an
+    in-window follow-on / aside (aside-safety stays voice-side, where the timing is observable). Defensive:
+    only a literal True fast-passes; absent/false/malformed => no fast-pass (exact current behavior)."""
+    return isinstance(wake, dict) and wake.get("fresh") is True
+
+
+def _wake_fresh_command(wake: object, user_text: str) -> bool:
+    """True when a FRESH wake-led turn carries an actual command to act on. `fresh` means the wake word led
+    the turn (vocative stripped voice-side) → addressed by construction, BUT the residual must be a real
+    command: a bare "hey aria" (or an about-her "…is annoying" the producer scores 0) must still classify,
+    not fast-pass. Prefers the producer's `residual_words` count (Rob's requested aside-safety hint); falls
+    back to the residual text the brain already holds when the count is absent/non-integer. Either way an
+    empty / zero-command residual returns False, so the fast-pass only fires on a genuine wake-led command."""
+    if not _wake_fresh(wake):
+        return False
+    rw = wake.get("residual_words")
+    if isinstance(rw, int):
+        return rw >= 1
+    return bool(user_text.strip())
+
+
 # Item C — wake-context hint, prepended to _ADDRESSED_PROMPT ONLY when the acoustic signal says this turn
 # is very likely a bare wake. Text alone can't tell a fluently mis-transcribed "Hey Aria" ("how are you?")
 # from a genuine pleasantry — the duration-dominant `bare_wake_likelihood` already gated us here; the model
@@ -243,9 +268,11 @@ def _fast_verdict(text: str) -> bool | None:
 def _classify_client_model(ctx):
     """(client, model) for the is_addressed gate classify. Exclusive/offline local mode → the local model
     (the only one the Ollama endpoint knows). Claude provider → always the Claude floor (haiku). Else arya —
-    EXCEPT in Turbo (a bad-arya day), where if a Claude backend is available the gate routes to the fast
-    haiku classifier too (closes the ~10s arya classify tax). Normal days stay on arya (free). Mirrors the
-    router's own classifier pick."""
+    EXCEPT when a Claude backend is available AND either Turbo is on (a declared bad-arya day) or the
+    persistent `voice_fast_addressing_gate` flag is set, in which case the gate routes to the fast haiku
+    classifier (closes the ~10s arya classify tax — the gate fires every turn and rode arya's cloud-latency
+    variance, the dominant felt-latency tail on the Pi). Normal days with the flag off stay on arya (free).
+    Mirrors the router's own classifier pick."""
     from gabagent.agent.loop import _active_client
     cfg = ctx.config
     # Exclusive/offline local mode: `_active_client(ctx)` returns the local Ollama client, which only knows
@@ -257,7 +284,7 @@ def _classify_client_model(ctx):
         return _active_client(ctx), cfg.local_model
     if cfg.provider == "claude":
         return _active_client(ctx), cfg.claude.ladder[0].model
-    if getattr(ctx, "turbo_commands", False):
+    if getattr(ctx, "turbo_commands", False) or getattr(cfg, "voice_fast_addressing_gate", False):
         try:
             from gabagent.api.factory import anthropic_configured
             if (anthropic_configured(cfg) and (cfg.router.cross_backend or cfg.provider == "claude")
@@ -270,13 +297,24 @@ def _classify_client_model(ctx):
 
 async def is_addressed(ctx: AgentContext, user_text: str, wake: dict | None = None) -> tuple[bool, str]:
     """Decide whether `user_text` is directed at the assistant. Returns (addressed, via) where `via`
-    is one of 'wake_only' | 'fast' | 'llm:addressed' | 'llm:aside' | 'llm:wake_only' | 'error'. Never
-    raises; fails open (addressed) so a classifier hiccup can never drop a command. `wake` is the optional
-    out-of-band acoustic wake signal (item C); absent => exact current behavior."""
+    is one of 'wake_only' | 'wake_fresh' | 'fast' | 'llm:addressed' | 'llm:aside' | 'llm:wake_only' |
+    'error'. Never raises; fails open (addressed) so a classifier hiccup can never drop a command. `wake` is
+    the optional out-of-band acoustic wake signal (item C); absent => exact current behavior."""
     # Decisive wake-only: a bare greeting / being named with no command never gets a spoken reply
     # (listen-first). Narrow by construction — every token must be ignorable — so it can't eat a command.
+    # Runs BEFORE the fresh fast-pass below, so a bare "hey aria" can never be fast-passed to addressed even
+    # if the producer were to mark it fresh.
     if _is_bare_wake(user_text):
         return False, "wake_only"
+    # Lever A: a FRESH clean-strip wake-LED turn carrying a real command is addressed by construction (the
+    # wake word led it and the voice side stripped the vocative). Fast-pass it and skip the classify ENTIRELY
+    # — no arya/haiku call at all, the cheapest possible gate, removing the per-turn classify cost on the
+    # common wake-led case (the billing mitigation for the haiku gate). `_wake_fresh_command` requires a
+    # non-zero residual (the producer's `residual_words`, else the residual text), so a bare "hey aria" or an
+    # about-her "…is annoying" still classifies — dodging wake-led false-address. Gated behind the same
+    # wake-signal consumer switch; safe-inert when the producer omits `fresh` (absent => no fast-pass).
+    if getattr(ctx.config, "voice_wake_confidence_filter", True) and _wake_fresh_command(wake, user_text):
+        return True, "wake_fresh"
     # Item C: when the voice side's acoustic signal says this turn is very likely a bare wake (a "Hey Aria"
     # the STT fluently rewrote into a question), DON'T trust the text fast-pass — "how are you" would
     # otherwise fast-pass on the question word "how". Demote to the LLM classify with a wake-context hint.
@@ -300,6 +338,10 @@ async def is_addressed(ctx: AgentContext, user_text: str, wake: dict | None = No
         # Claude-backend bug: 28 asides leaked because every deferred classify errored). Mirrors turn.py's
         # `simple` pick — and in Turbo (bad-arya day) routes this gate onto the fast haiku classifier too.
         client, model = _classify_client_model(ctx)
+        # Receipt for the gate's classifier model — lets a joint drive confirm the gate ran on the fast
+        # haiku path (vs arya) and join its latency against the `addressed` event. No-op unless voice_debug.
+        from gabagent.voice.debuglog import dlog
+        dlog(ctx, "gate_model", model=model)
         prompt = _ADDRESSED_PROMPT.format(text=user_text.strip())
         if wake_suspect:
             prompt = _WAKE_CONTEXT_HINT + prompt

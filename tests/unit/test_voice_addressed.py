@@ -323,6 +323,64 @@ async def test_high_wake_signal_does_not_override_decisive_bare_wake():
     assert addressed is False and via == "wake_only"
 
 
+# ---- Lever A: a FRESH clean-strip wake-led turn fast-passes addressed, skipping the classify entirely ----
+
+# Locked marker shape (VAC producer): fresh + residual_words (command-word count) + confidence.
+_FRESH_WAKE = {"fresh": True, "residual_words": 2, "confidence": 0.93}
+
+
+async def test_wake_fresh_fastpasses_without_any_classify():
+    # A fresh wake-led command (residual_words>=1) is addressed by construction → no LLM call (seen empty).
+    seen: list = []
+    addressed, via = await is_addressed(
+        _ctx("[ASIDE]", raises=True, seen=seen), "play some jazz", wake=_FRESH_WAKE)
+    assert addressed is True and via == "wake_fresh"
+    assert seen == []  # the classify never ran — the cheapest gate
+
+
+async def test_wake_fresh_zero_residual_words_classifies_dodging_about_her():
+    # residual_words==0 (a bare/about-her wake-led turn the producer scored 0) must NOT fast-pass on the
+    # fresh path — it falls through to normal handling. Text with no command/question lead defers to the
+    # classifier, proving the fresh fast-pass was skipped (so "Hey Aria is annoying"-type false-address
+    # is dodged by the count, not the fresh marker).
+    seen: list = []
+    addressed, via = await is_addressed(
+        _ctx("[ASIDE]", seen=seen), "the meeting ran long", wake={"fresh": True, "residual_words": 0})
+    assert via != "wake_fresh"
+    assert seen != [] and via == "llm:aside"  # fresh path skipped → reached the classifier
+
+
+async def test_wake_fresh_does_not_override_decisive_bare_wake():
+    # Safety belt: even if the producer mis-marked a bare "hey aria" fresh, _is_bare_wake wins → wake_only.
+    addressed, via = await is_addressed(
+        _ctx("[ASIDE]", raises=True), "hey aria", wake=_FRESH_WAKE)
+    assert addressed is False and via == "wake_only"
+
+
+async def test_wake_fresh_killswitch_off_falls_through_to_classify():
+    # voice_wake_confidence_filter=False disables the fresh fast-pass → the turn reaches the classifier.
+    ctx = _ctx("[ADDRESSED]")
+    ctx.config.voice_wake_confidence_filter = False
+    addressed, via = await is_addressed(ctx, "the where of it", wake=_FRESH_WAKE)
+    assert addressed is True and via == "llm:addressed"
+
+
+async def test_wake_without_fresh_marker_is_unaffected():
+    # `wake` present but no `fresh` (garble-path likelihood object) => no fast-pass; normal path.
+    addressed, via = await is_addressed(
+        _ctx("[ADDRESSED]", raises=True), "play some jazz", wake={"bare_wake_likelihood": 0.1})
+    assert addressed is True and via == "fast"
+
+
+async def test_wake_fresh_no_count_falls_back_to_residual_text():
+    # When the producer omits residual_words, the consumer falls back to the residual text it holds: a bare
+    # "hey aria" stripped to an EMPTY residual must NOT fast-pass (_is_bare_wake returns False on empty).
+    seen: list = []
+    addressed, via = await is_addressed(_ctx("[ASIDE]", seen=seen), "   ", wake={"fresh": True})
+    assert via != "wake_fresh"  # blocked the empty-residual fast-pass
+    assert addressed is False and via == "llm:aside"  # fell through to the classifier, which asided it
+
+
 # ---- turn-level: a not-addressed utterance closes silently, never reaching the LLM ----
 
 async def test_not_addressed_turn_closes_silently(tmp_path):
@@ -401,7 +459,7 @@ def test_fast_verdict_b2_lets_thinking_aloud_still_defers(text):
 
 # ---- B1: Turbo routes the gate classify to the fast Claude rung (haiku), else stays on arya ----------
 
-def _ctx_turbo(tag, *, seen, turbo, cross_backend=True, anthropic=True):
+def _ctx_turbo(tag, *, seen, turbo, cross_backend=True, anthropic=True, fast_gate=False):
     class _GabClient:
         backend = "gab"
         async def complete_simple(self, messages, model=None):
@@ -414,6 +472,7 @@ def _ctx_turbo(tag, *, seen, turbo, cross_backend=True, anthropic=True):
     cfg.provider = "gab"
     cfg.claude.api_key = "ankey" if anthropic else ""
     cfg.router.cross_backend = cross_backend
+    cfg.voice_fast_addressing_gate = fast_gate
     return types.SimpleNamespace(
         config=cfg, client=_GabClient(), clients={"claude": _ClaudeClient()},
         local_mode=False, local_client=None, degraded_backends=set(),
@@ -438,4 +497,27 @@ async def test_b1_no_turbo_keeps_gate_on_arya():
 async def test_b1_turbo_falls_back_to_arya_when_no_claude():
     seen: list = []
     await is_addressed(_ctx_turbo("[ASIDE]", seen=seen, turbo=True, anthropic=False), "some ambiguous thing")
+    assert seen == [("gab", GabAgentConfig(api_key="t").router.simple_model)]
+
+
+# ---- Lever B: voice_fast_addressing_gate routes the gate to haiku WITHOUT Turbo (every turn) ----------
+
+async def test_fast_gate_routes_to_haiku_without_turbo():
+    seen: list = []
+    await is_addressed(_ctx_turbo("[ASIDE]", seen=seen, turbo=False, fast_gate=True), "some ambiguous thing")
+    assert len(seen) == 1
+    backend, model = seen[0]
+    assert backend == "claude" and model == GabAgentConfig(api_key="t").claude.ladder[0].model
+
+
+async def test_fast_gate_off_keeps_gate_on_arya():
+    seen: list = []
+    await is_addressed(_ctx_turbo("[ASIDE]", seen=seen, turbo=False, fast_gate=False), "some ambiguous thing")
+    assert seen == [("gab", GabAgentConfig(api_key="t").router.simple_model)]
+
+
+async def test_fast_gate_falls_back_to_arya_when_no_claude():
+    seen: list = []
+    await is_addressed(
+        _ctx_turbo("[ASIDE]", seen=seen, turbo=False, fast_gate=True, anthropic=False), "some ambiguous thing")
     assert seen == [("gab", GabAgentConfig(api_key="t").router.simple_model)]

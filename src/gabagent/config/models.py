@@ -291,6 +291,14 @@ class GabAgentConfig(BaseSettings):
     # Suppression floor for `bare_wake_likelihood` (0..1). Co-tuned against dlog receipts in a joint drive;
     # the voice-side scale is monotonic so this stays meaningful. Env: GABAI_VOICE_BARE_WAKE_THRESHOLD.
     voice_bare_wake_threshold: float = 0.8
+    # Route the is_addressed gate classify to the fast Claude classifier (haiku) on EVERY turn, not just in
+    # Turbo. The gate fires on every voice turn; on arya it rides Gab cloud-latency variance and spiked to
+    # ~10s on the Pi (2026-06-23 live drive) — the dominant felt-latency tail once B(ii) skips intent_classify
+    # on most turns. Haiku bounds the gate to ~0.4-0.6s and is spike-proof (off arya's variance), with the
+    # same suppression behavior; conversation answers stay on arya. Costs one haiku classification call per
+    # turn (a billing tradeoff — hence opt-in). No-ops to arya when no Claude backend is configured/cross-
+    # enabled. Default False = historical behavior (arya gate, free). Env: GABAI_VOICE_FAST_ADDRESSING_GATE.
+    voice_fast_addressing_gate: bool = False
     # Internet-outage failover: when a voice turn's cloud LLM call fails with a CONNECTIVITY error (no
     # network / DNS failure / connect timeout — NOT a 4xx/5xx, which means the server answered), auto-fail
     # the turn over to the on-demand local model (`local_model`) so Aria still answers offline, and probe
