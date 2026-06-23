@@ -59,13 +59,21 @@ class TmiEscalator:
         except Exception:
             return 0
 
+        from gabagent.tmi.observe import tmi_log
+        room = self._room_id or "default"
         nominees = self._nominate(room_facts, tmi, ts)
         if not nominees:
+            tmi_log("escalate", room=room, nominated=[], confirmed=[], rejected=[], wrote=0)
             return 0
         confirmed = await self._judge(ctx, nominees)  # top-rung LLM, OUTSIDE the lock
-        if not confirmed:
-            return 0
-        return self._commit(confirmed, tmi, ts)
+        conf_keys = {f.key for f in confirmed}
+        wrote = self._commit(confirmed, tmi, ts) if confirmed else 0
+        tmi_log("escalate", room=room,
+                nominated=[f.text for f in nominees],
+                confirmed=[f.text for f in confirmed],
+                rejected=[f.text for f in nominees if f.key not in conf_keys],
+                wrote=wrote)
+        return wrote
 
     # -- nomination (pure) -------------------------------------------------
     def _nominate(self, facts: list[Fact], tmi, ts: float) -> list[Fact]:

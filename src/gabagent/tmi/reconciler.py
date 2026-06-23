@@ -58,23 +58,36 @@ class TmiReconciler:
                 return False
             msgs = ctx.session.messages()
             turns = [m for m in msgs if m.role in ("user", "assistant") and m.content]
-            if sum(1 for m in turns if m.role == "user") < _MIN_TURNS:
+            user_turns = sum(1 for m in turns if m.role == "user")
+            if user_turns < _MIN_TURNS:
+                from gabagent.tmi.observe import tmi_log
+                tmi_log("reconcile", room=self._room_id or "default",
+                        skipped="too_few_turns", user_turns=user_turns)
                 return False  # nothing worth consolidating
         except Exception:
             return False
 
         from gabagent.config.paths import room_dir
+        from gabagent.tmi.observe import tmi_log
         store = FactStore(room_dir(self._room_id) / "facts.jsonl")
         existing = store.load()
 
         new_lines = await self._consolidate(ctx, turns)
         if new_lines is None:
+            tmi_log("reconcile", room=self._room_id or "default", skipped="llm_failed")
             return False  # the model call failed — leave the store untouched
 
         ts = now if now is not None else time.time()
         merged = self._merge(existing, new_lines, ts)
         store.save(merged)
         self._render_index(room_dir(self._room_id) / "memory.md", merged)
+        old_keys = {f.key for f in existing}
+        new_keys = {f.key for f in merged}
+        tmi_log("reconcile", room=self._room_id or "default",
+                before=len(existing), after=len(merged),
+                added=len(new_keys - old_keys), pruned=len(old_keys - new_keys),
+                kept=len(old_keys & new_keys),
+                explicit=sum(1 for f in merged if f.explicit))
         return True
 
     # -- the LLM consolidate pass -----------------------------------------
