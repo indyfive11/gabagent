@@ -249,6 +249,15 @@ def test_looks_simple():
     assert _looks_simple("turn the volume up")
     assert not _looks_simple("can you see what is playing and unpause it")   # has 'and'
     assert not _looks_simple("please research the best approach to scaling this whole system")
+    # B(ii) widen (6→10 words): ordinary single-clause conversational/factual turns up to 10 words now
+    # skip the classify instead of paying the ~2.3s arya round-trip.
+    assert _looks_simple("what's the weather like in seattle this weekend")          # 8w, simple
+    assert _looks_simple("who played the joker in the first batman movie")          # 10w, simple
+    # ...but the two guards keep genuinely-complex turns ON the classify→escalate path:
+    assert not _looks_simple("explain how tcp differs from udp in networking")       # reasoning marker
+    assert not _looks_simple("what's the best way to structure this project")        # depth marker
+    assert not _looks_simple("play some jazz then turn the lights down")             # compound 'then'
+    assert not _looks_simple("tell me a long detailed story about a dragon and a knight in a castle")  # >10w
 
 
 async def test_escalation_announces_once_then_deescalates(home):

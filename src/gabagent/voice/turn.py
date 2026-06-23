@@ -271,15 +271,40 @@ def _voice_tool_schemas() -> list[dict]:
     ]
 
 
+# Voice fast-path width — B(ii), 2026-06-22 (Pi-latency consensus). The complexity classifier exists to
+# ESCALATE hard REASONING to a stronger rung; for a short single-clause utterance it almost always returns
+# the floor, so the ~2.3s arya classify round-trip is dead weight on the ordinary conversational/factual
+# turns that dominate a satellite. Widen 6→10 words to skip it on those, while keeping genuinely-complex
+# turns ON the classify path via two guards: a compound/multi-clause marker, and a reasoning-depth marker.
+# Failure mode is bounded + recoverable: a missed-complex turn just answers on arya (the voice design intent
+# — conversation stays on arya), and command turns carry the reactive tool-loop climb as their escalation
+# backstop, so under-escalation never strands a control command.
+_SIMPLE_MAX_WORDS = 10
+_COMPOUND_MARKERS = (" and ", " then ", " also ", " as well as ")
+_COMPLEX_MARKERS = (
+    "research", "explain", "analyze", "analyse", "compare", "design", "summarize", "summarise",
+    "best approach", "best way", "step by step", "in detail", "pros and cons", "trade-off", "tradeoff",
+    "figure out", "optimize", "optimise", "architecture", "strategy", "implications", "how do i",
+    "how would i", "why does", "why is", "what's the best", "whats the best",
+)
+
+
 def _looks_simple(text: str) -> bool:
     """Voice-only fast-path: obviously-simple utterances skip the classifier's API round-trip and run
     on the base model. Conservative — returns False (→ classify) when unsure, so genuinely complex
-    requests still escalate."""
+    requests still escalate. A turn is simple when it's short (≤_SIMPLE_MAX_WORDS), single-clause (no
+    compound marker), and carries no reasoning-depth marker."""
     t = text.strip().lower()
     if not t:
         return True
-    # Short, single-clause commands ("stop", "pause the movie", "volume up") are simple.
-    return len(t.split()) <= 6 and " and " not in f" {t} "
+    if len(t.split()) > _SIMPLE_MAX_WORDS:
+        return False
+    padded = f" {t} "
+    if any(m in padded for m in _COMPOUND_MARKERS):
+        return False
+    if any(m in t for m in _COMPLEX_MARKERS):
+        return False
+    return True
 
 
 # Loop guard: when the model keeps firing the SAME tool call with no progress (live 2026-06-20:
@@ -658,7 +683,10 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
         command_intent = looks_like_command(user_text)
         if router:
             # Re-evaluate routing EACH turn so simple follow-ups drop back to the cheap floor instead of
-            # pinning the session to a premium rung. Obvious-simple utterances skip the classifier.
+            # pinning the session to a premium rung. Obvious-simple utterances skip the classifier. One
+            # `route` dlog fires at the end with the path actually taken (via=turbo|fast|intent_classify)
+            # — `fast` means the classify round-trip was SKIPPED, which is the B(ii) latency win to measure.
+            route_via = "intent_classify"
             if (ctx.turbo_commands and command_intent and not ctx.force_model
                     and (tr := _turbo_rung(router))):
                 # Turbo Mode: on a command turn, route straight to the fast rung (Claude haiku) and SKIP
@@ -669,10 +697,14 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
                 # In Turbo, command→Claude is the NORM, so don't speak the "Switching to Claude" escalate
                 # filler on every command — mark it already-announced (real escalations still announce).
                 ctx.voice_announced_model = tr.model
-                dlog(ctx, "route", active=tr.model, effort=tr.effort or None,
-                     backend=tr.backend, via="turbo")
-            elif _looks_simple(user_text):
+                route_via = "turbo"
+            elif _looks_simple(user_text) or command_intent:
+                # Skip the classify round-trip on a simple turn OR any control command. The complexity
+                # classifier rates a short imperative as simple anyway (it escalates for reasoning, not for
+                # tool-protocol difficulty), so paying ~2.3s of arya for a command is dead weight — the
+                # reactive tool-loop climb below is the real escalation path for commands. (B(ii), 2026-06-22.)
                 ctx.active_model, ctx.active_effort, ctx.active_backend = simple, simple_effort, simple_backend
+                route_via = "fast"
             elif assembled:
                 try:
                     rung = router.rung(await router.classify_rung(
@@ -695,7 +727,7 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
                     ctx.active_model = simple
                 ctx.active_backend = "gab"
             dlog(ctx, "route", active=ctx.active_model, effort=ctx.active_effort,
-                 backend=ctx.active_backend, via="intent_classify")
+                 backend=ctx.active_backend, via=route_via)
 
         # Device/media CONTROL turns drive run_command, where a weak model fumbles the tool protocol
         # (wrong arg shape / command id) rather than the reasoning — something the complexity classifier
