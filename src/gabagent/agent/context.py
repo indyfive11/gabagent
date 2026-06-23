@@ -39,6 +39,10 @@ class AgentContext:
     pinned_model: str | None = None
     pinned_effort: str | None = None
     pinned_backend: str | None = None
+    # Turbo Mode (session-only, voice-toggled): when True, COMMAND-intent turns route to the fast rung
+    # (Claude haiku) instead of arya and skip the arya classify, while CONVERSATION turns stay on the
+    # normal rung. Distinct from force_model (a hard per-turn pin of ALL turns). "regular mode" clears it.
+    turbo_commands: bool = False
     local_client: Any = field(default=None)
     local_mode: bool = False
     local_process: Any = field(default=None)

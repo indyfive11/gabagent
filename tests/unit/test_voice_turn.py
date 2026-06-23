@@ -660,6 +660,94 @@ async def test_keepalive_disabled_when_secs_zero(home, monkeypatch):
     assert not any(e.type == "wake_hold" for e in evs)
 
 
+# -- Terminal-command confirmation: speak the tool output, skip the narration model call -------------
+
+class _TermCatalog:
+    """Catalog whose `get(cid)` returns an object carrying `.domain` and `.terminal_confirm` so the turn
+    can exercise the terminal-confirm short-circuit."""
+    def __init__(self, terminal):
+        self._terminal = set(terminal)
+    def get(self, cid):
+        if not cid:
+            return None
+        return types.SimpleNamespace(domain="media", terminal_confirm=cid in self._terminal)
+    def index(self):
+        return []
+
+
+async def test_terminal_confirm_command_skips_narration(home, monkeypatch):
+    """A terminal_confirm command speaks its own tool output and ENDS the turn — the follow-up narration
+    model call is skipped (the 2nd canned response is never consumed)."""
+    from gabagent.api.models import ToolResult
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, *a, **k):
+        return [ToolResult(output="Skipped ahead 30 seconds.") for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text, wake=None):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+    seen = []
+    monkeypatch.setattr(turn_mod, "dlog", lambda ctx, e, **k: seen.append((e, k)))
+    ctx = make_ctx(home, [
+        [[_spec("run_command", command_id="jellyfin.control", action="forward")]],
+        ["NARRATION THAT MUST NOT BE SPOKEN"],
+    ])
+    ctx.command_catalog = _TermCatalog(terminal={"jellyfin.control"})
+    evs = await run_turn(ctx, "skip ahead")
+    spoken = "".join(e.text for e in evs if e.type == "token")
+    assert "Skipped ahead 30 seconds." in spoken
+    assert "NARRATION" not in spoken                       # narration round skipped
+    assert len(ctx.client.responses) == 1                  # 2nd response never consumed → one model call
+    assert any(e == "terminal_confirm" for e, _ in seen)
+
+
+async def test_non_terminal_command_still_narrates(home, monkeypatch):
+    """A command WITHOUT terminal_confirm still goes through the model narration round (2nd call), so its
+    structured/query result gets phrased — the short-circuit must not fire."""
+    from gabagent.api.models import ToolResult
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, *a, **k):
+        return [ToolResult(output='[{"title":"Heat"}]') for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text, wake=None):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+    ctx = make_ctx(home, [
+        [[_spec("run_command", command_id="jellyfin.search", query="heat")]],
+        ["I found Heat."],
+    ])
+    ctx.command_catalog = _TermCatalog(terminal={"jellyfin.control"})   # search is NOT terminal
+    evs = await run_turn(ctx, "search for heat")
+    spoken = "".join(e.text for e in evs if e.type == "token")
+    assert "I found Heat." in spoken                        # narration round ran
+    assert len(ctx.client.responses) == 0                  # both responses consumed → two model calls
+
+
+async def test_terminal_confirm_skipped_on_tool_error(home, monkeypatch):
+    """A FAILED terminal command must NOT short-circuit — it falls through to model narration so the
+    failure is phrased naturally instead of speaking a raw/empty output."""
+    from gabagent.api.models import ToolResult
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, *a, **k):
+        return [ToolResult(output="", error="control failed") for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text, wake=None):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+    ctx = make_ctx(home, [
+        [[_spec("run_command", command_id="jellyfin.control", action="forward")]],
+        ["Sorry, I couldn't do that."],
+    ])
+    ctx.command_catalog = _TermCatalog(terminal={"jellyfin.control"})
+    evs = await run_turn(ctx, "skip ahead")
+    spoken = "".join(e.text for e in evs if e.type == "token")
+    assert "Sorry, I couldn't do that." in spoken          # error narrated by the model, not short-circuited
+    assert len(ctx.client.responses) == 0                  # both consumed → narration ran
+
+
 # -- convo_hold: release the voice conversation-hold on a TERMINAL one-shot reply (VAC Phase-2 ask) --
 
 def test_convo_hold_event_wire_shape():
@@ -813,3 +901,90 @@ async def test_voice_volume_kill_switch_suppresses_event(home, monkeypatch):
     ], voice_volume_control=False)
     evs = await run_turn(ctx, "speak up")
     assert not any(e.type == "voice_volume" for e in evs)
+
+
+# -- Turbo Mode: hybrid routing (commands → fast rung, conversation → normal), voice-toggled -----------
+
+def test_turbo_meta_command_detection():
+    """'turbo mode' family toggles ON, 'regular/normal mode' family toggles OFF, and media controls
+    (fast forward / skip) must NEVER be read as a turbo toggle."""
+    from gabagent.voice.commands import detect_meta_command as d
+    for phrase in ("go to turbo mode", "turbo mode", "turn on turbo", "speed it up", "turbo on"):
+        mc = d(phrase)
+        assert mc is not None and mc.kind == "turbo" and mc.value == "on", phrase
+    for phrase in ("regular mode", "normal mode", "turbo off", "exit turbo", "back to regular mode"):
+        mc = d(phrase)
+        assert mc is not None and mc.kind == "turbo" and mc.value == "off", phrase
+    for phrase in ("fast forward", "skip ahead", "pause the movie", "turn it up", "play some music"):
+        mc = d(phrase)
+        assert mc is None or mc.kind != "turbo", phrase
+
+
+def test_turbo_rung_picks_claude_floor_else_none():
+    """_turbo_rung returns the first Claude rung of an assembled ladder (the fast haiku floor), or None
+    when no Claude backend is available (Turbo then no-ops)."""
+    from gabagent.agent.router import ModelRouter
+    from gabagent.voice.turn import _turbo_rung
+    cfg = GabAgentConfig(api_key="gabkey")
+    cfg.claude.api_key = "ankey"
+    cfg.router.cross_backend = True
+    r = ModelRouter.assemble(cfg, local_floor=False, local_running=False)
+    tr = _turbo_rung(r)
+    assert tr is not None and tr.backend == "claude"
+    assert tr.model == cfg.claude.ladder[0].model          # the Claude floor (haiku)
+    # No Anthropic key → no Claude rung → None
+    cfg2 = GabAgentConfig(api_key="gabkey")
+    cfg2.claude.api_key = ""
+    r2 = ModelRouter.assemble(cfg2, local_floor=False, local_running=False)
+    assert _turbo_rung(r2) is None
+    assert _turbo_rung(None) is None
+
+
+async def test_turbo_toggle_sets_flag_and_confirms(home, monkeypatch):
+    """Saying 'turbo mode' flips ctx.turbo_commands on with a spoken confirm and no model call; 'regular
+    mode' flips it back."""
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [["MODEL SHOULD NOT BE CALLED"]])
+    ctx.config.claude.api_key = "ankey"
+    ctx.config.router.cross_backend = True
+    evs = await run_turn(ctx, "go to turbo mode")
+    assert ctx.turbo_commands is True
+    assert any(e.type == "token" and "Turbo mode on" in e.text for e in evs)
+    assert len(ctx.client.responses) == 1                  # FakeClient untouched — no model call
+    evs2 = await run_turn(ctx, "regular mode")
+    assert ctx.turbo_commands is False
+    assert any(e.type == "token" and "regular mode" in e.text.lower() for e in evs2)
+
+
+async def test_turbo_routes_command_to_claude_and_skips_classify(home, monkeypatch):
+    """With Turbo on, a command-intent turn routes straight to the Claude fast rung and SKIPS the arya
+    classify (route via=turbo). A conversation turn is unaffected (normal routing)."""
+    import gabagent.voice.turn as turn_mod
+    from gabagent.agent.router import ModelRouter
+    # Spy: record any classify call so we can assert Turbo skipped it.
+    calls = {"classify": 0}
+    orig = ModelRouter.classify_rung
+    async def spy_classify(self, *a, **k):
+        calls["classify"] += 1
+        return 0
+    monkeypatch.setattr(ModelRouter, "classify_rung", spy_classify)
+    seen = []
+    monkeypatch.setattr(turn_mod, "dlog", lambda ctx, e, **k: seen.append((e, k)))
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text, wake=None):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [["should not be used (gab)"]])
+    ctx.config.router.enabled = True
+    ctx.config.claude.api_key = "ankey"
+    ctx.config.router.cross_backend = True
+    ctx.turbo_commands = True
+    ctx.clients = {"claude": FakeClient([["Paused."]])}    # the turbo rung's client answers the turn
+
+    await run_turn(ctx, "pause the music")                 # command-intent
+    routes = [kw for e, kw in seen if e == "route"]
+    assert any(kw.get("via") == "turbo" and kw.get("backend") == "claude" for kw in routes)
+    assert calls["classify"] == 0                          # classify skipped on the turbo command turn
+    assert ctx.active_backend == "claude"

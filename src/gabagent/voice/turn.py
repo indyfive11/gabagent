@@ -359,6 +359,58 @@ def _is_media_command(ctx: AgentContext, cid: str | None) -> bool:
     return bool(cmd is not None and getattr(cmd, "domain", "") == "media")
 
 
+def _terminal_confirmation(ctx: AgentContext, tool_calls, results) -> str | None:
+    """If EVERY tool call this round was a run_command for a `terminal_confirm` command that SUCCEEDED,
+    return the joined spoken confirmation built from their outputs — the turn can speak it and end,
+    skipping the follow-up narration model call. Returns None when any call isn't a terminal command,
+    failed, or has no speakable output (→ fall back to model narration: errors, queries, multi-step)."""
+    cat = getattr(ctx, "command_catalog", None)
+    if cat is None or not tool_calls:
+        return None
+    parts: list[str] = []
+    for tc, result in zip(tool_calls, results):
+        if tc.name != "run_command" or not result.success:
+            return None
+        try:
+            cid = (json.loads(tc.arguments) if tc.arguments else {}).get("command_id")
+        except Exception:
+            return None
+        cmd = cat.get(cid) if cid else None
+        if cmd is None or not getattr(cmd, "terminal_confirm", False):
+            return None
+        out = (result.output or "").strip()
+        if not out:
+            return None
+        parts.append(out)
+    return " ".join(parts) if parts else None
+
+
+def _turbo_available(ctx: AgentContext) -> bool:
+    """True when Turbo can actually route commands to a faster rung — i.e. a usable Claude backend exists.
+    Mirrors assemble()'s include_claude gate so the toggle confirm is honest. (If False, Turbo no-ops:
+    nothing is faster than arya to route to.)"""
+    try:
+        from gabagent.api.factory import anthropic_configured
+        cfg = ctx.config
+        return bool(anthropic_configured(cfg)
+                    and (cfg.router.cross_backend or cfg.provider == "claude")
+                    and "claude" not in ctx.degraded_backends)
+    except Exception:
+        return False
+
+
+def _turbo_rung(router):
+    """The fast rung for Turbo: the first Claude-backend rung in the assembled ladder (the Claude floor —
+    haiku). assemble() already drops degraded/unconfigured backends, so this is guaranteed live. None when
+    there's no Claude rung (Turbo then no-ops). No hardcoded model — read from the configured ladder."""
+    if not router:
+        return None
+    for r in getattr(router, "ladder", []):
+        if getattr(r, "backend", "") == "claude":
+            return r
+    return None
+
+
 async def _emit_filtered(sfilter: SpeakableFilter, parts, emit) -> None:
     for kind, payload in parts:
         if kind == "speak":
@@ -471,6 +523,19 @@ async def _handle_meta(ctx: AgentContext, mc: commands.MetaCommand, emit) -> Non
                 eff = f" at {effort}" if effort else ""
                 await emit(events.token(
                     f"Locked to {_pin_friendly(model)}{eff} — say 'back to auto' to re-enable escalation."))
+    elif mc.kind == "turbo":
+        if mc.value == "on":
+            ctx.turbo_commands = True
+            # Honest if there's nothing faster than arya to route to (no Claude backend configured).
+            if _turbo_available(ctx):
+                await emit(events.token(
+                    "Turbo mode on — I'll run commands on the faster model and keep conversation as usual."))
+            else:
+                await emit(events.token(
+                    "Turbo mode on, but I don't have a faster model set up, so commands will run as usual."))
+        else:
+            ctx.turbo_commands = False
+            await emit(events.token("Back to regular mode."))
     elif mc.kind == "quiet":
         # "Shut up / be quiet": the brain can't mute or sleep itself (the voice layer owns that), so
         # answer with ONE short pointer instead of routing to the model — a terse line ends fast and,
@@ -587,10 +652,26 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
             simple = ctx.config.claude.ladder[0].model if is_claude else ctx.config.router.simple_model
             simple_effort = (ctx.config.claude.ladder[0].effort or None) if is_claude else None
             simple_backend = "claude" if is_claude else "gab"
+        # Command-intent (cheap regex, no API) — known before routing so Turbo can pick the fast rung and
+        # skip the classifier, and the local-floor command-escalate below can pre-bump off local.
+        from gabagent.agent.router import looks_like_command
+        command_intent = looks_like_command(user_text)
         if router:
             # Re-evaluate routing EACH turn so simple follow-ups drop back to the cheap floor instead of
             # pinning the session to a premium rung. Obvious-simple utterances skip the classifier.
-            if _looks_simple(user_text):
+            if (ctx.turbo_commands and command_intent and not ctx.force_model
+                    and (tr := _turbo_rung(router))):
+                # Turbo Mode: on a command turn, route straight to the fast rung (Claude haiku) and SKIP
+                # the arya classify entirely — both the classify and the command call were the slow arya
+                # round-trips. Conversation turns fall through to normal routing (untouched).
+                ctx.active_model, ctx.active_effort, ctx.active_backend = (
+                    tr.model, tr.effort or None, tr.backend)
+                # In Turbo, command→Claude is the NORM, so don't speak the "Switching to Claude" escalate
+                # filler on every command — mark it already-announced (real escalations still announce).
+                ctx.voice_announced_model = tr.model
+                dlog(ctx, "route", active=tr.model, effort=tr.effort or None,
+                     backend=tr.backend, via="turbo")
+            elif _looks_simple(user_text):
                 ctx.active_model, ctx.active_effort, ctx.active_backend = simple, simple_effort, simple_backend
             elif assembled:
                 try:
@@ -622,8 +703,6 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
         # sequential climb in the tool loop below: start at the floor (least escalation) and step ONE
         # rung up only on evidence of trouble. A LOCAL floor is the exception — a local model can't drive
         # tools at all, so don't waste a round discovering it; pre-bump to the first non-local rung.
-        from gabagent.agent.router import looks_like_command
-        command_intent = looks_like_command(user_text)
         if command_intent and router and assembled and ctx.active_backend == "local":
             nl = router.rung(1)  # first rung above the local floor (Aria, else Claude)
             if nl.backend != "local":
@@ -803,6 +882,20 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
                 ctx.session.append_message(
                     ChatMessage(role="tool", content=result.to_content(), tool_call_id=tc.id)
                 )
+
+            # Terminal-command confirmation (latency): when the model produced no prose of its own this
+            # round and every tool call was a `terminal_confirm` command that succeeded, the tool output
+            # IS the finished spoken line ("Skipped ahead 30 seconds.") — speak it and end the turn,
+            # skipping the follow-up narration model call (~one arya round-trip saved on every such turn).
+            # Any error / query / structured result / non-terminal command falls through to narrate as before.
+            if not text_buf:
+                confirmation = _terminal_confirmation(ctx, tool_calls, results)
+                if confirmation:
+                    await emit(events.token(confirmation))
+                    ctx.session.append_message(ChatMessage(role="assistant", content=confirmation))
+                    text_buf = confirmation
+                    dlog(ctx, "terminal_confirm", n=len(tool_calls))
+                    break
 
             # Loop guard: count this round's signatures; a repeated one means the model is stuck firing
             # the same call with no progress. Step ONE rung up (sequential, least-escalation-first) to let

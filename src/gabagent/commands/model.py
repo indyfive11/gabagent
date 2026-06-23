@@ -86,3 +86,8 @@ class Command:
     requires_confirm_surface: bool = False
     confirm_template: str = ""             # speakable confirm summary, e.g. "Play {title} in Jellyfin?"
     featured: bool = False                 # core command — seeds the in-context "hot set" (vs lookup)
+    terminal_confirm: bool = False         # True => on SUCCESS the result `output` is already the final spoken
+                                           # confirmation ("Skipped ahead 30 seconds."), so the turn can speak it
+                                           # directly and skip the follow-up narration model call. Opt-in; only
+                                           # for deterministic controls whose output is finished prose. Errors and
+                                           # structured results always fall back to model narration.

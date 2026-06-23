@@ -178,7 +178,7 @@ class JellyfinProvider:
                           "play it starting at an hour and ten minutes", "start the movie twenty minutes in"],
             ),
             Command(
-                id="jellyfin.control", domain="media", tier=1, featured=True,
+                id="jellyfin.control", domain="media", tier=1, featured=True, terminal_confirm=True,
                 summary="Control the movie — pause, resume, stop, fast-forward/rewind ±30s, jump to a specific time, enter or leave full screen, close the window, or turn the movie volume up/down",
                 backend=PyBackend(ref="gabagent.commands.providers.jellyfin:control"),
                 params=[Slot("action", "enum", True,

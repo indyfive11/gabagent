@@ -32,7 +32,7 @@ class VoiceControlProvider:
     def commands(self, ctx: AgentContext) -> list[Command]:
         return [
             Command(
-                id="voice.set_volume", domain="voice", tier=1, featured=True,
+                id="voice.set_volume", domain="voice", tier=1, featured=True, terminal_confirm=True,
                 summary="Change ARIA'S OWN speaking-voice volume — how loud YOU sound, NOT the music or "
                         "movie volume. Use this only when the user refers to your VOICE: 'lower your "
                         "voice', 'speak up', 'you're too loud/quiet', 'talk quieter'. For the music or a "

@@ -16,8 +16,8 @@ if TYPE_CHECKING:
 
 @dataclass
 class MetaCommand:
-    kind: str          # "brain" | "undo" | "query" | "forget" | "quiet" | "floor" | "pin"
-    value: str = ""    # brain: local|cloud · floor: local|aria · pin: <model[ effort]>|auto · query: … · forget: last|all
+    kind: str          # "brain" | "undo" | "query" | "forget" | "quiet" | "floor" | "pin" | "turbo"
+    value: str = ""    # brain: local|cloud · floor: local|aria · pin: <model[ effort]>|auto · query: … · forget: last|all · turbo: on|off
 
 
 # -- detection -------------------------------------------------------------
@@ -94,6 +94,26 @@ _UNPIN = re.compile(
     re.I,
 )
 
+# Turbo Mode toggle — route COMMAND turns through the fast rung (haiku) on bad-latency days, keeping
+# conversation on the normal rung. Anchored on "turbo"/"…mode" so it can NEVER swallow a media control
+# ("fast forward", "skip", "speed up the movie"). OFF is checked before ON ("turbo off" must not match ON).
+_TURBO_OFF = re.compile(
+    r"\b(?:regular|normal|standard)\s+mode\b"
+    r"|\bturbo\s+(?:mode\s+)?off\b"
+    r"|\b(?:turn\s+off|disable|exit|stop|end)\s+(?:the\s+)?turbo(?:\s+mode)?\b"
+    r"|\bout\s+of\s+turbo\b",
+    re.I,
+)
+_TURBO_ON = re.compile(
+    r"\bturbo\s+mode\b"
+    r"|\b(?:fast|speed|turbo)\s+mode\b"
+    r"|\b(?:go|switch|kick\s+(?:it\s+)?in)(?:\s+(?:to|into))?\s+turbo\b"
+    r"|\b(?:turn\s+on|enable|activate)\s+(?:the\s+)?turbo(?:\s+mode)?\b"
+    r"|\bturbo\s+on\b"
+    r"|\bneed\s+(?:more\s+)?speed\b|\bspeed\s+(?:it|things)\s+up\b",
+    re.I,
+)
+
 # Deterministic "which model am I on" — answered from brain state, never the LLM (the local
 # model can't reliably introspect its own runtime). Broadened to natural spoken variants.
 _Q_MODEL = re.compile(
@@ -157,6 +177,12 @@ def detect_meta_command(text: str) -> MetaCommand | None:
     if m:
         val = m.group("m") + (" " + m.group("e") if m.group("e") else "")
         return MetaCommand("pin", val.strip())
+    # Turbo Mode toggle (OFF before ON so "turbo off" never reads as ON). Checked before the brain/floor
+    # switches — "turbo mode" is its own directive, not a model switch.
+    if _TURBO_OFF.search(t):
+        return MetaCommand("turbo", "off")
+    if _TURBO_ON.search(t):
+        return MetaCommand("turbo", "on")
     # "use only local" / "local only" → EXCLUSIVE local (no escalation), checked before the floor.
     if _EXCLUSIVE_LOCAL.search(t):
         return MetaCommand("brain", "local")
