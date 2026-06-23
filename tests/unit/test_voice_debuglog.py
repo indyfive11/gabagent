@@ -52,8 +52,13 @@ def test_dlog_drops_none_fields(tmp_path):
     assert "error" not in e and e["ok"] is True
 
 
-async def test_media_state_logs_inventory_counts(tmp_path):
+async def test_media_state_logs_inventory_counts(tmp_path, monkeypatch):
     from gabagent.voice.ducking import media_state
+    # Stub the generic pactl local-audio provider (mpris.sources) so the count is deterministic on a host
+    # that may be playing audio during the test run.
+    async def _no_pactl(*a, **k):
+        return (1, "")
+    monkeypatch.setattr("gabagent.voice.ducking._run_pactl", _no_pactl)
     ctx = _ctx(tmp_path)
     ctx.config.tidal.enabled = False
     ctx.config.jellyfin.api_key = ""           # both providers inert → no sources

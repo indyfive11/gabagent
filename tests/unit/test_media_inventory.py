@@ -184,7 +184,12 @@ async def test_jellyfin_skips_sessions_without_nowplaying():
 # -- inventory aggregation + scoped views ---------------------------------------------------------
 
 @respx.mock
-async def test_inventory_aggregates_and_scopes():
+async def test_inventory_aggregates_and_scopes(monkeypatch):
+    # Neutralize the generic pactl-based local-audio provider (mpris.sources) so the assertion is
+    # deterministic regardless of what the host is actually playing during the test run.
+    async def _no_pactl(*a, **k):
+        return (1, "")
+    monkeypatch.setattr("gabagent.voice.ducking._run_pactl", _no_pactl)
     respx.post(RPC).mock(side_effect=_tidal_rpc("playing"))
     respx.get(BASE + "/Sessions").mock(side_effect=_sessions_resp([
         {"Id": "r", "DeviceName": "Bedroom", "RemoteEndPoint": "192.168.1.50:5000",
@@ -205,3 +210,51 @@ async def test_inventory_never_raises_on_broken_provider(monkeypatch):
     ctx = _ctx(tidal=False, jellyfin=False)
     srcs = await inventory(ctx)
     assert isinstance(srcs, list)        # disabled providers → empty, no raise
+
+
+# -- Generic local-audio detection (mpris.sources via pactl) — the browser-movie duck fix --------------
+
+_SINK_INPUTS = '''Sink Input #100
+	Corked: no
+	Mute: no
+	Volume: front-left: 65536 / 100%
+	Properties:
+		application.name = "Chromium"
+Sink Input #200
+	Corked: yes
+	Mute: no
+	Properties:
+		application.name = "Firefox"
+Sink Input #300
+	Corked: no
+	Properties:
+		application.name = "Mopidy"
+		node.name = "Mopidy"
+Sink Input #400
+	Corked: no
+	Properties:
+		gabagent.duck_exclude = "1"
+		node.name = "gabagent-tts"
+'''
+
+
+async def test_mpris_sources_detects_local_audio_excludes_tts_and_mopidy(monkeypatch):
+    """A browser/mpv/VLC stream (no dedicated provider) surfaces as a generic local source so the duck
+    fires; Aria's own TTS and the Mopidy stream (tidal models it) are excluded."""
+    from gabagent.commands.providers.mpris import PROVIDER as mpris
+    async def _pactl(*a, **k):
+        return (0, _SINK_INPUTS)
+    monkeypatch.setattr("gabagent.voice.ducking._run_pactl", _pactl)
+    srcs = await mpris.sources(_ctx())
+    assert all(s.provider == "local" and s.is_local for s in srcs)
+    states = sorted(s.state for s in srcs)
+    assert states == ["paused", "playing"]                 # Chromium playing, Firefox corked; TTS+Mopidy gone
+    assert any(s.state == "playing" and s.audible for s in srcs)   # → media_state.playing = True → duck
+
+
+async def test_mpris_sources_empty_when_no_pactl(monkeypatch):
+    from gabagent.commands.providers.mpris import PROVIDER as mpris
+    async def _no_pactl(*a, **k):
+        return (1, "")
+    monkeypatch.setattr("gabagent.voice.ducking._run_pactl", _no_pactl)
+    assert await mpris.sources(_ctx()) == []
