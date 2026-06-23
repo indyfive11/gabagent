@@ -117,6 +117,25 @@ class TidalConfig(BaseModel):
     """
     enabled: bool = True
     rpc_url: str = "http://localhost:6680/mopidy/rpc"
+    rpc_timeout: float = 0.0   # per-call RPC timeout (s); 0 ⇒ the module default (_RPC_TIMEOUT, 30s)
+
+
+class RoomMediaProfile(BaseModel):
+    """Per-room media target overrides (Phase 10 / #62). Each field overrides the corresponding GLOBAL
+    provider endpoint for ONE room (keyed by room_id in GabAgentConfig.room_media). Empty ⇒ fall through
+    to the global provider config, so a room with no profile — and any unconfigured install — behaves
+    EXACTLY as today (byte-identical). Example:
+        room_media = {"raspi": {"tidal_rpc_url": "http://192.168.1.108:6680/mopidy/rpc"}}
+    routes that room's music control AND its RPC duck to the Pi's Mopidy instead of the brain-host's."""
+    tidal_rpc_url: str = ""   # override TidalConfig.rpc_url for this room's Mopidy endpoint (unset ⇒ global)
+    tidal_rpc_timeout: float = 0.0   # override TidalConfig.rpc_timeout for this room (s); 0 ⇒ global default
+    # This room ducks its own music locally at the sink (satellite-side PipeWire belt), so the brain must
+    # NOT also duck via the Mopidy mixer-RPC. On a satellite whose Mopidy software-mixer can't be reliably
+    # ducked over RPC (e.g. the Pi — value changes but output doesn't, or a phantom-0 right after play), the
+    # brain's mixer duck is at best a no-op that mis-reports `ducked:["tidal"]` and at worst saves a 0 prior
+    # that restores the music to silence. True ⇒ the brain skips its tidal duck for this room and the
+    # satellite owns it. Default false ⇒ the brain ducks as before (EM/global byte-identical).
+    duck_local: bool = False
 
 
 class TmiConfig(BaseModel):
@@ -245,6 +264,14 @@ class GabAgentConfig(BaseSettings):
     # commands/questions skip the check; only ambiguous utterances pay a one-shot classify. Bias is
     # answer-when-unsure so it never eats a command. Env: GABAI_VOICE_INTENT_FILTER.
     voice_intent_filter: bool = True
+    # Bare-direction guard: a lone ambiguous direction word ('up'/'down'/'on'/'off') with nothing else is
+    # meaningless without a verb ('turn it up') and is a classic garbled-STT fragment — yet the LLM will
+    # happily classify it into a state-changing command (live 2026-06-23, Pi: a fragmented utterance
+    # arrived as bare 'up' → auto-ran system.volume_up on a turn the user never asked for). When the
+    # addressed utterance is exactly such a token, ask instead of acting. Explicit terse commands
+    # ('stop'/'pause'/'skip'/'next'/'mute'/'louder') are NOT bare-direction tokens and pass through.
+    # Env: GABAI_VOICE_BARE_DIRECTION_GUARD.
+    voice_bare_direction_guard: bool = True
     commands_enabled: bool = True  # voice command framework (capability discovery + run_command)
     # Hold playing music at this % cap continuously (not just on speech) so VAD can hear the user over
     # it — the speech-duck drops it deeper, then restores to this cap. 100 disables. Slide down if VAD
@@ -343,3 +370,6 @@ class GabAgentConfig(BaseSettings):
     tidal: TidalConfig = Field(default_factory=TidalConfig)
     desktop: DesktopConfig = Field(default_factory=DesktopConfig)
     tmi: TmiConfig = Field(default_factory=TmiConfig)
+    # Phase 10 / #62: per-room media-target overrides, keyed by room_id. Empty default = no override on any
+    # room = today's single-target behavior (byte-identical). Written by the future `gab detect-media` sync.
+    room_media: dict[str, RoomMediaProfile] = Field(default_factory=dict)

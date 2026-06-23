@@ -99,6 +99,49 @@ async def test_aside_emits_addressed_false_then_done(home, monkeypatch):
     assert ctx.session.messages() == []                          # not appended to history
 
 
+def test_bare_direction_pure():
+    """The classifier matches ONLY a lone bare direction word, never an explicit terse command or a
+    multi-token control phrase — so legit commands ('stop'/'pause'/'skip'/'next'/'mute'/'turn it up')
+    pass through untouched."""
+    from gabagent.voice.turn import _bare_direction
+    assert _bare_direction("up") == "up"
+    assert _bare_direction("  Up. ") == "up"          # punctuation/case/space normalized
+    assert _bare_direction("OFF") == "off"
+    for legit in ("stop", "pause", "skip", "next", "mute", "louder",
+                  "turn it up", "volume up", "up up", "on the table", ""):
+        assert _bare_direction(legit) == "", legit
+
+
+async def test_bare_direction_guard_asks_and_runs_nothing(home, monkeypatch):
+    """A lone ambiguous direction word ('up') — a classic garbled-STT fragment — must NOT auto-run a
+    state-changing command. The brain asks ('Turn what up?') and ends the turn: no model call, no
+    command, no history append. (Live 2026-06-23: bare 'up' auto-ran system.volume_up unasked.)"""
+    import gabagent.voice.addressed as addr
+    async def _addressed(ctx, text, wake=None):
+        return True, "test"                            # reach the guard (it sits after the addressed gate)
+    monkeypatch.setattr(addr, "is_addressed", _addressed)
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [["should never speak"]])     # the model must never be called
+    evs = await run_turn(ctx, "Up.")
+    assert [e.type for e in evs] == ["token", "done"]
+    assert next(e for e in evs if e.type == "token").text.lower() == "turn what up?"
+    assert ctx.session.messages() == []                # the fragment never entered history
+
+
+async def test_bare_direction_guard_off_lets_it_through(home, monkeypatch):
+    """With the guard disabled, a bare 'up' falls through to normal routing (the model is reached) —
+    proving the guard is the only thing short-circuiting it and the default is opt-out-able."""
+    import gabagent.voice.addressed as addr
+    async def _addressed(ctx, text, wake=None):
+        return True, "test"
+    monkeypatch.setattr(addr, "is_addressed", _addressed)
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [["Okay."]], voice_bare_direction_guard=False)
+    evs = await run_turn(ctx, "up")
+    assert any(e.type == "token" and e.text == "Okay." for e in evs)   # reached the (fake) model
+    assert ctx.session.messages()                                      # appended normally
+
+
 async def test_tier1_scratch_write_streams_and_writes(home):
     proj = home / "proj"
     proj.mkdir()

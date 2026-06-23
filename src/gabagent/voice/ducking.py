@@ -750,7 +750,8 @@ async def apply_ambient_cap(ctx, new_track: bool = True) -> None:
     cap = _ambient_cap(ctx)
     if cap >= 100:
         return
-    tc = getattr(ctx.config, "tidal", None)
+    from gabagent.commands.providers.tidal import resolve_tidal
+    tc = resolve_tidal(ctx)   # #62: this room's Mopidy endpoint (global when no per-room override)
     try:
         mixer = None
         if tc and getattr(tc, "enabled", False):
@@ -916,11 +917,29 @@ async def _duck_tidal_sink(ctx, on: bool, mute: bool = False, mixer_vol: int | N
         pass
 
 
+def _room_duck_local(ctx) -> bool:
+    """True when THIS room ducks its music locally at the sink (a satellite-side PipeWire belt), so the
+    brain must NOT also duck via the Mopidy mixer-RPC. #62: set room_media[<room>].duck_local for a
+    satellite whose Mopidy software-mixer can't be reliably ducked over RPC. Default false ⇒ the brain
+    ducks as before (EM / single-room / unconfigured installs byte-identical)."""
+    rid = getattr(ctx, "room_id", None)
+    if not rid:
+        return False
+    prof = (getattr(getattr(ctx, "config", None), "room_media", None) or {}).get(rid)
+    return bool(getattr(prof, "duck_local", False)) if prof is not None else False
+
+
 async def _duck_tidal(ctx, on: bool, mute: bool = False) -> bool:
-    tc = getattr(ctx.config, "tidal", None)
+    from gabagent.commands.providers.tidal import _rpc, resolve_tidal
+    # #62: a room that ducks locally at the sink owns its duck — the brain's mixer-RPC duck here is a no-op
+    # that would mis-report ducked:["tidal"] and risk saving a phantom-0 prior (restore-to-silence). Skip it
+    # entirely (both on and off) so the satellite's sink belt is the sole attenuator for this room.
+    if _room_duck_local(ctx):
+        _tidal_dlog(ctx, phase="skip_duck_local", on=on)
+        return False
+    tc = resolve_tidal(ctx)   # #62: duck this room's Mopidy over its own rpc_url (global when no override)
     if not tc or not getattr(tc, "enabled", False):
         return False
-    from gabagent.commands.providers.tidal import _rpc
     st = _state(ctx)
     try:
         if on:

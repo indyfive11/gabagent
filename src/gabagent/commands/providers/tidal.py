@@ -41,6 +41,33 @@ _RETRY_TIMEOUT = 8.0
 _PLAYBACK_CACHE_TTL = 1.5   # seconds a cached state is served before an idle refresh RPC is allowed
 
 
+def resolve_tidal(ctx):
+    """The effective TidalConfig for this turn's room (Phase 10 / #62).
+
+    Returns a per-room rpc_url override (config.room_media[ctx.room_id].tidal_rpc_url) when one is set, so
+    a room's music control AND its RPC duck both target that room's Mopidy. With no room_id, no profile, or
+    no override it returns the GLOBAL tidal config UNCHANGED — so an unconfigured install / single-room
+    brain is byte-identical to pre-#62. Returns None when tidal is unconfigured (matches the prior
+    `getattr(ctx.config, "tidal", None)` the call-sites used)."""
+    tc = getattr(getattr(ctx, "config", None), "tidal", None)
+    if tc is None:
+        return None
+    rid = getattr(ctx, "room_id", None)
+    if not rid:
+        return tc
+    prof = (getattr(ctx.config, "room_media", None) or {}).get(rid)
+    if prof is None:
+        return tc
+    overrides: dict = {}
+    url = getattr(prof, "tidal_rpc_url", "")
+    if url:
+        overrides["rpc_url"] = url
+    to = getattr(prof, "tidal_rpc_timeout", 0.0) or 0.0
+    if to > 0:
+        overrides["rpc_timeout"] = to
+    return tc.model_copy(update=overrides) if overrides else tc
+
+
 def _pb_cache(ctx) -> dict:
     c = getattr(ctx, "_tidal_playback", None)
     if c is None:
@@ -76,7 +103,7 @@ class TidalProvider:
     id = "tidal"
 
     async def detect(self, ctx: AgentContext) -> bool:
-        tc = getattr(ctx.config, "tidal", None)
+        tc = resolve_tidal(ctx)
         if not tc or not tc.enabled:
             return False
         try:
@@ -88,7 +115,7 @@ class TidalProvider:
     async def sources(self, ctx: AgentContext):
         """Mopidy/TIDAL is a single local player the brain owns — runs on this box, on the default sink.
         One owned-local audio source when something is loaded. Never raises."""
-        tc = getattr(ctx.config, "tidal", None)
+        tc = resolve_tidal(ctx)
         if not tc or not getattr(tc, "enabled", False):
             return []
         c = _pb_cache(ctx)
@@ -208,8 +235,18 @@ PROVIDER = TidalProvider()
 
 # -- JSON-RPC plumbing -----------------------------------------------------
 
-async def _rpc(tc, method: str, params: dict | None = None, timeout: float = _RPC_TIMEOUT):
+def _rpc_timeout(tc, timeout: float | None) -> float:
+    """Resolve the per-call RPC timeout: an explicit arg wins; else the (per-room-resolved) tc.rpc_timeout;
+    else the module default. Lets a slow room (e.g. a cold Pi Mopidy) carry a larger budget than EM via
+    room_media without touching the fast explicit-timeout callers (get_state/get_current_track at 2.0s)."""
+    if timeout is not None:
+        return timeout
+    return getattr(tc, "rpc_timeout", 0.0) or _RPC_TIMEOUT
+
+
+async def _rpc(tc, method: str, params: dict | None = None, timeout: float | None = None):
     """Call a Mopidy JSON-RPC method. Raises on transport/RPC error; returns `result`."""
+    timeout = _rpc_timeout(tc, timeout)
     payload: dict = {"jsonrpc": "2.0", "id": 1, "method": method}
     if params is not None:
         payload["params"] = params
@@ -234,11 +271,12 @@ def _human_err(e: Exception) -> str:
     return str(e).strip() or "it didn't respond"
 
 
-async def _rpc_resilient(tc, method: str, params: dict | None = None, timeout: float = _RPC_TIMEOUT):
+async def _rpc_resilient(tc, method: str, params: dict | None = None, timeout: float | None = None):
     """_rpc, but retry once on a timeout — TIDAL's first live-API call often warms a cache and the
     second succeeds (a direct browse then returns in ~0.5s). The retry uses a SHORT timeout
     (_RETRY_TIMEOUT): the cache is warm now, so it should return fast, and bounding it stops a second
     full 30s timeout from stacking into a ~60s dead turn."""
+    timeout = _rpc_timeout(tc, timeout)
     try:
         return await _rpc(tc, method, params, timeout)
     except Exception as e:
@@ -357,6 +395,48 @@ async def _play_uris(tc, uris: list[str], shuffle: bool = False) -> dict:
     return t
 
 
+async def _append_rest(tc, uris: list[str]) -> None:
+    """Background-append the rest of a container's tracks AFTER playback has started (see
+    _play_uris_fast_start). Best-effort and chunked: a failure here just yields a shorter queue, never a
+    failed play, and chunking lets the tracklist grow progressively (so 'next' works before the whole
+    playlist has resolved) and keeps any single add bounded."""
+    CHUNK = 20
+    for i in range(0, len(uris), CHUNK):
+        try:
+            await _rpc(tc, "core.tracklist.add", {"uris": uris[i:i + CHUNK]})
+        except Exception:
+            return  # a slow/cold resolve stalled the append — stop; what's queued already plays
+
+
+async def _play_uris_fast_start(tc, uris: list[str], shuffle: bool = False) -> dict:
+    """Like _play_uris, but start playback after queuing only the FIRST track, then append the rest in a
+    background task. A cold mopidy-tidal resolves every track against TIDAL's live API INSIDE
+    tracklist.add, so adding a whole playlist (e.g. 442 tracks on the Pi) blows the RPC timeout before
+    playback.play is ever reached (live 2026-06-23: 442 queued, state=stopped, two 'it timed out', a 97s
+    cancelled turn). Queuing one track starts music in ~one resolve; the remaining tracks stream in behind
+    it while it plays. `shuffle` is applied brain-side BEFORE the split, so playback starts on a random
+    track and the rest follow in that random order (no core.tracklist.set_random needed)."""
+    ordered = list(uris)
+    if shuffle:
+        import random
+        random.shuffle(ordered)
+    t: dict = {}
+    s = time.monotonic()
+    await _rpc(tc, "core.tracklist.clear")
+    t["clear_ms"] = int((time.monotonic() - s) * 1000)
+    s = time.monotonic()
+    await _rpc(tc, "core.tracklist.add", {"uris": ordered[:1]})
+    t["queue_ms"] = int((time.monotonic() - s) * 1000)
+    s = time.monotonic()
+    await _rpc(tc, "core.playback.play")
+    t["play_ms"] = int((time.monotonic() - s) * 1000)
+    rest = ordered[1:]
+    if rest:
+        t["deferred"] = len(rest)
+        asyncio.create_task(_append_rest(tc, rest))
+    return t
+
+
 def _play_verb(shuffle: bool) -> str:
     return "Shuffling" if shuffle else "Playing"
 
@@ -374,7 +454,7 @@ def _play_timing(ctx, **fields) -> None:
 # -- backend callables -----------------------------------------------------
 
 async def search(ctx, query="", limit=8) -> ToolResult:
-    tc = ctx.config.tidal
+    tc = resolve_tidal(ctx)
     if not query:
         return ToolResult(output="", error="nothing to search for")
     try:
@@ -404,7 +484,7 @@ async def _hold_ambient(ctx, new_track: bool = True) -> None:
 
 
 async def play(ctx, query="", uri="", album=False, playlist="", shuffle=False) -> ToolResult:
-    tc = ctx.config.tidal
+    tc = resolve_tidal(ctx)
     # Container intent: a whole album/playlist/mix, not a single track. A tidal:album/playlist/mix URI
     # plays that exact container; `album=true` with a query searches the album catalog.
     if _is_container_uri(uri):
@@ -649,7 +729,13 @@ async def _play_container(ctx, tc, query="", uri="", album=False, shuffle=False,
             expand_ms = int((time.monotonic() - _e) * 1000)
             if not uris:
                 return ToolResult(output="", error=f"that {noun} has no playable tracks")
-            timings = await _play_uris(tc, uris, shuffle=bool(shuffle))
+            # Fast-start a multi-track container: queue track 1 + play now, append the rest in the
+            # background (a cold mopidy-tidal resolving the whole queue inside one tracklist.add blows the
+            # RPC timeout — the Pi 442-track hang, 2026-06-23). A single track keeps the simple path.
+            if len(uris) > 1:
+                timings = await _play_uris_fast_start(tc, uris, shuffle=bool(shuffle))
+            else:
+                timings = await _play_uris(tc, uris, shuffle=bool(shuffle))
         except Exception as e:
             # A slow live-API call can blow the RPC timeout after Mopidy already started streaming —
             # reconcile against real playback state before calling it a failure (see _playback_started).
@@ -677,7 +763,7 @@ _TRANSPORT_RESULT = {
 async def _transport(ctx, method: str, said: str) -> ToolResult:
     try:
         async with _tidal_op(ctx, result=_TRANSPORT_RESULT.get(method)):
-            await _rpc(ctx.config.tidal, method)
+            await _rpc(resolve_tidal(ctx), method)
     except Exception as e:
         return ToolResult(output="", error=f"couldn't do that: {_human_err(e)}")
     return ToolResult(output=said)
@@ -697,7 +783,7 @@ async def _set_stream_volume(ctx, target: int) -> None:
     """Set the MUSIC stream's volume — the Mopidy software mixer AND its PipeWire sink-input — never the
     system master sink (@DEFAULT_SINK@). Targeting the master sink (as system.volume_* does) would also
     attenuate the assistant's own voice, which shares that sink. Best-effort on the sink-input."""
-    await _rpc(ctx.config.tidal, "core.mixer.set_volume", {"volume": target}, timeout=2.0)
+    await _rpc(resolve_tidal(ctx), "core.mixer.set_volume", {"volume": target}, timeout=2.0)
     try:
         # Local import to avoid a module-load cycle (ducking imports this module's _rpc), mirroring
         # _hold_ambient. The sink-input is the node the user actually hears.
@@ -753,7 +839,7 @@ async def stop(ctx) -> ToolResult:
 
 async def now_playing(ctx) -> ToolResult:
     try:
-        track = await _rpc(ctx.config.tidal, "core.playback.get_current_track")
+        track = await _rpc(resolve_tidal(ctx), "core.playback.get_current_track")
     except Exception as e:
         return ToolResult(output="", error=f"couldn't check: {_human_err(e)}")
     if not track:
@@ -804,7 +890,7 @@ async def shuffle(ctx, mode="on") -> ToolResult:
     song (the 2026-06-19 live bug). OFF turns random play off and leaves the queue order as-is.
 
     (To START a specific playlist/album shuffled from nothing, use tidal.play with shuffle=true.)"""
-    tc = ctx.config.tidal
+    tc = resolve_tidal(ctx)
     m = (mode or "on").strip().lower()
     try:
         if m in _SHUFFLE_TOGGLE_WORDS:
@@ -843,7 +929,7 @@ async def _load_playlists(tc) -> list[dict]:
 
 async def playlists(ctx) -> ToolResult:
     """The user's saved TIDAL playlists. Play one by passing its uri to tidal.play."""
-    tc = ctx.config.tidal
+    tc = resolve_tidal(ctx)
     try:
         pls = await _load_playlists(tc)
     except Exception as e:
@@ -860,7 +946,7 @@ _RECO_NODES = ("tidal:my_mixes", "tidal:for_you", "tidal:home")
 
 async def recommendations(ctx) -> ToolResult:
     """Personalized mixes / recommendations. Play one by passing its uri to tidal.play."""
-    tc = ctx.config.tidal
+    tc = resolve_tidal(ctx)
     for node in _RECO_NODES:
         try:
             refs = await _rpc(tc, "core.library.browse", {"uri": node})

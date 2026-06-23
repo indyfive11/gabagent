@@ -244,10 +244,14 @@ async def test_play_album_searches_expands_and_queues_all():
     respx.post(RPC).mock(side_effect=resp)
     res = await td.play(_ctx(), query="Dizzy Up the Girl", album=True)
     assert res.success and "album" in res.output.lower() and "Dizzy Up the Girl" in res.output
+    # Fast-start: queue ONLY track 1 + play synchronously; append the rest in the background.
     methods = [m for m, _ in seen]
-    assert methods == ["core.library.search", "core.library.lookup",
-                       "core.tracklist.clear", "core.tracklist.add", "core.playback.play"]
-    assert ("core.tracklist.add", {"uris": ["tidal:track:1", "tidal:track:2"]}) in seen
+    assert methods[:5] == ["core.library.search", "core.library.lookup",
+                           "core.tracklist.clear", "core.tracklist.add", "core.playback.play"]
+    assert ("core.tracklist.add", {"uris": ["tidal:track:1"]}) in seen
+    await asyncio.sleep(0.1)   # let the background append run
+    queued = [p["uris"] for m, p in seen if m == "core.tracklist.add"]
+    assert [u for chunk in queued for u in chunk] == ["tidal:track:1", "tidal:track:2"]  # all, in order
 
 
 @respx.mock
@@ -378,17 +382,22 @@ async def test_play_playlist_uri_expands_via_get_items():
     respx.post(RPC).mock(side_effect=resp)
     res = await td.play(_ctx(), uri="tidal:playlist:a")
     assert res.success and "playlist" in res.output.lower()
+    # Fast-start: expand, queue track 1 + play now, append the rest in the background.
     methods = [m for m, _ in seen]
-    assert methods == ["core.playlists.get_items", "core.tracklist.clear",
-                       "core.tracklist.add", "core.playback.play"]
-    assert ("core.tracklist.add", {"uris": ["tidal:track:1", "tidal:track:2"]}) in seen
+    assert methods[:4] == ["core.playlists.get_items", "core.tracklist.clear",
+                           "core.tracklist.add", "core.playback.play"]
+    assert ("core.tracklist.add", {"uris": ["tidal:track:1"]}) in seen
+    await asyncio.sleep(0.1)
+    queued = [p["uris"] for m, p in seen if m == "core.tracklist.add"]
+    assert [u for chunk in queued for u in chunk] == ["tidal:track:1", "tidal:track:2"]
 
 
 @respx.mock
 async def test_play_playlist_shuffle_reorders_before_play():
-    # tidal.play with shuffle=true randomizes the queued order (core.tracklist.shuffle) AND turns on
-    # random play BEFORE core.playback.play, so a "shuffle my playlist" starts on a random track instead
-    # of always track 1 (the 2026-06-19 live bug). The output reads "Shuffling …".
+    # tidal.play with shuffle=true randomizes the order so a "shuffle my playlist" starts on a random
+    # track instead of always track 1 (the 2026-06-19 live bug). Fast-start does this BRAIN-side: the
+    # expanded URIs are shuffled before the split, so track-1-played is random and the rest follow in
+    # that order — no core.tracklist.shuffle/set_random RPCs needed. Output reads "Shuffling …".
     seen = []
 
     def resp(request):
@@ -399,12 +408,13 @@ async def test_play_playlist_shuffle_reorders_before_play():
     respx.post(RPC).mock(side_effect=resp)
     res = await td.play(_ctx(), uri="tidal:playlist:a", shuffle=True)
     assert res.success and res.output.lower().startswith("shuffling")
+    await asyncio.sleep(0.1)
     methods = [m for m, _ in seen]
-    assert methods == ["core.playlists.get_items", "core.tracklist.clear", "core.tracklist.add",
-                       "core.tracklist.shuffle", "core.tracklist.set_random", "core.playback.play"]
-    # the reorder happens AFTER queueing but BEFORE play
-    assert methods.index("core.tracklist.shuffle") < methods.index("core.playback.play")
-    assert ("core.tracklist.set_random", {"value": True}) in seen
+    # brain-side shuffle ⇒ no Mopidy reorder RPCs; playback still starts and all tracks get queued.
+    assert "core.tracklist.shuffle" not in methods and "core.tracklist.set_random" not in methods
+    assert "core.playback.play" in methods
+    queued = [u for m, p in seen if m == "core.tracklist.add" for u in p["uris"]]
+    assert sorted(queued) == ["tidal:track:1", "tidal:track:2"]
 
 
 @respx.mock
@@ -740,12 +750,15 @@ async def test_play_named_playlist_queues_whole_playlist_and_names_it():
     respx.post(RPC).mock(side_effect=resp)
     res = await td.play(_ctx(), query="James", playlist=True)
     assert res.success and "Jaymes" in res.output
+    # resolved the name (as_list), expanded (get_items), fast-started (queue track 1 + play), then
+    # background-appended the rest — the whole playlist still ends up queued and naming is unchanged.
     methods = [m for m, _ in seen]
-    # resolved the name (as_list), expanded the playlist (get_items), queued ALL tracks, played
-    assert methods == ["core.playlists.as_list", "core.playlists.get_items",
-                       "core.tracklist.clear", "core.tracklist.add", "core.playback.play"]
-    assert ("core.tracklist.add",
-            {"uris": ["tidal:track:1", "tidal:track:2", "tidal:track:3"]}) in seen
+    assert methods[:5] == ["core.playlists.as_list", "core.playlists.get_items",
+                           "core.tracklist.clear", "core.tracklist.add", "core.playback.play"]
+    assert ("core.tracklist.add", {"uris": ["tidal:track:1"]}) in seen
+    await asyncio.sleep(0.1)
+    queued = [u for m, p in seen if m == "core.tracklist.add" for u in p["uris"]]
+    assert queued == ["tidal:track:1", "tidal:track:2", "tidal:track:3"]
 
 
 @respx.mock
@@ -797,8 +810,9 @@ async def test_play_named_playlist_shuffle_reorders():
     respx.post(RPC).mock(side_effect=resp)
     res = await td.play(_ctx(), query="Retro Favorites", playlist=True, shuffle=True)
     assert res.success and res.output.lower().startswith("shuffling")
-    assert "core.tracklist.shuffle" in seen
-    assert seen.index("core.tracklist.shuffle") < seen.index("core.playback.play")
+    await asyncio.sleep(0.1)
+    # brain-side shuffle (no Mopidy reorder RPC); playback started and all tracks queued.
+    assert "core.tracklist.shuffle" not in seen and "core.playback.play" in seen
 
 
 @respx.mock
@@ -908,3 +922,51 @@ async def test_play_bare_name_ambiguous_playlist_does_not_redirect():
     res = await td.play(_ctx(), query="Foreigner")
     assert res.success and "So What" in res.output        # fell through to the track search
     assert "core.playlists.get_items" not in seen         # did NOT play a playlist on the near-tie
+
+
+# -- #1 fast-start: queue track 1 + play now, background-append the rest -----
+
+@respx.mock
+async def test_fast_start_queues_one_plays_then_appends_rest():
+    """_play_uris_fast_start starts playback after queuing ONLY the first track, then appends the rest
+    in the background — so a cold mopidy-tidal can't blow the RPC timeout resolving a whole playlist
+    inside one tracklist.add before playback.play is reached (the Pi 442-track hang, 2026-06-23)."""
+    seen = []
+
+    def resp(request):
+        body = json.loads(request.content); seen.append((body["method"], body.get("params")))
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": None})
+
+    respx.post(RPC).mock(side_effect=resp)
+    uris = [f"tidal:track:{i}" for i in range(1, 26)]   # 25 → 1 synchronous + 24 deferred (20+4 chunks)
+    tc = _ctx().config.tidal
+    timings = await td._play_uris_fast_start(tc, uris)
+    # synchronously: clear → add(track 1 only) → play. The other 24 are NOT queued yet.
+    sync = [(m, p) for m, p in seen]
+    assert sync == [("core.tracklist.clear", None),
+                    ("core.tracklist.add", {"uris": ["tidal:track:1"]}),
+                    ("core.playback.play", None)]
+    assert timings["deferred"] == 24
+    await asyncio.sleep(0.1)                            # let the background append run
+    queued = [u for m, p in seen if m == "core.tracklist.add" for u in p["uris"]]
+    assert queued == uris                              # all 25, original order, chunked
+    # the deferred adds came in bounded chunks (20 then 4), not one giant add
+    chunk_sizes = [len(p["uris"]) for m, p in seen if m == "core.tracklist.add"]
+    assert chunk_sizes == [1, 20, 4]
+
+
+@respx.mock
+async def test_fast_start_single_track_keeps_simple_path():
+    """A single-track container uses the plain _play_uris (one resolve is already fast — no deferral)."""
+    seen = []
+
+    def resp(request):
+        body = json.loads(request.content); seen.append(body["method"])
+        result = {"core.playlists.get_items": [{"uri": "tidal:track:1"}]}.get(body["method"])
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    respx.post(RPC).mock(side_effect=resp)
+    res = await td.play(_ctx(), uri="tidal:playlist:solo")
+    assert res.success
+    assert seen == ["core.playlists.get_items", "core.tracklist.clear",
+                    "core.tracklist.add", "core.playback.play"]

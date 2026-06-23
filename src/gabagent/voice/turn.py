@@ -436,6 +436,20 @@ def _turbo_rung(router):
     return None
 
 
+# A lone ambiguous direction word: meaningless as a command without a verb ('turn it UP'). STT clips an
+# utterance down to one of these and the LLM then guesses it into a state-changing command ('up' →
+# system.volume_up, live 2026-06-23). Bare, it should ask, not act. Deliberately excludes explicit terse
+# commands ('stop'/'pause'/'skip'/'next'/'mute'/'louder'/'resume'), which are unambiguous on their own.
+_BARE_DIRECTION = {"up", "down", "on", "off"}
+
+
+def _bare_direction(user_text: str) -> str:
+    """The bare direction word if the WHOLE utterance is exactly one ('up'/'down'/'on'/'off', any case,
+    with surrounding punctuation/space), else ''. 'turn it up' / 'volume up' (multi-token) → '' (untouched)."""
+    norm = (user_text or "").strip().lower().strip(".,!?;:-—…\"' ").strip()
+    return norm if norm in _BARE_DIRECTION else ""
+
+
 async def _emit_filtered(sfilter: SpeakableFilter, parts, emit) -> None:
     for kind, payload in parts:
         if kind == "speak":
@@ -650,6 +664,19 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
                 # 18% on ambient speech — the bug Rob dictated 2026-06-14). Emitted only on suppression;
                 # the client treats addressed:true as a no-op. This is the earliest possible point.
                 await emit(events.addressed(False))
+                await emit(events.done())
+                return
+
+        # Bare-direction guard: a lone ambiguous direction word ('up'/'down'/'on'/'off') is a classic
+        # garbled-STT fragment that the LLM will otherwise classify into a state-changing command (live
+        # 2026-06-23: a fragmented utterance reached the brain as bare 'up' → auto-ran system.volume_up
+        # on an unasked turn). Ask instead of acting — and end the turn here so NO command runs and the
+        # fragment never enters history. A question reply (ends '?') keeps the mic open for the answer.
+        if getattr(ctx.config, "voice_bare_direction_guard", True):
+            _bare = _bare_direction(user_text)
+            if _bare:
+                dlog(ctx, "bare_direction_guard", word=_bare)
+                await emit(events.token(f"Turn what {_bare}?"))
                 await emit(events.done())
                 return
 
