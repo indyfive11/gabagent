@@ -221,6 +221,32 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
     except Exception:
         pass
 
+    # Surface any builder jobs that finished while we were away (phase-0 text-first delivery).
+    try:
+        from gabagent.builder import store as _builder_store
+        from rich.panel import Panel
+        finished = _builder_store.undelivered_done()
+        if finished:
+            for job in finished:
+                if not ctx.headless:
+                    console.print(Panel(
+                        job.get("summary") or f"Job {job['id']}: {job.get('status')}",
+                        title=f"[bold green]⚒ Builder [{job.get('status')}][/bold green]",
+                        border_style="green",
+                        padding=(0, 1),
+                        width=min(80, console.width - 2),
+                    ))
+                _builder_store.update_job(job["id"], delivered=True)
+            combined = "\n\n".join(
+                j.get("summary") or f"Job {j['id']}: {j.get('status')}" for j in finished
+            )
+            ctx.session.append_message(ChatMessage(
+                role="system",
+                content=f"Builder results that completed since the last session:\n\n{combined}",
+            ))
+    except Exception:
+        pass
+
     if initial_prompt:
         ctx.session.append_message(ChatMessage(role="user", content=initial_prompt))
 

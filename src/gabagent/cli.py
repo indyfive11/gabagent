@@ -478,6 +478,10 @@ def _register_tools() -> None:
     except ImportError:
         pass
     try:
+        import gabagent.tools.builder_tool  # noqa: F401
+    except ImportError:
+        pass
+    try:
         import gabagent.tools.postmortem_tool  # noqa: F401
     except ImportError:
         pass
