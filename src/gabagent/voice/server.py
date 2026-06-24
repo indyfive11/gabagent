@@ -208,6 +208,24 @@ def build_app(ctx: AgentContext):
         return JSONResponse(await duck_media(
             ctx, bool(body.get("on")), session_id=body.get("session_id"), mute=bool(body.get("mute"))))
 
+    async def builder_poll(request):
+        # The steady, SLEEP-INDEPENDENT proactive channel (phase 2): the voice side polls this on a fixed
+        # cadence regardless of media/sleep to drain deferred spoken announcements (builder results, timer
+        # rings, future nudges) — see voice/announce_store.py. Deliberately NOT the /media/state duck poll
+        # (that GET is provider-neutral and dead when asleep; this one carries builder payloads and must run
+        # while asleep). Two-phase, liveness-leased delivery: `session_id` is the poller's identity (claims
+        # are renewed by continued polling, never a speak-deadline); `ack=<job_id>[,<id2>]` finalizes items
+        # the caller just spoke (piggybacked on the next poll — no separate endpoint). Named /builder/poll
+        # by consensus though it carries timer rings too: it is the general deferred-announce channel.
+        from gabagent.voice import announce_store
+        session_id = request.query_params.get("session_id", "") or ""
+        for jid in (request.query_params.get("ack", "") or "").split(","):
+            jid = jid.strip()
+            if jid:
+                announce_store.ack(jid)
+        lease = float(getattr(ctx.config, "voice_announce_lease_secs", announce_store.DEFAULT_LEASE_SECS))
+        return JSONResponse({"deferred": announce_store.poll(session_id, lease_secs=lease)})
+
     async def media_state(request):
         # Read-only: lets the voice client's duck-timing skip ducking when nothing's playing.
         # PROTOCOL INVARIANT: this response (like every event/endpoint here) stays brain-agnostic —
@@ -241,6 +259,7 @@ def build_app(ctx: AgentContext):
         Route("/cancel", cancel, methods=["POST"]),
         Route("/media/duck", media_duck, methods=["POST"]),
         Route("/media/state", media_state, methods=["GET"]),
+        Route("/builder/poll", builder_poll, methods=["GET"]),
     ], middleware=middleware)
     app.state.sessions = sessions
     return app

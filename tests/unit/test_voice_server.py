@@ -87,6 +87,32 @@ async def test_health(tmp_path):
         assert r.json() == {"status": "ok", "mode": "voice"}
 
 
+async def test_builder_poll_drains_and_acks(tmp_path, monkeypatch):
+    # The proactive channel endpoint: a GET drains deferred announcements for the polling session, and a
+    # piggybacked ?ack= finalizes a previously-spoken item. (Redirect XDG so the store writes under tmp.)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    from gabagent.voice import announce_store
+    announce_store.enqueue("Builder job done.", job_id="b1", source="builder")
+    app = build_app(make_ctx(tmp_path, []))
+    async with _client(app) as client:
+        r = await client.get("/builder/poll", params={"session_id": "s1"})
+        assert r.status_code == 200
+        assert r.json()["deferred"] == [{"job_id": "b1", "text": "Builder job done."}]
+        # Ack on the next poll removes it; nothing left to deliver.
+        r2 = await client.get("/builder/poll", params={"session_id": "s1", "ack": "b1"})
+        assert r2.json()["deferred"] == []
+        assert announce_store.pending() == []
+
+
+async def test_builder_poll_is_bearer_guarded(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    ctx = make_ctx(tmp_path, [])
+    ctx.config.voice_auth_token = "tok"
+    app = build_app(ctx)
+    async with _client(app) as client:
+        assert (await client.get("/builder/poll", params={"session_id": "s"})).status_code == 401
+
+
 async def test_respond_logs_received_marker_and_turn_lifecycle(tmp_path):
     # The `respond_recv` marker (fires even on a busy 409) + turn_start/turn_done bracket every turn, so a
     # future freeze is localised: no respond_recv after a wake = voice never reached us; turn_start with no

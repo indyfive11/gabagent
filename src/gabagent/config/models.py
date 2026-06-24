@@ -359,6 +359,14 @@ class GabAgentConfig(BaseSettings):
     # a looser backstop costs little — and the crash-net stays honest (no TTS → no refresh → fires on real silence).
     # Env: GABAI_DUCK_WATCHDOG_SECS.
     duck_watchdog_secs: int = 20
+    # Liveness gone-timeout for the deferred-announce channel (voice/announce_store.py, the GET /builder/poll
+    # proactive channel). An announcement claimed by a polling device is held while that device keeps polling;
+    # it reverts to free-for-all only after this many seconds with NO poll from the claimer (≈ a few missed
+    # poll cycles ⇒ the device is gone/shut down). Also the originating-first fallback grace. NOT a speak-
+    # deadline: the voice floor can stay closed indefinitely while asleep, so delivery must key on poller
+    # liveness, never on elapsed time-since-ready. Default comfortably exceeds the ~1.5s voice poll cadence.
+    # Env: GABAI_VOICE_ANNOUNCE_LEASE_SECS.
+    voice_announce_lease_secs: float = 8.0
     # This machine's friendly name, used to tag media sources as LOCAL vs on another device/room (e.g.
     # "EndeavorMain"). Empty → defaults to the hostname at use. The brain only AUTO-ducks/controls media it
     # judges local to this device; remote sources are visible (for future explicit control) but never touched

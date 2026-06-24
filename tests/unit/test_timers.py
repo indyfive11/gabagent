@@ -58,6 +58,32 @@ def test_join_phrase():
     assert t.join_phrase(["a", "b", "c"]) == "a, b, and c"
 
 
+# -- ring phrasing + proactive-channel delivery -----------------------------
+
+def test_ring_phrase():
+    vs = VoiceSession("s", None)
+    labelled = t.add_timer(vs, 600, "pasta", now=0.0)
+    bare = t.add_timer(vs, 90, None, now=0.0)
+    assert t.ring_phrase(labelled) == "Your pasta timer is up — that was 10 minutes."
+    assert t.ring_phrase(bare) == "Your 1 minute 30 seconds timer is up."
+
+
+async def test_fire_due_enqueues_ring_onto_announce_channel(tmp_path, monkeypatch):
+    # A fired timer now lands a spoken ring on the deferred-announce channel (the phase-2 unblock), keyed
+    # to its owning session for originating-first delivery.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    from gabagent.voice import announce_store
+    vs = VoiceSession("kitchen", None)
+    t.add_timer(vs, 60, "eggs", now=0.0)
+    sessions = {"kitchen": vs}
+    fired = await t.fire_due(_ctx(vs), sessions, now=100.0)
+    assert [x.label for x in fired] == ["eggs"]
+    # The originating session drains it; a foreign session within the grace does not.
+    assert announce_store.poll("office", now=101.0, lease_secs=5.0) == []
+    out = announce_store.poll("kitchen", now=101.0, lease_secs=5.0)
+    assert len(out) == 1 and "eggs timer is up" in out[0]["text"]
+
+
 # -- state helpers ----------------------------------------------------------
 
 def test_add_timer_unique_ids_and_expiry():
@@ -178,7 +204,10 @@ async def test_cancel_backend_messages():
 
 # -- firing (the ticker's per-tick unit) ------------------------------------
 
-async def test_fire_due_pops_and_returns():
+async def test_fire_due_pops_and_returns(tmp_path, monkeypatch):
+    # fire_due now enqueues a ring onto the disk-backed announce store — redirect XDG so it writes under
+    # tmp, never the real ~/.local/share/gabagent/announce (a leak there floods the live voice side).
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     vs = VoiceSession("s", None)
     t.add_timer(vs, 10, "a", now=0.0)
     t.add_timer(vs, 30, "b", now=0.0)
@@ -191,7 +220,8 @@ async def test_fire_due_pops_and_returns():
     assert [x.label for x in t.active(vs)] == ["b"]           # b still pending
 
 
-async def test_fire_due_across_sessions():
+async def test_fire_due_across_sessions(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))  # isolate the announce-store write
     v1, v2 = VoiceSession("s1", None), VoiceSession("s2", None)
     t.add_timer(v1, 10, "a", now=0.0)
     t.add_timer(v2, 10, "b", now=0.0)

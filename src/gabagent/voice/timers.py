@@ -140,6 +140,14 @@ def human(secs: int) -> str:
     return " ".join(parts) or "0 seconds"
 
 
+def ring_phrase(t: Timer) -> str:
+    """Speakable line for a fired timer — verbatim text the deferred-announce channel will voice."""
+    dur = human(t.set_secs)
+    if t.label:
+        return f"Your {t.label} timer is up — that was {dur}."
+    return f"Your {dur} timer is up."
+
+
 def join_phrase(parts: list[str]) -> str:
     """'a' | 'a and b' | 'a, b, and c'."""
     if not parts:
@@ -154,24 +162,29 @@ def join_phrase(parts: list[str]) -> str:
 # -- firing -----------------------------------------------------------------
 
 async def fire_due(ctx: Any, sessions: dict, now: float | None = None) -> list[Timer]:
-    """Scan every session, fire (pop + dlog) any due timers. Returns the fired timers.
-
-    DELIVERY HELD: dlog only — no voice-side push yet (see module docstring). Returns the list
-    so the eventual proactive-channel wiring (and tests) have the fired set."""
+    """Scan every session, fire any due timers: dlog them AND enqueue a spoken ring onto the deferred-
+    announce channel (voice/announce_store.py — the steady, sleep-independent brain→voice channel that
+    finally makes a timer audible). The ring prefers its owning session (originating-first), but the
+    liveness-leased store delivers it to whatever Rob device is present. Returns the fired timers."""
     now = time.time() if now is None else now
     from gabagent.voice.debuglog import dlog
+    from gabagent.voice import announce_store
 
     fired: list[Timer] = []
     for vs in list(sessions.values()):
+        sid = getattr(vs, "session_id", "") or ""
         for t in pop_due(vs, now):
-            dlog(
-                ctx,
-                "timer_fired",
-                session=getattr(vs, "session_id", ""),
-                id=t.id,
-                label=t.label or "",
-                set_secs=t.set_secs,
-            )
+            dlog(ctx, "timer_fired", session=sid, id=t.id, label=t.label or "", set_secs=t.set_secs)
+            try:
+                announce_store.enqueue(
+                    ring_phrase(t),
+                    job_id=f"timer-{sid}-{t.id}-{int(t.expires_epoch)}",
+                    source="timer",
+                    preferred_session=sid or None,
+                    now=now,
+                )
+            except Exception:  # a store hiccup must never kill the tick loop
+                pass
             fired.append(t)
     return fired
 
