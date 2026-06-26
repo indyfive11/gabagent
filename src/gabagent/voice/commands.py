@@ -16,8 +16,9 @@ if TYPE_CHECKING:
 
 @dataclass
 class MetaCommand:
-    kind: str          # "brain" | "undo" | "query" | "forget" | "quiet" | "floor" | "pin" | "turbo"
-    value: str = ""    # brain: local|cloud · floor: local|aria · pin: <model[ effort]>|auto · query: … · forget: last|all · turbo: on|off
+    kind: str          # "brain" | "undo" | "query" | "forget" | "quiet" | "floor" | "pin" | "turbo" | "builder"
+    value: str = ""    # brain: local|cloud · floor: local|aria · pin: <model[ effort]>|auto · query: … · forget: last|all · turbo: on|off · builder: <verb>
+    arg: str = ""      # builder: the project name / target argument (empty for verbs that take none)
 
 
 # -- detection -------------------------------------------------------------
@@ -170,6 +171,12 @@ _FORGET_ALL = re.compile(r"\b(?:everything|all(?:\s+of\s+it)?|your\s+memory|memo
 
 def detect_meta_command(text: str) -> MetaCommand | None:
     t = text.strip()
+    # Builder VUI verbs first — tightly anchored on "builder"/"build"/"graduate", so they win over the
+    # generic switch/query patterns ("switch builder to X" must not read as a brain switch).
+    from gabagent.builder import vui
+    b = vui.detect(t)
+    if b is not None:
+        return b
     # Model pin / unpin are checked BEFORE the exclusive switch ("just use aria" = pin, not switch).
     if _UNPIN.search(t):
         return MetaCommand("pin", "auto")
