@@ -98,6 +98,46 @@ def test_postmortem_log_is_tier1_internal(home):
     assert tier_of("postmortem_log", {"title": "x", "description": "y"}, home, _cfg()) == 1
 
 
+def test_send_to_builder_default_is_keyboard(home):
+    # No allow-list configured (default) ⇒ every dispatch stays keyboard-gated (Tier 3).
+    cfg = _cfg()
+    assert tier_of("send_to_builder", {"task": "x", "project": str(home / "proj")}, home, cfg) == 3
+    # project omitted ⇒ falls back to cwd, still gated when cwd isn't allow-listed.
+    assert tier_of("send_to_builder", {"task": "x"}, home / "proj", cfg) == 3
+
+
+def test_send_to_builder_inside_allowed_root_is_auto(home):
+    # A target inside an allow-listed root auto-runs (Tier 1) — the graduate-a-folder guardrail.
+    cfg = _cfg()
+    cfg.builder_allowed_roots = [str(home / "builds")]
+    root = home / "builds"
+    assert tier_of("send_to_builder", {"task": "x", "project": str(root)}, home, cfg) == 1            # the root itself
+    assert tier_of("send_to_builder", {"task": "x", "project": str(root / "proj-a")}, home, cfg) == 1  # a subdir
+    # project omitted ⇒ cwd is the target; cwd inside the root ⇒ auto.
+    assert tier_of("send_to_builder", {"task": "x"}, root / "proj-b", cfg) == 1
+
+
+def test_send_to_builder_outside_allowed_root_is_keyboard(home):
+    # A target outside every allow-listed root stays keyboard-gated (fail-safe).
+    cfg = _cfg()
+    cfg.builder_allowed_roots = [str(home / "builds")]
+    assert tier_of("send_to_builder", {"task": "x", "project": str(home / "elsewhere")}, home, cfg) == 3
+
+
+def test_check_builder_is_tier1_read(home):
+    # Reporting builder status/results is a read — must never keyboard-confirm.
+    assert tier_of("check_builder", {}, home, _cfg()) == 1
+    assert tier_of("check_builder", {"job_id": "x"}, home, _cfg()) == 1
+
+
+def test_manage_builder_tiers_by_action(home):
+    cfg = _cfg()
+    for a in ("list", "switch", "new", "status", "working", "help"):
+        assert tier_of("manage_builder", {"action": a}, home, cfg) == 1
+    for a in ("graduate", "cancel", "discard"):
+        assert tier_of("manage_builder", {"action": a}, home, cfg) == 2
+
+
 def test_memory_is_tier1_low_friction(home):
     # The agent's own project memory: reading is a read, writing is reversible ("forget that").
     cfg = _cfg()

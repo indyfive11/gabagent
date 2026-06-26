@@ -244,6 +244,19 @@ class GabAgentConfig(BaseSettings):
     # carries the same token in its .env). Env: GABAI_VOICE_AUTH_TOKEN.
     voice_auth_token: str = ""
     voice_safe_zones: list[str] = Field(default_factory=list)
+    # Builder auto-run guardrail: directory roots inside which `send_to_builder` may dispatch WITHOUT a
+    # keyboard confirm (Tier 1). A target outside every root stays keyboard-gated (fail-safe). Empty
+    # (default) ⇒ no folder auto-approved ⇒ unchanged confirm-everywhere behavior. The user graduates a
+    # folder into this list once they trust the build there. Env: GABAI_BUILDER_ALLOWED_ROOTS.
+    builder_allowed_roots: list[str] = Field(default_factory=list)
+    # Builder sandbox: parent dir for throwaway/new builder projects ("new builder project called X" →
+    # <root>/X). A path-less `send_to_builder` lands here. Empty (default) ⇒ no sandbox; a path-less
+    # dispatch falls back to the cwd (legacy). Set to e.g. ~/builder. Env: GABAI_BUILDER_SCRATCH_ROOT.
+    builder_scratch_root: str = ""
+    # Builder graduation target: parent dir a matured project is promoted into ("graduate it as X" →
+    # <root>/X), after which <root>/X is appended to builder_allowed_roots. Empty (default) ⇒ graduation
+    # is unavailable until configured. Set to e.g. ~/dev. Env: GABAI_BUILDER_GRADUATE_ROOT.
+    builder_graduate_root: str = ""
     voice_passphrase: str = ""
     voice_persona: str = ""
     # Self-learning persona layer: a GLOBAL (one-Aria), user-invisible personality that grows over

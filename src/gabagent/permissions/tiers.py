@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 _TIER1_READS = {
     "read_file", "glob", "grep", "git_status", "git_diff", "git_log",
     "web_search", "web_fetch", "check_inbox", "read_claude_memory",
+    # check_builder just reports builder status/results — a read, never a confirm.
+    "check_builder",
     # Internal bookkeeping/telemetry — must auto-run, never prompt the user.
     "postmortem_log",
     # The agent's own project memory: reading is a read; writing is reversible (the user can
@@ -124,6 +126,37 @@ def tier_of(
         if _under(dest, cwd.resolve()):
             return 2
         return 3
+
+    # send_to_builder: dispatching a coding task to the headless builder. AUTO (Tier 1) only when the
+    # target project resolves inside a user-configured allow-list of builder roots — the guardrail the
+    # user graduates folders into as they trust the build there. Anywhere else stays keyboard-gated
+    # (fail-safe). Empty list (default) ⇒ no folder auto-approved ⇒ unchanged keyboard-confirm behavior.
+    if tool_name == "send_to_builder":
+        roots = getattr(config, "builder_allowed_roots", None) or []
+        if not roots:
+            return 3
+        # Resolve the target the SAME way the tool will (incl. the active sandbox project when `project`
+        # is omitted) — otherwise an omitted project falls back to cwd and keyboard-gates the hands-free
+        # path the guardrail exists to auto-run.
+        from gabagent.builder.projects import effective_target_path
+        try:
+            target = effective_target_path(args.get("project"), args.get("name"), cwd, config)
+        except Exception:
+            return 3
+        for r in roots:
+            try:
+                base = Path(r).expanduser().resolve()
+            except Exception:
+                continue
+            if target == base or _under(target, base):
+                return 1
+        return 3
+
+    # manage_builder: queries/switches are cheap & reversible (Tier 1); the consequential actions —
+    # promoting a project (moves files + adds an auto-run root), stopping a build, reverting a tree —
+    # take a spoken yes/no (Tier 2). Never the keyboard.
+    if tool_name == "manage_builder":
+        return 2 if args.get("action") in ("graduate", "cancel", "discard") else 1
 
     # git_branch: listing is a read; create/switch is a local Tier-2 change.
     if tool_name == "git_branch":

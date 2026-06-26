@@ -612,6 +612,9 @@ async def _handle_meta(ctx: AgentContext, mc: commands.MetaCommand, emit) -> Non
         await emit(events.token(commands.forget(ctx, mc.value)))
     elif mc.kind == "query":
         await emit(events.token(commands.answer_query(ctx, mc.value)))
+    elif mc.kind == "builder":
+        from gabagent.builder import vui
+        await vui.handle(ctx, mc, emit)
     await emit(events.done())
 
 

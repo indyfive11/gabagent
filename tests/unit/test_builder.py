@@ -211,10 +211,16 @@ def test_runner_success_announces_onto_channel(store, tmp_path, monkeypatch):
 
 # ----- tools -----------------------------------------------------------------
 
-def _ctx(tmp_path):
+def _ctx(tmp_path, scratch_root="", graduate_root=""):
+    from types import SimpleNamespace
     ctx = MagicMock(spec=AgentContext)
     ctx.cwd = tmp_path
     ctx.headless = True
+    ctx.config = SimpleNamespace(
+        builder_scratch_root=scratch_root,
+        builder_graduate_root=graduate_root,
+        builder_allowed_roots=[],
+    )
     return ctx
 
 
