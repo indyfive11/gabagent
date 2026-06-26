@@ -54,8 +54,49 @@ async def test_jellyfin_routes_through_control_action(patch_inv):
 
 @pytest.mark.asyncio
 async def test_no_resolution_when_nothing_playing(patch_inv):
+    # ctx is None → no command_catalog → the empty-inventory fallback can't route → None (back-compat).
     patch_inv([])
     assert await resolve.resolve_media_intent(None, "media.pause") is None
+
+
+# ---- ISSUE C (2026-06-26): empty live-inventory race → fall back to the room's music backend -----------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cid,expect", [
+    ("media.pause", ("tidal.pause", {})),
+    ("media.play", ("tidal.resume", {})),
+    ("media.stop", ("tidal.stop", {})),
+    ("media.next", ("tidal.next", {})),
+    ("media.previous", ("tidal.previous", {})),
+    ("media.playpause", ("tidal.resume", {})),          # no state → default to starting playback
+    ("media.now_playing", ("tidal.now_playing", {})),
+    ("media.shuffle", ("tidal.shuffle", {"mode": "on"})),
+    ("media.unshuffle", ("tidal.shuffle", {"mode": "off"})),
+])
+async def test_empty_inventory_falls_back_to_tidal_when_catalog_has_it(patch_inv, cid, expect):
+    # The 2026-06-26 Pi miss: `media.pause` fell through to "did you mean tidal.pause?" only because the live
+    # inventory was momentarily empty. With tidal in the catalog, route the transport intent to it directly.
+    patch_inv([])
+    ctx = types.SimpleNamespace(command_catalog=_StubCatalog(
+        {"tidal.pause", "tidal.resume", "tidal.stop", "tidal.next", "tidal.previous",
+         "tidal.now_playing", "tidal.shuffle"}))
+    assert await resolve.resolve_media_intent(ctx, cid) == expect
+
+
+@pytest.mark.asyncio
+async def test_empty_inventory_no_tidal_in_catalog_falls_through(patch_inv):
+    # A room without tidal (e.g. jellyfin-only) → don't invent a backend it lacks → None → difflib salvage.
+    patch_inv([])
+    ctx = types.SimpleNamespace(command_catalog=_StubCatalog({"jellyfin.control", "jellyfin.search"}))
+    assert await resolve.resolve_media_intent(ctx, "media.pause") is None
+
+
+@pytest.mark.asyncio
+async def test_empty_inventory_non_transport_still_ignored(patch_inv):
+    # An empty inventory must not turn a non-transport id into a transport guess.
+    patch_inv([])
+    ctx = types.SimpleNamespace(command_catalog=_StubCatalog({"tidal.pause", "tidal.search"}))
+    assert await resolve.resolve_media_intent(ctx, "weather.today") is None
 
 
 @pytest.mark.asyncio

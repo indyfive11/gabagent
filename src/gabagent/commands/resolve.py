@@ -66,7 +66,13 @@ async def resolve_media_intent(ctx: AgentContext, command_id: str) -> tuple[str,
     except Exception:
         return None
     if not srcs:
-        return None
+        # Empty live inventory at the instant of a transport command is almost always a cache/transition
+        # race over music — the 2026-06-26 Pi miss: `media.pause` fell through to "did you mean tidal.pause?"
+        # (turn +3.6s) because the inventory was momentarily empty, while the SAME id had resolved fine
+        # moments earlier. Fall back to the room's music backend when the catalog actually offers that
+        # transport command (tidal.* transport is a safe no-op if nothing is truly playing). Catalog-gated,
+        # so we never route to a backend this room doesn't have.
+        return _empty_inventory_fallback(ctx, intent)
     active = next((s for s in srcs if s.state == "playing"), None) or srcs[0]
     prov = (active.provider or "").lower()
     if intent == "now_playing":
@@ -87,6 +93,32 @@ async def resolve_media_intent(ctx: AgentContext, command_id: str) -> tuple[str,
         act = _JELLYFIN_ACTION.get(intent)
         return ("jellyfin.control", {"action": act}) if act else None
     return None
+
+
+def _empty_inventory_fallback(ctx, intent: str) -> tuple[str, dict] | None:
+    """Route a generic transport intent to the room's MUSIC backend when the live inventory is momentarily
+    empty (a cache/transition race). Catalog-gated: only routes to a command the room actually has. Music
+    only (tidal) — a video transport with no live session is the rarer case and would error anyway, so we
+    don't guess jellyfin here. Never raises."""
+    cat = getattr(ctx, "command_catalog", None)
+    if cat is None:
+        return None
+
+    def _has(cid: str) -> bool:
+        try:
+            return cat.get(cid) is not None
+        except Exception:
+            return False
+
+    if intent == "toggle":
+        intent = "resume"          # no state to read with nothing playing → default to starting playback
+    if intent == "now_playing":
+        return ("tidal.now_playing", {}) if _has("tidal.now_playing") else None
+    if intent in ("shuffle", "shuffle_off"):
+        return ("tidal.shuffle", {"mode": "on" if intent == "shuffle" else "off"}) \
+            if _has("tidal.shuffle") else None
+    rid = _TIDAL.get(intent)
+    return (rid, {}) if rid and _has(rid) else None
 
 
 def closest_command_ids(command_id: str, all_ids: list[str], *, n: int = 3, cutoff: float = 0.6) -> list[str]:
