@@ -408,7 +408,18 @@ class GabAgentConfig(BaseSettings):
     # same suppression behavior; conversation answers stay on arya. Costs one haiku classification call per
     # turn (a billing tradeoff — hence opt-in). No-ops to arya when no Claude backend is configured/cross-
     # enabled. Default False = historical behavior (arya gate, free). Env: GABAI_VOICE_FAST_ADDRESSING_GATE.
+    # NOTE: as of 2026-06-26 the gate ALSO prefers haiku by DEFAULT whenever a Claude backend is available
+    # cross-backend (see voice_arya_addressing_gate) — so this flag is now only needed to FORCE haiku when
+    # you've opted back into the arya gate. It still works as before (forces haiku) for back-compat.
     voice_fast_addressing_gate: bool = False
+    # Escape hatch: force the addressing-gate classify back onto arya (the historical free gate) even when a
+    # Claude backend is available. Default False = prefer the cheaper, spike-proof haiku classifier whenever
+    # Claude is configured + cross-enabled and the primary provider isn't already Claude (2026-06-26: a fresh
+    # loopback satellite that set neither Turbo nor voice_fast_addressing_gate was silently paying arya's
+    # ~4.8s gate-tax — the invisible-config trap). Turbo / voice_fast_addressing_gate still override this
+    # (explicit opt-in to haiku wins). No-ops when no Claude backend is available (already arya). Env:
+    # GABAI_VOICE_ARYA_ADDRESSING_GATE.
+    voice_arya_addressing_gate: bool = False
     # Internet-outage failover: when a voice turn's cloud LLM call fails with a CONNECTIVITY error (no
     # network / DNS failure / connect timeout — NOT a 4xx/5xx, which means the server answered), auto-fail
     # the turn over to the on-demand local model (`local_model`) so Aria still answers offline, and probe

@@ -267,12 +267,15 @@ def _fast_verdict(text: str) -> bool | None:
 
 def _classify_client_model(ctx):
     """(client, model) for the is_addressed gate classify. Exclusive/offline local mode → the local model
-    (the only one the Ollama endpoint knows). Claude provider → always the Claude floor (haiku). Else arya —
-    EXCEPT when a Claude backend is available AND either Turbo is on (a declared bad-arya day) or the
-    persistent `voice_fast_addressing_gate` flag is set, in which case the gate routes to the fast haiku
-    classifier (closes the ~10s arya classify tax — the gate fires every turn and rode arya's cloud-latency
-    variance, the dominant felt-latency tail on the Pi). Normal days with the flag off stay on arya (free).
-    Mirrors the router's own classifier pick."""
+    (the only one the Ollama endpoint knows). Claude provider → always the Claude floor (haiku). Else PREFER
+    the fast haiku classifier whenever a Claude backend is available cross-backend — it's strictly cheaper
+    than the arya gate and spike-proof (off arya's cloud-latency variance, the ~4.8s gate-tax measured on a
+    fresh laptop satellite 2026-06-26), with the same suppression behaviour. This is now the DEFAULT (was
+    previously gated behind Turbo / `voice_fast_addressing_gate`, so a fresh satellite that set neither
+    silently paid the arya gate — the invisible-config trap VAC flagged). `voice_arya_addressing_gate` is the
+    escape hatch back to the historical arya gate; Turbo / `voice_fast_addressing_gate` still force haiku
+    (explicit opt-in wins over the hatch). Falls through to arya when no Claude backend is configured/cross-
+    enabled. Mirrors the router's own classifier pick."""
     from gabagent.agent.loop import _active_client
     cfg = ctx.config
     # Exclusive/offline local mode: `_active_client(ctx)` returns the local Ollama client, which only knows
@@ -284,7 +287,13 @@ def _classify_client_model(ctx):
         return _active_client(ctx), cfg.local_model
     if cfg.provider == "claude":
         return _active_client(ctx), cfg.claude.ladder[0].model
-    if getattr(ctx, "turbo_commands", False) or getattr(cfg, "voice_fast_addressing_gate", False):
+    # Prefer haiku by default (option-b): Turbo or the explicit fast-gate flag always force it; otherwise
+    # still prefer it unless the arya escape hatch is set. When no Claude backend is available the precondition
+    # below fails and we fall through to arya (a safe no-op).
+    prefer_haiku = (getattr(ctx, "turbo_commands", False)
+                    or getattr(cfg, "voice_fast_addressing_gate", False)
+                    or not getattr(cfg, "voice_arya_addressing_gate", False))
+    if prefer_haiku:
         try:
             from gabagent.api.factory import anthropic_configured
             if (anthropic_configured(cfg) and (cfg.router.cross_backend or cfg.provider == "claude")

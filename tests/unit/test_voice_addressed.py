@@ -459,7 +459,7 @@ def test_fast_verdict_b2_lets_thinking_aloud_still_defers(text):
 
 # ---- B1: Turbo routes the gate classify to the fast Claude rung (haiku), else stays on arya ----------
 
-def _ctx_turbo(tag, *, seen, turbo, cross_backend=True, anthropic=True, fast_gate=False):
+def _ctx_turbo(tag, *, seen, turbo, cross_backend=True, anthropic=True, fast_gate=False, arya_gate=False):
     class _GabClient:
         backend = "gab"
         async def complete_simple(self, messages, model=None):
@@ -473,6 +473,7 @@ def _ctx_turbo(tag, *, seen, turbo, cross_backend=True, anthropic=True, fast_gat
     cfg.claude.api_key = "ankey" if anthropic else ""
     cfg.router.cross_backend = cross_backend
     cfg.voice_fast_addressing_gate = fast_gate
+    cfg.voice_arya_addressing_gate = arya_gate
     return types.SimpleNamespace(
         config=cfg, client=_GabClient(), clients={"claude": _ClaudeClient()},
         local_mode=False, local_client=None, degraded_backends=set(),
@@ -488,9 +489,35 @@ async def test_b1_turbo_routes_gate_classify_to_haiku():
     assert backend == "claude" and model == GabAgentConfig(api_key="t").claude.ladder[0].model
 
 
-async def test_b1_no_turbo_keeps_gate_on_arya():
+async def test_no_turbo_defaults_to_haiku_when_claude_available():
+    # option-b (2026-06-26): with a Claude backend available cross-backend and NEITHER turbo nor the explicit
+    # fast-gate flag set, the gate now PREFERS haiku by default (was arya — the invisible-config trap on a
+    # fresh satellite). The arya escape hatch is off by default.
     seen: list = []
     await is_addressed(_ctx_turbo("[ASIDE]", seen=seen, turbo=False), "some ambiguous thing")
+    assert len(seen) == 1
+    backend, model = seen[0]
+    assert backend == "claude" and model == GabAgentConfig(api_key="t").claude.ladder[0].model
+
+
+async def test_arya_escape_hatch_forces_gate_back_to_arya():
+    # voice_arya_addressing_gate=True restores the historical free arya gate even when Claude is available.
+    seen: list = []
+    await is_addressed(_ctx_turbo("[ASIDE]", seen=seen, turbo=False, arya_gate=True), "some ambiguous thing")
+    assert seen == [("gab", GabAgentConfig(api_key="t").router.simple_model)]
+
+
+async def test_turbo_overrides_arya_escape_hatch():
+    # Explicit opt-in to haiku (Turbo) wins over the arya escape hatch.
+    seen: list = []
+    await is_addressed(_ctx_turbo("[ASIDE]", seen=seen, turbo=True, arya_gate=True), "some ambiguous thing")
+    assert len(seen) == 1 and seen[0][0] == "claude"
+
+
+async def test_default_falls_to_arya_when_no_claude():
+    # No Claude backend available → precondition fails → arya (safe no-op), even though haiku is preferred.
+    seen: list = []
+    await is_addressed(_ctx_turbo("[ASIDE]", seen=seen, turbo=False, anthropic=False), "some ambiguous thing")
     assert seen == [("gab", GabAgentConfig(api_key="t").router.simple_model)]
 
 
@@ -510,10 +537,16 @@ async def test_fast_gate_routes_to_haiku_without_turbo():
     assert backend == "claude" and model == GabAgentConfig(api_key="t").claude.ladder[0].model
 
 
-async def test_fast_gate_off_keeps_gate_on_arya():
+async def test_fast_gate_off_now_defaults_to_haiku_unless_arya_hatch():
+    # Was "fast_gate off → arya". As of option-b (2026-06-26) fast_gate off DEFAULTS to haiku when Claude is
+    # available; arya now requires the explicit escape hatch. Both branches asserted here.
     seen: list = []
     await is_addressed(_ctx_turbo("[ASIDE]", seen=seen, turbo=False, fast_gate=False), "some ambiguous thing")
-    assert seen == [("gab", GabAgentConfig(api_key="t").router.simple_model)]
+    assert seen == [("claude", GabAgentConfig(api_key="t").claude.ladder[0].model)]
+    seen2: list = []
+    await is_addressed(_ctx_turbo("[ASIDE]", seen=seen2, turbo=False, fast_gate=False, arya_gate=True),
+                       "some ambiguous thing")
+    assert seen2 == [("gab", GabAgentConfig(api_key="t").router.simple_model)]
 
 
 async def test_fast_gate_falls_back_to_arya_when_no_claude():
