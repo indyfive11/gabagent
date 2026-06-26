@@ -187,7 +187,10 @@ class GlobTool(ToolBase):
 
 
 def _resolve(path: str, cwd: Path) -> Path:
-    p = Path(path).expanduser()
+    # Brain owns spoken→token assembly for file commands: a path dictated as "slash tmp slash notes dot
+    # txt" becomes /tmp/notes.txt. Guarded on the WORD "slash", so an already-clean path is untouched.
+    from gabagent.voice.spoken_tokens import maybe_assemble_path
+    p = Path(maybe_assemble_path(path)).expanduser()
     if p.is_absolute():
         return p
     return cwd / p
