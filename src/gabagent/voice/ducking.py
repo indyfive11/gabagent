@@ -860,6 +860,23 @@ def note_user_volume(ctx, target: int) -> bool:
         return False
 
 
+def pending_user_volume(ctx) -> int | None:
+    """The user's CHOSEN music level (0-100) saved against an active duck window, or None when no duck is
+    open. A relative bump ("turn it up") must read THIS, not the live mixer — while the command window is
+    open the mixer reads the ducked level (~18%), so reading it would compute the bump off the wrong base.
+    Mirrors note_user_volume's state. Never raises."""
+    try:
+        st = _state(ctx)
+        if st.get("tidal_prior") is not None:
+            return int(st["tidal_prior"])
+        saved = st.get("tidal_sink_prior")
+        if saved is not None:
+            return int(saved[1])
+        return None
+    except Exception:
+        return None
+
+
 async def _duck_tidal_sink(ctx, on: bool, mute: bool = False, mixer_vol: int | None = None) -> None:
     """Belt-and-suspenders for the music duck: also attenuate the Mopidy stream at the SYSTEM node
     (PipeWire sink-input). Mopidy's software mixer proved intermittently inaudible (value changes but

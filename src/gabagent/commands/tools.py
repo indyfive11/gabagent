@@ -64,9 +64,14 @@ class RunCommandTool(ToolBase):
                 if resolved is not None:
                     cmd, command_id, args = resolved, real_id, {**(args or {}), **extra}
             # 2) Otherwise a close catalog id → auto-route if very close, else suggest in one step.
+            #    Strictness is config-tunable (stricter on a weak-STT `mobile` process); defaults to the
+            #    historical 0.6/0.86 so an unconfigured install is unchanged.
             if cmd is None:
-                near = closest_command_ids(command_id, catalog.ids())
-                if near and best_match_ratio(command_id, near[0]) >= AUTO_ROUTE_RATIO:
+                cfg = getattr(ctx, "config", None)
+                cutoff = getattr(cfg, "salvage_command_cutoff", 0.6)
+                auto_ratio = getattr(cfg, "salvage_auto_route_ratio", AUTO_ROUTE_RATIO)
+                near = closest_command_ids(command_id, catalog.ids(), cutoff=cutoff)
+                if near and best_match_ratio(command_id, near[0]) >= auto_ratio:
                     cmd, command_id = catalog.get(near[0]), near[0]
                 elif near:
                     return ToolResult(output="", error=(

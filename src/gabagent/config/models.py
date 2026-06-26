@@ -257,6 +257,18 @@ class GabAgentConfig(BaseSettings):
     # <root>/X), after which <root>/X is appended to builder_allowed_roots. Empty (default) ⇒ graduation
     # is unavailable until configured. Set to e.g. ~/dev. Env: GABAI_BUILDER_GRADUATE_ROOT.
     builder_graduate_root: str = ""
+    # Closed-set fuzzy-salvage strictness — how confidently a garbled command id / playlist name is
+    # auto-resolved against the real catalog before we ask "did you mean …?" instead. Defaults are the
+    # historical bare constants (resolve.py 0.6/0.86, tidal 0.72) ⇒ an unconfigured install behaves
+    # EXACTLY as before. A process fed by a WEAKER STT (the fat-thin `mobile` laptop client on local
+    # small.en, which garbles more than cloud arya) RAISES these so a low/mid-confidence match becomes a
+    # safe "ask" rather than a confident WRONG-salvage (the dangerous misfire on a command terminal — see
+    # the fat-thin design R7). Higher = stricter = fewer confident-wrong, more clarify prompts. Because the
+    # `mobile` brain is its own process (process-per-room), "stricter mobile" is just its own config —
+    # no per-room branching. Env: GABAI_SALVAGE_COMMAND_CUTOFF / _AUTO_ROUTE_RATIO / _PLAYLIST_PLAY_SCORE.
+    salvage_command_cutoff: float = 0.6        # difflib floor for a near-match to even be a candidate
+    salvage_auto_route_ratio: float = 0.86     # single best near-match this close ⇒ auto-route (else suggest)
+    salvage_playlist_play_score: float = 0.72  # explicit playlist match this strong ⇒ auto-play (else ask)
     voice_passphrase: str = ""
     voice_persona: str = ""
     # Self-learning persona layer: a GLOBAL (one-Aria), user-invisible personality that grows over
@@ -294,6 +306,10 @@ class GabAgentConfig(BaseSettings):
     # least this % so "turn the music way down" can't ratchet to inaudible — to actually silence music
     # the user pauses/stops it. Env: GABAI_MEDIA_VOLUME_FLOOR.
     media_volume_floor: int = 5
+    # Step size (percentage points) for a RELATIVE music-volume change (tidal.adjust_volume — "turn it up/
+    # down", "louder", "quieter"). Bumped from the current level so a relative request is always audibly
+    # different, instead of the model guessing an absolute target. Env: GABAI_MEDIA_VOLUME_STEP.
+    media_volume_step: int = 15
     # Media-control keepalive: after any media command (play/pause/seek/volume/…), ask the voice client to
     # hold the wake/command window open this many more seconds, refreshed per command, so a follow-up
     # ("skip", "louder", "pause") needs no re-wake while music plays — the wake-gate otherwise idle-closes

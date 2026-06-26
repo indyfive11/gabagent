@@ -207,7 +207,28 @@ def _summarize_command(args: dict, ctx: AgentContext) -> str:
                 return tmpl.format(**inner)
             except Exception:
                 pass
-    return cmd.summary or f"Run {cid}."
+    # No usable confirm_template → name the resolved target so a fuzzy-salvaged WRONG argument is
+    # AUDIBLE before the yes (the small.en/`mobile` wrong-salvage case — fat-thin design follow-up #1).
+    # Safe key allowlist (same keys _arg_detail deems surfaceable), single value, never a raw dict dump.
+    base = cmd.summary or f"Run {cid}."
+    tgt = _primary_target(inner)
+    if tgt and tgt.lower() not in base.lower():
+        base = base.rstrip(".") + f" — {tgt}."
+    return base
+
+
+_TARGET_KEYS = ("title", "name", "branch", "playlist", "query", "target", "app", "url")
+
+
+def _primary_target(inner: dict) -> str:
+    """The single most salient resolved argument, for speaking in a target-less command confirm.
+    Allowlisted keys only (never an arbitrary arg), trimmed and length-capped for TTS."""
+    for k in _TARGET_KEYS:
+        v = inner.get(k)
+        if v and isinstance(v, str) and v.strip():
+            s = v.strip().replace("\n", " ")
+            return (s[:60] + "…") if len(s) > 60 else s
+    return ""
 
 
 def _reason(tool_name: str, args: dict, tier: int, ctx: AgentContext) -> str:

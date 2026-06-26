@@ -169,3 +169,44 @@ async def test_shuffle_falls_through_for_jellyfin(patch_inv):
     # No Jellyfin tracklist-shuffle equivalent we drive → don't route it.
     patch_inv([_Src("jellyfin", "playing")])
     assert await resolve.resolve_media_intent(None, "media.shuffle") is None
+
+
+# --- salvage strictness is config-tunable (fat-thin `mobile` / small.en follow-up #2) -----------
+
+def test_salvage_config_defaults_match_historical_constants():
+    """An unconfigured install must behave EXACTLY as before — the config defaults equal the old
+    bare constants (resolve.py 0.6/0.86, tidal 0.72)."""
+    from gabagent.config.models import GabAgentConfig
+    from gabagent.commands.providers.tidal import _PLAYLIST_PLAY_SCORE
+    cfg = GabAgentConfig(api_key="test")
+    assert cfg.salvage_command_cutoff == 0.6
+    assert cfg.salvage_auto_route_ratio == resolve.AUTO_ROUTE_RATIO == 0.86
+    assert cfg.salvage_playlist_play_score == _PLAYLIST_PLAY_SCORE == 0.72
+
+
+@pytest.mark.asyncio
+async def test_stricter_ratio_demotes_autoroute_to_suggest(patch_inv, monkeypatch):
+    """A weak-STT `mobile` process raises salvage_auto_route_ratio → a borderline typo that auto-routes
+    at the default 0.86 instead asks 'did you mean?' (the wrong-salvage guard, R7)."""
+    from gabagent.commands.tools import RunCommandTool
+    from gabagent.config.models import GabAgentConfig
+    patch_inv([])
+    monkeypatch.setattr("gabagent.commands.usage.record", lambda *a, **k: None, raising=False)
+    cfg = GabAgentConfig(api_key="test", salvage_auto_route_ratio=0.99)
+    ctx = types.SimpleNamespace(
+        command_catalog=_StubCatalog({"jellyfin.now_playing", "tidal.search"}), config=cfg)
+    res = await RunCommandTool().execute(ctx, command_id="jellyfin.now_playng", args={})  # typo, ratio 0.974
+    assert res.error and "Did you mean" in res.error  # not silently auto-routed under the stricter ratio
+
+
+@pytest.mark.asyncio
+async def test_stricter_cutoff_drops_marginal_candidate(patch_inv):
+    """A high salvage_command_cutoff filters a marginal near-match out entirely → plain unknown."""
+    from gabagent.commands.tools import RunCommandTool
+    from gabagent.config.models import GabAgentConfig
+    patch_inv([])
+    cfg = GabAgentConfig(api_key="test", salvage_command_cutoff=0.99, salvage_auto_route_ratio=0.99)
+    ctx = types.SimpleNamespace(
+        command_catalog=_StubCatalog({"jellyfin.now_playing", "tidal.search"}), config=cfg)
+    res = await RunCommandTool().execute(ctx, command_id="jellyfin.now_playng", args={})
+    assert res.error and "Try list_capabilities" in res.error

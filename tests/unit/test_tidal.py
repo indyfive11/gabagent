@@ -37,6 +37,27 @@ def _ctx(**tcfg):
     return types.SimpleNamespace(config=cfg, voice_session=None, voice_emit=None)
 
 
+@pytest.mark.asyncio
+async def test_play_named_playlist_uses_config_play_score(monkeypatch):
+    """The playlist auto-play threshold is config-driven (stricter on a weak-STT `mobile` process);
+    `_play_named_playlist` must thread ctx.config.salvage_playlist_play_score into _resolve_playlist."""
+    captured = {}
+
+    def fake_resolve(pls, query, *, play_score=td._PLAYLIST_PLAY_SCORE, ask=True):
+        captured["play_score"] = play_score
+        return ("none", "", "", [])
+
+    async def fake_load(tc):
+        return []
+
+    monkeypatch.setattr(td, "_resolve_playlist", fake_resolve)
+    monkeypatch.setattr(td, "_load_playlists", fake_load)
+    cfg = GabAgentConfig(api_key="test", salvage_playlist_play_score=0.9)
+    ctx = types.SimpleNamespace(config=cfg)
+    await td._play_named_playlist(ctx, object(), "some jazz")
+    assert captured["play_score"] == 0.9
+
+
 def _rpc_router(handlers):
     """respx side_effect: dispatch by the JSON-RPC method in the request body."""
     def _resp(request):

@@ -192,13 +192,27 @@ class TidalProvider:
             ),
             Command(
                 id="tidal.set_volume", domain="media", tier=1, featured=True, terminal_confirm=True,
-                summary="Set the music volume to a specific level (0-100%) — use this for the MUSIC "
-                        "volume, not the system volume",
+                summary="Set the music volume to a SPECIFIC level (0-100%) — use this only when the user "
+                        "names a number (e.g. 'set the music to 30'). For 'turn it up/down' with no number, "
+                        "use tidal.adjust_volume instead. This is the MUSIC volume, not the system volume",
                 backend=PyBackend(ref=ref + "set_volume"),
                 params=[Slot("level", "integer", True,
                              description="target volume as a percent, 0-100, e.g. 30")],
-                examples=["set the music to 30%", "turn the music down to 20", "make the music quieter",
-                          "music volume 50 percent", "lower the volume to 40"],
+                examples=["set the music to 30%", "turn the music down to 20", "music volume 50 percent",
+                          "lower the volume to 40"],
+            ),
+            Command(
+                id="tidal.adjust_volume", domain="media", tier=1, featured=True, terminal_confirm=True,
+                summary="Turn the MUSIC volume up or down by a step, RELATIVE to the current level — use "
+                        "this for 'turn it up/down', 'louder', 'quieter', 'a bit lower' with NO specific "
+                        "number. For a named level (e.g. 'set it to 40') use tidal.set_volume instead",
+                backend=PyBackend(ref=ref + "adjust_volume"),
+                params=[Slot("direction", "enum", True, enum=("up", "down"),
+                             description="required — 'up' (louder) or 'down' (quieter)"),
+                        Slot("amount", "integer", False,
+                             description="optional step in percentage points; omit to use the default step")],
+                examples=["turn up the volume", "turn it up", "louder", "make the music louder",
+                          "turn the music down", "make it quieter", "a bit lower", "bump it up"],
             ),
             Command(id="tidal.pause", domain="media", tier=1, featured=True, terminal_confirm=True,
                     summary="Pause TIDAL playback",
@@ -688,7 +702,11 @@ async def _play_named_playlist(ctx, tc, query: str, shuffle: bool = False) -> To
         pls = await _load_playlists(tc)
     except Exception as e:
         return ToolResult(output="", error=f"couldn't load your playlists: {_human_err(e)}")
-    kind, uri, title, options = _resolve_playlist(pls, query)
+    # Auto-play strictness is config-tunable (stricter on a weak-STT `mobile` process); the default
+    # equals the historical _PLAYLIST_PLAY_SCORE so an unconfigured install is unchanged.
+    kind, uri, title, options = _resolve_playlist(
+        pls, query,
+        play_score=getattr(getattr(ctx, "config", None), "salvage_playlist_play_score", _PLAYLIST_PLAY_SCORE))
     if kind == "play":
         return await _play_container(ctx, tc, uri=uri, shuffle=bool(shuffle), label=title)
     if kind == "ask":
@@ -795,6 +813,36 @@ async def _set_stream_volume(ctx, target: int) -> None:
         pass
 
 
+async def _apply_volume(ctx, target: int) -> None:
+    """Apply an absolute target (0-100) to the music stream, duck-aware. If a duck/command window is open,
+    don't write the live output — that would unduck the bed mid-window and re-open the music-leak the duck
+    suppresses; instead record the new level so the duck-off restore returns to it (option b, applied
+    promptly at BotStopped). With no duck active, set the live stream as usual. Raises on transport error."""
+    from gabagent.voice.ducking import note_user_volume
+    if not note_user_volume(ctx, target):
+        await _set_stream_volume(ctx, target)
+
+
+async def _current_volume(ctx) -> int | None:
+    """The user's current CHOSEN music volume (0-100), duck-aware: while a command window is open the live
+    mixer reads the ducked level, so prefer the saved pre-duck prior; else read the live Mopidy mixer.
+    None when neither is available. Never raises."""
+    try:
+        from gabagent.voice.ducking import pending_user_volume
+        pend = pending_user_volume(ctx)
+        if pend is not None:
+            return max(0, min(100, int(pend)))
+    except Exception:
+        pass
+    try:
+        vol = await _rpc(resolve_tidal(ctx), "core.mixer.get_volume", {}, timeout=2.0)
+        if vol is not None:
+            return max(0, min(100, int(vol)))
+    except Exception:
+        pass
+    return None
+
+
 async def set_volume(ctx, level=None) -> ToolResult:
     """Set the music volume to an absolute level (0-100), targeting the music stream — idempotent, with
     a floor so it can't be ratcheted to silence. Replaces brute-forced relative system volume steps."""
@@ -806,15 +854,39 @@ async def set_volume(ctx, level=None) -> ToolResult:
         return ToolResult(output="", error="that volume isn't a number")
     target = max(_volume_floor(ctx), min(100, target))
     try:
-        # If a duck/command window is open, don't write the live output — that would unduck the bed
-        # mid-window and re-open the music-leak the duck suppresses. Instead record the new level so the
-        # duck-off restore returns to it (option b). With no duck active, set the live stream as usual.
-        from gabagent.voice.ducking import note_user_volume
-        if not note_user_volume(ctx, target):
-            await _set_stream_volume(ctx, target)
+        await _apply_volume(ctx, target)
     except Exception as e:
         return ToolResult(output="", error=f"couldn't set the volume: {_human_err(e)}")
     return ToolResult(output=f"Set the music volume to {target} percent.")
+
+
+async def adjust_volume(ctx, direction=None, amount=None) -> ToolResult:
+    """Relative music-volume change ('turn it up/down', 'louder', 'quieter') — bumps from the CURRENT level
+    so the result is always audibly different, instead of the model guessing an absolute target that may
+    equal the current one (the 'I asked to turn it up and nothing changed' bug). Duck-aware via
+    _current_volume; routes through _apply_volume so it lands on restore when a window is open."""
+    d = (direction or "").strip().lower()
+    if d not in ("up", "down"):
+        return ToolResult(output="", error="say up or down")
+    try:
+        step = int(round(float(amount))) if amount not in (None, "") else int(getattr(ctx.config, "media_volume_step", 15))
+    except (TypeError, ValueError):
+        step = int(getattr(ctx.config, "media_volume_step", 15))
+    step = max(1, min(100, abs(step)))
+    cur = await _current_volume(ctx)
+    if cur is None:
+        return ToolResult(output="", error="couldn't read the current music volume")
+    target = cur + step if d == "up" else cur - step
+    target = max(_volume_floor(ctx), min(100, target))
+    if target == cur:
+        edge = "as loud as it goes" if d == "up" else "as low as it goes"
+        return ToolResult(output=f"The music's already {edge}.")
+    try:
+        await _apply_volume(ctx, target)
+    except Exception as e:
+        return ToolResult(output="", error=f"couldn't change the volume: {_human_err(e)}")
+    verb = "Turned it up to" if d == "up" else "Turned it down to"
+    return ToolResult(output=f"{verb} {target} percent.")
 
 
 async def pause(ctx) -> ToolResult:
