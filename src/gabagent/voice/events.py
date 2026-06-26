@@ -115,5 +115,15 @@ def timer_fired(timer_id: str, label: str = "", set_secs: int = 0) -> VoiceEvent
     return VoiceEvent(type="timer_fired", extra={"id": timer_id, "label": label, "set_secs": int(set_secs)})
 
 
+def wake_hold(hold: bool) -> VoiceEvent:
+    """Confirm-style wake-window hold (brain → voice, #6 auto-Turbo offer). `hold=True` opens + FREEZES the
+    command window WITH a pre-duck — so the user's "yes" spoken over playing media lands on ducked audio,
+    not masked by it — and does NOT self-release. Emit `hold=False` to close it (the voice gate's max-hold
+    ceiling backstops a missed release). Distinct from keepalive(), which carries `ttl_secs` and self-
+    releases WITHOUT pre-ducking. Selected on the wire by the ABSENCE of ttl_secs (→ the gate's `_set_hold`
+    confirm path). Carried via `extra` so a literal `hold:false` survives to_dict's empty-value filter."""
+    return VoiceEvent(type="wake_hold", extra={"hold": bool(hold)})
+
+
 def done() -> VoiceEvent:
     return VoiceEvent(type="done")

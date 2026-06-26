@@ -321,6 +321,49 @@ class GabAgentConfig(BaseSettings):
     # down", "louder", "quieter"). Bumped from the current level so a relative request is always audibly
     # different, instead of the model guessing an absolute target. Env: GABAI_MEDIA_VOLUME_STEP.
     media_volume_step: int = 15
+    # Latency-gated progress-ack: if a turn produces no speech within this many ms, Aria emits ONE short
+    # filler ("One moment.") so a slow think or a long command (e.g. a 9s Tidal search) doesn't feel like a
+    # dead stick — the user knows she heard them. Fast turns (speech before the threshold) never trigger it,
+    # so terseness survives. Domain-aware reassurance ("Trying Tidal…") is handled separately once the tool
+    # is known; this covers the PRE-decision silence that can't. DEFAULT 0 = OFF (the historical no-op, per
+    # the config-generalization SOP — it adds a NEW spoken utterance, so it's opt-in + live-verified like the
+    # other speak/spend features; set e.g. 2200 to enable). Env: GABAI_VOICE_PROGRESS_ACK_MS.
+    voice_progress_ack_ms: int = 0
+    # The phrase spoken by the latency-gated progress-ack (above). Kept short and non-committal since the
+    # command isn't known yet. Env: GABAI_VOICE_PROGRESS_ACK_PHRASE.
+    voice_progress_ack_phrase: str = "One moment."
+    # Cold-start pre-warm (#2): when True, the /prewarm endpoint fires a throwaway arya completion on the
+    # voice side's first-post-wake-voice-energy trigger, so the cloud session is warm by the time the real
+    # turn arrives (overlapping arya's deep-cold spin with the user's own speaking time). False → endpoint
+    # no-ops (kill-switch). Inert unless the voice client calls it. Env: GABAI_VOICE_PREWARM_ENABLED.
+    voice_prewarm_enabled: bool = True
+    # Per-room cooldown (seconds) between pre-warm completions, so a chatty onset or a double-fire can't
+    # spend repeated arya calls. Env: GABAI_VOICE_PREWARM_COOLDOWN_SECS.
+    voice_prewarm_cooldown_secs: float = 4.0
+    # Latency self-test → auto-Turbo (#6). OFF by default (Rob's call) — it auto-spends (Turbo billing +
+    # recovery probes), so it stays opt-in: flip voice_latency_watch on for a bad-cloud day. When on, the
+    # brain passively watches real arya ttft and, when arya is the DOMINANT slowness, offers to switch
+    # command turns to the fast (Claude) rung; "yes" toggles Turbo. All values below are live-tunable.
+    voice_latency_watch: bool = False
+    # Trip when the median of the last `window` arya-DOMINATED turns exceeds this, OR any single
+    # arya-dominated turn exceeds hard_ceiling. From last night's data (warm ~3s, cold 18-26s).
+    voice_latency_ceiling_ms: int = 8000
+    voice_latency_hard_ceiling_ms: int = 15000
+    voice_latency_window: int = 3
+    # Consider arya "recovered" once the last `window` samples are all below this (hysteresis vs ceiling).
+    voice_latency_floor_ms: int = 4000
+    # Arya counts as the DOMINANT cause of a slow turn only when its ttft is at least this fraction of the
+    # turn's total time — so a turn that felt slow because of a long Tidal/command call (which Turbo can't
+    # speed) does NOT trigger the offer (VAC's Q4 attribution point). 0.6 = arya ≥60% of the turn.
+    voice_latency_attribution: float = 0.6
+    # Don't re-offer Turbo more than once per this window per room (no nagging after a "no"/ignore).
+    voice_latency_offer_cooldown_secs: float = 600.0
+    # How long the held command-window / pending offer stays valid for the user's "yes" before it expires.
+    voice_latency_offer_ttl_secs: float = 60.0
+    # Recovery probing (only while in Turbo AND no room is producing a real arya sample): cadence + a hard
+    # per-day cap so a flapping arya can't rack up probe cost.
+    voice_latency_probe_secs: float = 75.0
+    voice_latency_probe_daily_max: int = 40
     # Media-control keepalive: after any media command (play/pause/seek/volume/…), ask the voice client to
     # hold the wake/command window open this many more seconds, refreshed per command, so a follow-up
     # ("skip", "louder", "pause") needs no re-wake while music plays — the wake-gate otherwise idle-closes

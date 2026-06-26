@@ -387,6 +387,39 @@ def _status_phrase(tool_calls) -> str:
     return "Looking into it."
 
 
+def _progress_phrase(ctx) -> str:
+    """Generic 'I'm on it' filler for the latency-gated progress-ack — covers the PRE-decision silence (a
+    slow/cold think before the tool is even chosen) that the domain phrase ('Trying Tidal…') can't, since
+    that needs the tool_calls first. Short and non-committal; config-overridable."""
+    return (getattr(ctx.config, "voice_progress_ack_phrase", "") or "One moment.").strip()
+
+
+async def _progress_ack_watchdog(ctx, emit, stamped: set, progress: dict) -> None:
+    """If a turn produces no speakable token or status within voice_progress_ack_ms, emit ONE short ack so a
+    slow think or long command doesn't feel like a dead stick. Fast turns (speech before the threshold) and
+    turns where the domain phrase already spoke never trigger it — terseness preserved. Emitted as a `status`
+    event, so the voice side's existing gating (asleep / quiet) governs whether it's actually spoken, exactly
+    like the escalate filler. The caller cancels this once the turn ends. Never raises out."""
+    try:
+        delay = int(getattr(ctx.config, "voice_progress_ack_ms", 0))
+    except Exception:
+        delay = 0
+    if delay <= 0:
+        return
+    try:
+        await asyncio.sleep(delay / 1000.0)
+    except asyncio.CancelledError:
+        return
+    # Nothing spoken yet AND the domain phrase hasn't claimed the single per-turn filler → fill the silence.
+    if "token" in stamped or "status" in stamped or progress.get("acked"):
+        return
+    progress["acked"] = True
+    try:
+        await emit(events.status(_progress_phrase(ctx)))
+    except Exception:
+        pass
+
+
 def _run_command_domain(tool_calls) -> str:
     """Best-effort human domain for the first run_command (e.g. 'Jellyfin'). Empty if unknown."""
     import json
@@ -655,6 +688,9 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
     # number VAC can't see from the voice side. Cheap, default-on, one dlog line per turn per type.
     _base_emit = ctx.voice_emit
     _stamped: set[str] = set()
+    _progress_task = None        # latency-gated progress-ack watchdog; created once routing commits to a turn
+    _progress = {"acked": False}  # set when the watchdog OR the domain phrase emits the single per-turn filler
+    _arya_ttft0 = None           # round-0 arya ttft this turn → fed to the latency self-test (#6)
 
     async def emit(ev):
         kind = getattr(ev, "type", None)
@@ -665,6 +701,25 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
 
     dlog(ctx, "turn_start", words=len(user_text.split()))
     try:
+        # Auto-Turbo (#6): a pending "switch Turbo on/off?" offer + an affirmation toggles Turbo HERE, before
+        # any routing or model call (instant, no arya). A non-affirmation lapses the offer and falls through
+        # to normal handling. No-op (returns None) when nothing is pending or the watcher is off.
+        _had_offer = False
+        try:
+            from gabagent.voice import latency_watch
+            _had_offer = latency_watch.pending(ctx) is not None
+            _turbo_line = latency_watch.resolve_offer(ctx, user_text)
+        except Exception:
+            _turbo_line = None
+        if _turbo_line is not None:
+            dlog(ctx, "meta", matched="turbo_offer")
+            await emit(events.token(_turbo_line))
+            await emit(events.wake_hold(False))   # release the confirm-hold the offer opened
+            await emit(events.done())
+            return
+        if _had_offer:
+            # The offer lapsed (user said something else) → release the held window before handling normally.
+            await emit(events.wake_hold(False))
         mc = commands.detect_meta_command(user_text)
         if mc is not None:
             dlog(ctx, "meta", matched=f"{mc.kind}:{mc.value}".rstrip(":"))
@@ -822,6 +877,9 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
         ctx._voice_volume_signal = None   # cleared each turn; voice.set_volume sets it → emit before `done`
         sig_counts: dict[str, int] = {}   # tool-call signature → times seen this turn (loop detector)
         tool_rounds = 0                    # total tool rounds this turn (hard backstop)
+        # Routing has committed to answering (asides/meta returned earlier) → arm the progress-ack so a slow
+        # think/command fills the silence. Cancelled in the finally regardless of how the turn exits.
+        _progress_task = asyncio.create_task(_progress_ack_watchdog(ctx, emit, _stamped, _progress))
         while True:
             cur = ctx.active_model or simple
             # Announce an arya→premium transition ONCE (vs. every turn), and de-escalate silently.
@@ -940,6 +998,10 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
             _stats = getattr(_call_client, "last_call_stats", None)
             if _stats is not None:
                 dlog(ctx, "gab_call", round=tool_rounds, backend=ctx.active_backend, **_stats)
+                if _arya_ttft0 is None and ctx.active_backend in (None, "gab"):
+                    # round-0 cloud ttft → latency self-test (#6). None = the unrouted default (arya);
+                    # an explicit "local"/"claude" backend is excluded (Turbo/local turns aren't arya).
+                    _arya_ttft0 = _stats.get("ttft_ms")
 
             if text_buf:
                 ctx.session.append_message(
@@ -953,9 +1015,10 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
                 )
 
             phrase = _status_phrase(tool_calls)
-            if phrase and not status_emitted:   # one status per turn — no stacked preambles
+            if phrase and not status_emitted and not _progress["acked"]:   # one status per turn — no stacked preambles
                 await emit(events.status(phrase))
                 status_emitted = True
+                _progress["acked"] = True   # claim the single per-turn filler so the watchdog won't double-speak
                 last_status = phrase
             results = await _execute_tool_calls(
                 tool_calls, ctx, perm_engine, None, NullToolDisplay(), router
@@ -1054,6 +1117,29 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
             await emit(events.voice_volume(vv["op"], vv.get("value")))
             dlog(ctx, "voice_volume", op=vv["op"], value=vv.get("value"))
 
+        # Latency self-test → auto-Turbo (#6): record this turn's round-0 arya ttft (vs the turn total, the
+        # attribution gate) and, if the cloud is the DOMINANT slowness — or has recovered while in Turbo —
+        # speak a short Turbo offer + emit the hold event so the voice side keeps the window open for "yes".
+        # OFF unless voice_latency_watch. Deferred-NOT to a question turn (the offer would stack on a pending
+        # clarification): only appended after a terminal reply. Best-effort, never blocks `done`.
+        if _is_terminal_reply(text_buf):
+            try:
+                from gabagent.voice import latency_watch
+                latency_watch.record(ctx, _arya_ttft0, int((time.monotonic() - _t0) * 1000))
+                _offer = latency_watch.maybe_offer(ctx, ctx.session_id)
+                if _offer:
+                    await emit(events.token(" " + _offer["text"]))
+                    # Confirm-HOLD path (wake_hold with NO ttl → the voice gate's _set_hold): it PRE-DUCKS for
+                    # the whole offer window, so the user's "yes" spoken over playing media isn't masked by the
+                    # bed. No self-release — the release is emitted when the offer resolves (pre-route, below)
+                    # or its pending TTL lapses; the voice side's max-hold ceiling backstops a walk-away.
+                    await emit(events.wake_hold(True))
+                    dlog(ctx, "turbo_offer", kind=_offer["kind"], ttl_secs=int(_offer["ttl_secs"]))
+                if getattr(ctx, "turbo_commands", False):
+                    asyncio.create_task(latency_watch.maybe_probe(ctx))
+            except Exception:
+                pass
+
         await emit(events.done())
     except asyncio.CancelledError:
         # A barge-in (/cancel) aborts the turn. Log it EXPLICITLY: a cancel bypasses the `except Exception`
@@ -1132,6 +1218,10 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
             vs.queue.put_nowait(events.error(cause, text))
             vs.queue.put_nowait(events.done())
     finally:
+        # Stop the progress-ack watchdog on every exit (meta return, normal done, cancel, error) so it can't
+        # fire after the turn is over. Safe if it never started or already completed.
+        if _progress_task is not None:
+            _progress_task.cancel()
         # Fires on EVERY exit (meta return, normal done, cancel, error, fallback) — so the absence of a
         # turn_done after a turn_start unambiguously localises a hang to this turn.
         dlog(ctx, "turn_done", dur_ms=int((time.monotonic() - _t0) * 1000))

@@ -78,6 +78,7 @@ def build_app(ctx: AgentContext):
     from gabagent.voice.turn import start_turn, drain
 
     sessions: dict[str, VoiceSession] = {}
+    _prewarm_last: dict[str, float] = {}   # room → last pre-warm monotonic time (per-room cooldown)
 
     def get_session(sid: str) -> VoiceSession:
         vs = sessions.get(sid)
@@ -226,6 +227,43 @@ def build_app(ctx: AgentContext):
         lease = float(getattr(ctx.config, "voice_announce_lease_secs", announce_store.DEFAULT_LEASE_SECS))
         return JSONResponse({"deferred": announce_store.poll(session_id, lease_secs=lease)})
 
+    async def prewarm(request):
+        # Cold-start mitigation (#2): the voice side fires this fire-and-forget the instant it detects the
+        # FIRST post-wake voice energy — BEFORE STT — so a throwaway arya completion warms the cloud session
+        # while the user is still speaking, overlapping arya's ~18-21s deep-cold spin with dead time the user
+        # already spends. The brain has no earlier turn signal (it first hears a turn at /respond, AFTER STT),
+        # which is why this seam exists. Idempotent + per-room rate-limited; the caller ignores the response.
+        import time
+        import asyncio as _aio
+        from gabagent.api.models import ChatMessage
+        from gabagent.voice.debuglog import dlog
+        if not getattr(ctx.config, "voice_prewarm_enabled", True):
+            return JSONResponse({"ok": True, "skipped": "disabled"})
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        room = str(body.get("room") or body.get("session_id") or "default")
+        cooldown = float(getattr(ctx.config, "voice_prewarm_cooldown_secs", 4.0))
+        now = time.monotonic()
+        if now - _prewarm_last.get(room, 0.0) < cooldown:
+            return JSONResponse({"ok": True, "skipped": "cooldown"})
+        _prewarm_last[room] = now
+
+        async def _warm(client_ts):
+            rt = getattr(ctx.config, "router", None)
+            model = (getattr(rt, "simple_model", None) if rt else None) or "arya"
+            t = time.monotonic()
+            try:
+                await ctx.client.complete_simple([ChatMessage(role="user", content="hi")], model=model)
+                dlog(ctx, "prewarm", room=room, model=model,
+                     ttft_ms=int((time.monotonic() - t) * 1000), client_ts=client_ts)
+            except Exception as e:
+                dlog(ctx, "prewarm", room=room, model=model, error=type(e).__name__)
+
+        _aio.create_task(_warm(body.get("ts")))
+        return JSONResponse({"ok": True, "warming": True})
+
     async def media_state(request):
         # Read-only: lets the voice client's duck-timing skip ducking when nothing's playing.
         # PROTOCOL INVARIANT: this response (like every event/endpoint here) stays brain-agnostic —
@@ -260,6 +298,7 @@ def build_app(ctx: AgentContext):
         Route("/media/duck", media_duck, methods=["POST"]),
         Route("/media/state", media_state, methods=["GET"]),
         Route("/builder/poll", builder_poll, methods=["GET"]),
+        Route("/prewarm", prewarm, methods=["POST"]),
     ], middleware=middleware)
     app.state.sessions = sessions
     return app

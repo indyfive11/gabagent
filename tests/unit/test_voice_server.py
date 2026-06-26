@@ -398,3 +398,70 @@ async def test_respond_threads_room_id_onto_session_refresh_only(tmp_path):
                                  json={"session_id": "s1", "text": "hi", "room_id": "garage"}) as resp:
             await _drain(resp)
         assert app.state.sessions["s1"].room_id == "garage"      # refreshed from the payload
+
+
+# --- /prewarm (#2 cold-start mitigation) -----------------------------------
+
+class _RecordingClient(FakeClient):
+    def __init__(self):
+        super().__init__([])
+        self.warm_calls = []
+
+    async def complete_simple(self, messages, model=None):
+        self.warm_calls.append(model)
+        return "ok"
+
+
+async def _settle():
+    import asyncio
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+
+async def test_prewarm_fires_warm_call(tmp_path):
+    ctx = make_ctx(tmp_path, [])
+    ctx.client = _RecordingClient()
+    app = build_app(ctx)
+    async with _client(app) as client:
+        r = await client.post("/prewarm", json={"room": "raspi", "ts": 123})
+        assert r.status_code == 200 and r.json()["warming"] is True
+    await _settle()
+    assert ctx.client.warm_calls == ["arya"]          # warmed the simple model
+
+
+async def test_prewarm_cooldown_skips_second(tmp_path):
+    ctx = make_ctx(tmp_path, [])
+    ctx.client = _RecordingClient()
+    ctx.config.voice_prewarm_cooldown_secs = 60.0
+    app = build_app(ctx)
+    async with _client(app) as client:
+        await client.post("/prewarm", json={"room": "raspi"})
+        r2 = await client.post("/prewarm", json={"room": "raspi"})
+        assert r2.json().get("skipped") == "cooldown"
+    await _settle()
+    assert ctx.client.warm_calls == ["arya"]          # only the first warmed
+
+
+async def test_prewarm_per_room_independent(tmp_path):
+    ctx = make_ctx(tmp_path, [])
+    ctx.client = _RecordingClient()
+    ctx.config.voice_prewarm_cooldown_secs = 60.0
+    app = build_app(ctx)
+    async with _client(app) as client:
+        await client.post("/prewarm", json={"room": "raspi"})
+        r = await client.post("/prewarm", json={"room": "EndeavorMain"})
+        assert r.json()["warming"] is True            # a different room is not cooled down
+    await _settle()
+    assert ctx.client.warm_calls == ["arya", "arya"]
+
+
+async def test_prewarm_disabled_no_call(tmp_path):
+    ctx = make_ctx(tmp_path, [])
+    ctx.client = _RecordingClient()
+    ctx.config.voice_prewarm_enabled = False
+    app = build_app(ctx)
+    async with _client(app) as client:
+        r = await client.post("/prewarm", json={"room": "raspi"})
+        assert r.json().get("skipped") == "disabled"
+    await _settle()
+    assert ctx.client.warm_calls == []
