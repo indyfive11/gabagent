@@ -136,6 +136,17 @@ class RoomMediaProfile(BaseModel):
     # that restores the music to silence. True ⇒ the brain skips its tidal duck for this room and the
     # satellite owns it. Default false ⇒ the brain ducks as before (EM/global byte-identical).
     duck_local: bool = False
+    # Per-room Jellyfin (Phase 10 / #62 video half). In THIS deployment both rooms share the ONE EM
+    # Jellyfin server; a room is distinguished only by WHICH session it casts to — so the active per-room
+    # override is `jellyfin_client_target` (the room's native client, e.g. the Pi's mpv-shim, which streams
+    # from the shared EM server and plays on the room's own screen instead of the brain-host's browser).
+    jellyfin_client_target: str = ""   # Jellyfin DeviceName to cast+control (the room's mpv-shim client)
+    # base_url/api_key/user_id are an OPTIONAL future multi-server hook (mirrors the Tidal per-room
+    # override) — UNUSED in this single-server deployment: leave empty ⇒ fall through to the shared global
+    # EM Jellyfin (byte-identical). Only set these if a room ever points at a DIFFERENT Jellyfin server.
+    jellyfin_base_url: str = ""        # override the room's Jellyfin server URL (empty ⇒ shared global)
+    jellyfin_api_key: str = ""         # per-room API key (empty ⇒ global key)
+    jellyfin_user_id: str = ""         # per-room user id for played/unwatched filters (empty ⇒ global)
 
 
 class TmiConfig(BaseModel):

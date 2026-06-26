@@ -94,11 +94,78 @@ def _strip_vocative(text) -> str:
     return s
 
 
+def resolve_jellyfin(ctx):
+    """Effective JellyfinConfig for this turn's room (#62 video half) — the Jellyfin mirror of
+    resolve_tidal. Per-room overrides from room_media[room_id] (base_url / api_key / user_id) are layered
+    onto the GLOBAL JellyfinConfig via model_copy; no room / no profile / no overrides ⇒ the global config
+    UNCHANGED (byte-identical for EM, single-room, and unconfigured installs). None when jellyfin is
+    unconfigured (matches the prior getattr(ctx.config, "jellyfin", None) the call-sites used)."""
+    jc = getattr(getattr(ctx, "config", None), "jellyfin", None)
+    if jc is None:
+        return None
+    prof = _room_profile(ctx)
+    if prof is None:
+        return jc
+    overrides: dict = {}
+    for pf, jf in (("jellyfin_base_url", "base_url"), ("jellyfin_api_key", "api_key"),
+                   ("jellyfin_user_id", "user_id")):
+        val = (getattr(prof, pf, "") or "").strip()
+        if val:
+            overrides[jf] = val
+    return jc.model_copy(update=overrides) if overrides else jc
+
+
+def _room_profile(ctx):
+    """This turn's per-room media profile (room_media[room_id]) or None."""
+    rid = getattr(ctx, "room_id", None)
+    if not rid:
+        return None
+    return (getattr(getattr(ctx, "config", None), "room_media", None) or {}).get(rid)
+
+
+def _room_client_target(ctx) -> str:
+    """The Jellyfin DeviceName this room casts+controls (its native client, e.g. the Pi's mpv-shim).
+    Empty ⇒ the room has no native target → fall back to the brain-host owned-browser path (EM behavior)."""
+    prof = _room_profile(ctx)
+    return (getattr(prof, "jellyfin_client_target", "") or "").strip() if prof is not None else ""
+
+
+def _match_target_session(sessions: list[dict], target: str) -> dict | None:
+    """Find the /Sessions entry for a room's client_target — DeviceName first (stable, recommended),
+    then Client as a coarse fallback. None if no live session matches (e.g. mpv-shim not up yet)."""
+    if not target:
+        return None
+    t = target.strip().lower()
+    for s in sessions:
+        if (s.get("DeviceName") or "").strip().lower() == t:
+            return s
+    for s in sessions:
+        if (s.get("Client") or "").strip().lower() == t:
+            return s
+    return None
+
+
+def _session_locality(ctx, s: dict) -> str:
+    """Locality verdict for an observed session, with a per-room override: a duck_local room's OWN target
+    session (its mpv-shim) counts as LOCAL-to-that-room so /media/state reports the room's video playing
+    and the room's local-duck belt fires. A native Pi session would otherwise read REMOTE (LAN endpoint).
+    Scoped strictly to per-room-configured duck_local rooms — every other path keeps the pure global
+    judge_locality verdict (byte-identical for EM / unconfigured)."""
+    from gabagent.commands.media import judge_locality
+    prof = _room_profile(ctx)
+    if prof is not None and getattr(prof, "duck_local", False):
+        target = (getattr(prof, "jellyfin_client_target", "") or "").strip().lower()
+        if target and (s.get("DeviceName") or "").strip().lower() == target:
+            return "local"
+    return judge_locality(ctx, device_id=s.get("DeviceId", ""),
+                          device_name=s.get("DeviceName", ""), endpoint=s.get("RemoteEndPoint", ""))
+
+
 class JellyfinProvider:
     id = "jellyfin"
 
     async def detect(self, ctx: AgentContext) -> bool:
-        jc = getattr(ctx.config, "jellyfin", None)
+        jc = resolve_jellyfin(ctx)
         if not jc or not jc.enabled:
             return False
         try:
@@ -114,7 +181,7 @@ class JellyfinProvider:
         (loopback endpoint / our DeviceId / configured device-name → local; else remote) and owned=False —
         so a session on another device is visible for future explicit control but never auto-touched.
         Never raises."""
-        jc = getattr(ctx.config, "jellyfin", None)
+        jc = resolve_jellyfin(ctx)
         if not jc or not getattr(jc, "enabled", True) or not jc.api_key:
             return []
         from gabagent.commands.media import MediaSource, judge_locality
@@ -135,9 +202,7 @@ class JellyfinProvider:
                 out.append(MediaSource(
                     provider="jellyfin", kind="video",
                     state="paused" if paused else "playing", owned=False,
-                    locality=judge_locality(ctx, device_id=s.get("DeviceId", ""),
-                                            device_name=s.get("DeviceName", ""),
-                                            endpoint=s.get("RemoteEndPoint", "")),
+                    locality=_session_locality(ctx, s),
                     device_name=s.get("DeviceName", ""), device_id=s.get("DeviceId", ""),
                     endpoint=s.get("RemoteEndPoint", ""), session_key=s.get("Id", ""),
                     title=(npi.get("Name") or "")))
@@ -240,7 +305,7 @@ async def now_playing(ctx) -> ToolResult:
     and which device — so the brain can answer "is the movie still on in the bedroom?" not just "what am I
     watching here". On-demand only: the always-on media_state stays LOCAL-scoped to avoid cross-device
     flap, and this summary is a few short lines, so it never bloats the model's context."""
-    jc = ctx.config.jellyfin
+    jc = resolve_jellyfin(ctx)
     if not jc.enabled or not jc.api_key:
         return ToolResult(output="", error="Jellyfin isn't set up.")
     lines: list[str] = []
@@ -306,7 +371,7 @@ async def _other_session_playing(jc, exclude_title: str = "") -> bool:
 
 
 async def search(ctx, genre=None, min_rating=None, query=None, unwatched=False) -> ToolResult:
-    jc = ctx.config.jellyfin
+    jc = resolve_jellyfin(ctx)
     if not jc.api_key:
         return ToolResult(output="", error="Jellyfin API key not set (settings: jellyfin.api_key).")
     if query:
@@ -325,19 +390,42 @@ async def search(ctx, genre=None, min_rating=None, query=None, unwatched=False) 
         params["minCommunityRating"] = str(mr)
     if genre:
         params["Genres"] = genre
-    if query:
-        params["SearchTerm"] = query
     if unwatched and jc.user_id:
         params["IsPlayed"] = "false"
         params["userId"] = jc.user_id
-    try:
+
+    async def _run(term):
+        p = dict(params)
+        if term:
+            p["SearchTerm"] = term
         async with _client(jc) as c:
-            r = await c.get("/Items", params=params)
+            r = await c.get("/Items", params=p)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        return r.json().get("Items", [])
+
+    try:
+        if query:
+            # STT can't disambiguate a sequel homophone ("Pitch Perfect 2" → "Pitch Perfect to") — it's a
+            # homophone, fixable only here where the library is the candidate set. Try the digit form; keep
+            # it ONLY if a returned title actually carries that number (the false-positive guard) — else
+            # fall back to the spoken form so a query that merely ends in "for"/"to" isn't mangled.
+            from gabagent.voice.spoken_tokens import normalize_trailing_number
+            norm = normalize_trailing_number(query)
+            if norm != query:
+                items = await _run(norm)
+                digit = norm.split()[-1]
+                # Word-boundary match so the digit form only wins on a real "<title> N" title — not a
+                # substring hit ("2" inside "20" or "2 Fast 2 Furious"); else fall back to the spoken form.
+                _dpat = re.compile(rf"\b{re.escape(digit)}\b")
+                if not any(_dpat.search(i.get("Name") or "") for i in items):
+                    items = await _run(query)
+            else:
+                items = await _run(query)
+        else:
+            items = await _run(None)
     except Exception as e:
-        return ToolResult(output="", error=f"Jellyfin unreachable: {e}")
-    if r.status_code != 200:
-        return ToolResult(output="", error=f"Jellyfin search failed: HTTP {r.status_code}")
-    items = r.json().get("Items", [])
+        return ToolResult(output="", error=f"Jellyfin search failed: {e}")
     results = [
         {"id": i.get("Id"), "title": i.get("Name"), "year": i.get("ProductionYear"), "rating": i.get("CommunityRating")}
         for i in items
@@ -455,7 +543,7 @@ async def _rest_control(ctx, jc, session: dict, action: str, secs: int | None = 
 
 
 async def control(ctx, action="", position=None) -> ToolResult:
-    jc = ctx.config.jellyfin
+    jc = resolve_jellyfin(ctx)
     if action not in _ACTIONS:
         return ToolResult(output="", error=f"unknown action: {action}")
     if action == "fullscreen":
@@ -483,9 +571,13 @@ async def control(ctx, action="", position=None) -> ToolResult:
             if target is not None:
                 return await _rest_control(ctx, jc, target, action, secs)
         return await _browser_control(ctx, page, action, secs)
-    # No owned page → drive a native/controllable Jellyfin client over REST (prefer what's actually playing).
+    # No owned page → drive a native/controllable Jellyfin client over REST. For a per-room target (the
+    # Pi's mpv-shim) prefer THAT session, so pause/resume/stop/seek/volume hit the room's own player; else
+    # fall back to whatever's actually playing (EM/global behavior, unchanged).
     sessions = await _sessions(jc)
-    target = _other_playing_session(ctx, sessions) \
+    _target_name = _room_client_target(ctx)
+    target = (_match_target_session(sessions, _target_name) if _target_name else None) \
+        or _other_playing_session(ctx, sessions) \
         or next((s for s in sessions if s.get("NowPlayingItem")), None) \
         or next((s for s in sessions if s.get("SupportsRemoteControl")), None)
     if not target:
@@ -538,18 +630,31 @@ async def _rest_seek_to(jc, session, secs: int) -> ToolResult:
 async def play(ctx, item_id="", title="", position=None) -> ToolResult:
     # `title` is carried for the spoken confirmation only; playback uses item_id.
     from gabagent.voice import events
-    jc = ctx.config.jellyfin
+    jc = resolve_jellyfin(ctx)
     if not item_id:
         return ToolResult(output="", error="no item to play")
     start_secs = _coerce_secs(position)            # optional "start N seconds in"
     emit = getattr(ctx, "voice_emit", None)
 
-    # ALWAYS open OUR controllable window. We deliberately do NOT branch on the Jellyfin /Sessions list to
-    # offer "play there?": that list usually reflects API sessions on OTHER devices (a movie playing in
-    # another room), not a real local client we could hand off to here — so the old confirm fired on
-    # phantom/remote clients and was misleading. A web client also can't be REST-controlled anyway. So a play
-    # here just opens the window we own and can drive (via the <video> element), with no narration. Routing a
-    # play to another device ("play it on the bedroom TV") is the deferred whole-home roadmap, not this path.
+    # Per-room native cast (#62): when THIS room targets a native client (e.g. the Pi's mpv-shim), PlayNow
+    # to that /Sessions entry via REST and let it play on the room's own screen — instead of opening the
+    # brain-host's owned browser (which is the wrong machine for a satellite room). Target configured but no
+    # live session yet (mpv-shim down) ⇒ an honest error, NOT a browser on the brain host.
+    target = _room_client_target(ctx)
+    if target:
+        sess = _match_target_session(await _sessions(jc), target)
+        if sess is None:
+            return ToolResult(output="", error=f"The {target} player isn't available right now.")
+        if emit:
+            await emit(events.status("Casting to the room player…"))
+        res = await _play_to_session(jc, sess["Id"], item_id, sess.get("DeviceName") or target, start_secs)
+        if res.success and title:
+            ctx.jellyfin_playing_title = title
+        return res
+
+    # No per-room target (EM / default): open OUR controllable browser window and drive the <video>. We
+    # deliberately do NOT branch on the /Sessions list to offer "play there?" — that list usually reflects
+    # sessions on OTHER devices, and a web client can't be REST-controlled anyway.
     if emit:
         await emit(events.status("Opening the player…"))
     res = await _play_in_browser(ctx, jc, item_id, title, start_secs)
@@ -863,8 +968,9 @@ async def _browser_control(ctx, page, action, position: int | None = None) -> To
             # a DIFFERENT (unowned/other-device) Jellyfin session is still playing — close just reports what it
             # did. The on-demand jellyfin.now_playing is the explicit "is anything playing elsewhere?" path.
             # (Opt back in to restore the old "…but another is still playing" honesty notice.)
-            if getattr(ctx.config.jellyfin, "announce_other_sessions", False) \
-                    and await _other_session_playing(ctx.config.jellyfin, exclude_title=closed_title):
+            _jc = resolve_jellyfin(ctx)
+            if _jc is not None and getattr(_jc, "announce_other_sessions", False) \
+                    and await _other_session_playing(_jc, exclude_title=closed_title):
                 return ToolResult(output="I closed the window I opened, but another Jellyfin is still playing.")
             return ToolResult(output="Closed the movie window.")
         if action in ("volume_up", "volume_down"):

@@ -104,7 +104,8 @@ def _auth(profile: str, ctx: AgentContext) -> tuple[str, dict]:
     """Return (base_url, headers) for a named auth profile. Empty profile => no base/headers
     (the backend path is then expected to be a full URL). Profiles added per provider (Phase 2)."""
     if profile == "jellyfin":
-        jc = getattr(ctx.config, "jellyfin", None)
+        from gabagent.commands.providers.jellyfin import resolve_jellyfin
+        jc = resolve_jellyfin(ctx)   # per-room server when the room overrides it (#62)
         if jc is not None:
             return jc.base_url, ({"Authorization": f'MediaBrowser Token="{jc.api_key}"'} if jc.api_key else {})
     return "", {}
