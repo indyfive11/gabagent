@@ -422,16 +422,25 @@ async def close_named(ctx, name="") -> ToolResult:
         else ToolResult(output="", error="couldn't run the window command")
 
 
+def _is_plasma() -> bool:
+    """True only on a real KDE Plasma session. Window/desktop ops here drive KWin over DBus
+    (`org.kde.KWin`), which exists ONLY under Plasma. `qdbus6` alone is a bare Qt6 dependency present
+    on non-Plasma DEs too (e.g. Cinnamon, whose WM is Muffin), so gating on it would advertise window
+    control we can't execute — a detect-true → KWin-call-fail over-claim. Require an actual Plasma/KWin
+    binary instead (the authoritative-source detection the hardware-generalization SOP calls for)."""
+    return any(shutil.which(b) for b in ("plasmashell", "kwin_wayland", "kwin_x11"))
+
+
 class DesktopProvider:
     id = "desktop"
 
     async def detect(self, ctx: AgentContext) -> bool:
-        return any(shutil.which(b) for b in ("qdbus6", "spectacle", "kquitapp6", "wtype"))
+        return _is_plasma()
 
     def commands(self, ctx: AgentContext) -> list[Command]:
         cmds: list[Command] = []
 
-        if shutil.which("qdbus6"):
+        if _is_plasma():
             cmds += [
                 Command(id="window.maximize", domain="window", tier=1, featured=True,
                         summary="Maximize the active window", backend=_kwin("Window Maximize"),

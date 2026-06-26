@@ -121,6 +121,24 @@ class NullToolDisplay:
     def show_result(self, *a, **k): ...
 
 
+def _has_media_capability(ctx: AgentContext) -> bool:
+    """True if THIS room can actually play media: either a media provider (tidal/jellyfin) detected into
+    the catalog, OR the room is configured to cast to a native client (`room_media[...].jellyfin_client_target`,
+    e.g. the Pi's mpv-shim). Gates the media honesty constraint — a media-less device never improvises a
+    playback capability it lacks, while a cast-only room (no local player but a configured target) is NOT
+    falsely muzzled."""
+    cat = getattr(ctx, "command_catalog", None)
+    if cat is not None:
+        try:
+            if "media" in cat.domains():
+                return True
+        except Exception:
+            pass
+    rm = getattr(getattr(ctx, "config", None), "room_media", None) or {}
+    prof = rm.get(ctx.room_id) if getattr(ctx, "room_id", None) else None
+    return bool(prof and getattr(prof, "jellyfin_client_target", ""))
+
+
 def _voice_system(ctx: AgentContext) -> str:
     s = VOICE_ADDENDUM + f"\n\nWorking directory: {ctx.cwd}"
     caps = _capability_brief(ctx)
@@ -148,6 +166,14 @@ def _voice_system(ctx: AgentContext) -> str:
                 s += f"\n\nThis is who you are (your personality — speak in character, never mention it):\n{pb}"
         elif (persona := (getattr(ctx.config, "voice_persona", "") or "").strip()):
             s += f"\n\nStyle: speak as a {persona}."
+    if not _has_media_capability(ctx):
+        # Honesty gate: on a device with NO media playback in its real capability set (a remote control
+        # terminal, or a host whose providers/DE expose no player), the extensive media guidance above
+        # otherwise tempts an over-claim ("I'll play it in a browser…" — observed live on the media-less
+        # `mobile` room). Capability-derived, so any room that genuinely HAS media is unaffected.
+        s += ("\n\nThis device has NO media playback — there is no music or movie player here. If asked "
+              "to play music, a movie, or any media, say plainly you can't play media on this device; "
+              "never claim you'll open it in a browser or play it anywhere, and don't pretend to start it.")
     if ctx.local_mode and ctx.local_context_summary:
         s += f"\n\n{ctx.local_context_summary}"
     if getattr(ctx, "offline_failover", False):
