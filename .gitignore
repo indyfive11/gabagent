@@ -13,10 +13,15 @@ build/
 .ruff_cache/
 *.pyc
 
-# Secrets & Config
+# Secrets & Config — bare .env AND any backup/variant (a backup is the common leak path)
 .secrets/
 .env
+.env.bak*
+.env.*.bak
+*.bak
 *.key
+settings.json
+!.env.example
 
 # Logs
 *.log
