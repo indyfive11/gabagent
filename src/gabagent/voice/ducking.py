@@ -673,6 +673,16 @@ def _excluded_from_local_duck(block: str) -> bool:
     return False
 
 
+def _cast_duck_exclude_match(ctx) -> str:
+    """A sink-input substring the universal full-mute local-duck must NOT touch, because a satellite-side
+    gentle-duck belt already owns that node (the cast Jellyfin movie on a non-KDE room — e.g. the laptop's
+    JMP/mpv: brain gentle-duck no-ops it on the cast path, but this full-mute would hard-mute it and race the
+    belt on restore). config jellyfin.cast_duck_exclude_match; empty (default) ⇒ no extra exclusion ⇒
+    EM/Pi byte-identical."""
+    jc = getattr(getattr(ctx, "config", None), "jellyfin", None)
+    return (getattr(jc, "cast_duck_exclude_match", "") or "").strip().lower() if jc is not None else ""
+
+
 async def _duck_local_sinks(ctx, on: bool, mute: bool = False) -> bool:
     """Universal local-media duck: on a full-mute window-open, drop EVERY other local media sink-input to 0
     (saving each prior), and restore them on close — so Rob is heard over ANY local media. Only fires on
@@ -692,10 +702,15 @@ async def _duck_local_sinks(ctx, on: bool, mute: bool = False) -> bool:
             # in duck_media and saved its idx) — exclude it here so the two don't both save/restore it.
             jf_saved = st.get("jellyfin_sink_prior")
             owned_jf_idx = jf_saved[0] if jf_saved else None
+            # A cast movie node (e.g. the laptop's JMP/mpv) is owned by the satellite's gentle-duck belt; the
+            # owned_jf_idx exclusion above only covers the brain's OWN browser sink, so exclude the cast node
+            # explicitly by its configured substring (empty ⇒ no-op ⇒ EM/Pi unchanged).
+            cast_excl = _cast_duck_exclude_match(ctx)
             priors = {}
             for si in _parse_sink_inputs(out):
                 if si["volume"] is None or si["idx"] == owned_jf_idx \
-                        or _excluded_from_local_duck(si["block"]):
+                        or _excluded_from_local_duck(si["block"]) \
+                        or (cast_excl and cast_excl in si["block"].lower()):
                     continue
                 await _run_pactl("set-sink-input-volume", si["idx"], "0%")
                 priors[si["idx"]] = si["volume"]

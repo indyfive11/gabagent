@@ -107,6 +107,19 @@ class JellyfinConfig(BaseModel):
     # "is anything playing elsewhere?" path. Flip True to restore the volunteered "…but another is still
     # playing" notice. Env: GABAI_JELLYFIN__ANNOUNCE_OTHER_SESSIONS.
     announce_other_sessions: bool = False
+    # GLOBAL Jellyfin cast target (the native-client DeviceName to PlayNow+control via REST, e.g. a Jellyfin
+    # Media Player / mpv-shim). Empty (default) ⇒ no global target ⇒ the owned-browser play path (EM/KDE
+    # behavior, byte-identical). This is the SINGLE-ROOM analog of room_media[<room>].jellyfin_client_target:
+    # a single-room install whose desktop is NOT KDE (the Cinnamon laptop — the owned-browser path's KWin
+    # fullscreen can't run there) sets this so play() casts to a native client instead, with no room_media /
+    # room_id plumbing. Precedence: per-room target wins, else this global. Env: GABAI_JELLYFIN__CLIENT_TARGET.
+    client_target: str = ""
+    # A PipeWire sink-input substring the brain's universal full-mute local-duck (voice/ducking.py
+    # _duck_local_sinks) must NOT touch, because a satellite-side gentle-duck belt already owns that node.
+    # Set to the cast movie node (e.g. the laptop JMP/mpv `node.name`) so the brain doesn't ALSO hard-mute it
+    # on window-open and race the belt on restore. Empty (default) ⇒ no extra exclusion ⇒ EM/Pi byte-identical.
+    # Env: GABAI_JELLYFIN__CAST_DUCK_EXCLUDE_MATCH.
+    cast_duck_exclude_match: str = ""
 
 
 class TidalConfig(BaseModel):

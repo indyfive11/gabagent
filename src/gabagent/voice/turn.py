@@ -140,9 +140,15 @@ def _has_media_capability(ctx: AgentContext) -> bool:
                 return True
         except Exception:
             pass
-    rm = getattr(getattr(ctx, "config", None), "room_media", None) or {}
-    prof = rm.get(ctx.room_id) if getattr(ctx, "room_id", None) else None
-    return bool(prof and getattr(prof, "jellyfin_client_target", ""))
+    # Config-level fallback for when the catalog isn't (yet) populated with a detected provider — the
+    # catalog is built once at startup (cli.py) and a transient detect miss there would otherwise muzzle a
+    # genuinely media-capable room for the whole session. A configured native cast target means this room
+    # CAN play, so it must not be muzzled. Honor the SAME precedence as the play path
+    # (`_room_client_target`: per-room room_media[...].jellyfin_client_target → global jellyfin.client_target)
+    # — so a single-room global-target install (the Cinnamon laptop) gets the robustness the per-room
+    # backstop already gave the Pi, with no room_media required.
+    from gabagent.commands.providers.jellyfin import _room_client_target
+    return bool(_room_client_target(ctx))
 
 
 def _voice_system(ctx: AgentContext) -> str:

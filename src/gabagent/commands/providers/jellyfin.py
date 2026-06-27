@@ -125,9 +125,27 @@ def _room_profile(ctx):
 
 def _room_client_target(ctx) -> str:
     """The Jellyfin DeviceName this room casts+controls (its native client, e.g. the Pi's mpv-shim).
-    Empty ⇒ the room has no native target → fall back to the brain-host owned-browser path (EM behavior)."""
+    Precedence: the per-room room_media[room_id].jellyfin_client_target, else the GLOBAL
+    jellyfin.client_target (a single-room install — e.g. the Cinnamon laptop — with no room_media that still
+    needs to cast to a native client rather than the KWin-only owned-browser path). Empty ⇒ no native target
+    → the brain-host owned-browser path (EM behavior, byte-identical)."""
     prof = _room_profile(ctx)
-    return (getattr(prof, "jellyfin_client_target", "") or "").strip() if prof is not None else ""
+    if prof is not None:
+        t = (getattr(prof, "jellyfin_client_target", "") or "").strip()
+        if t:
+            return t
+    jc = getattr(getattr(ctx, "config", None), "jellyfin", None)
+    return (getattr(jc, "client_target", "") or "").strip() if jc is not None else ""
+
+
+def _is_kde_wayland_desktop() -> bool:
+    """True on a KDE desktop, where the owned-browser play path's fullscreen/screen-move (desktop.py via
+    `qdbus6 org.kde.KWin` / kglobalaccel) actually works. Read from the standard XDG env — universal, no
+    host-specific assumption. False on a non-KDE desktop (e.g. the laptop's Cinnamon), where the browser
+    path's KWin calls fail cryptically and a native cast target should be configured instead."""
+    import os
+    xdg = (os.environ.get("XDG_CURRENT_DESKTOP", "") or "").lower()
+    return "kde" in xdg or bool(os.environ.get("KDE_FULL_SESSION"))
 
 
 def _match_target_session(sessions: list[dict], target: str) -> dict | None:
@@ -651,6 +669,16 @@ async def play(ctx, item_id="", title="", position=None) -> ToolResult:
         if res.success and title:
             ctx.jellyfin_playing_title = title
         return res
+
+    # Guard the owned-browser path on a non-KDE desktop. That path full-screens via KWin (desktop.py /
+    # `qdbus6 org.kde.KWin`), which only exists on KDE — on e.g. the laptop's Cinnamon it fails cryptically.
+    # Reaching here means no cast target is configured for this room, so surface a clear, actionable error
+    # instead. KDE (EM) is unaffected; this only bites a non-KDE install that fell through to the browser path.
+    if not _is_kde_wayland_desktop():
+        return ToolResult(output="", error=(
+            "I can't play the movie here: this isn't a KDE desktop, so the built-in browser player can't run, "
+            "and no Jellyfin cast target is configured. Set jellyfin.client_target to a native client "
+            "(e.g. a Jellyfin Media Player device) so I can cast to it."))
 
     # No per-room target (EM / default): open OUR controllable browser window and drive the <video>. We
     # deliberately do NOT branch on the /Sessions list to offer "play there?" — that list usually reflects

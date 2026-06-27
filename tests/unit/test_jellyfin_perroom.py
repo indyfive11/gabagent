@@ -21,6 +21,14 @@ def _ctx(cfg, room_id=None, **extra):
     return SimpleNamespace(config=cfg, room_id=room_id, **extra)
 
 
+@pytest.fixture(autouse=True)
+def _force_kde(monkeypatch):
+    # The browser-fallback test here runs the KDE/EM owned-browser path; force KDE so the new non-KDE guard
+    # (jellyfin._is_kde_wayland_desktop) doesn't short-circuit it in a headless/non-KDE test env. The cast
+    # path tests don't reach the guard, so this is harmless for them.
+    monkeypatch.setattr(J, "_is_kde_wayland_desktop", lambda: True)
+
+
 # -- resolve_jellyfin -------------------------------------------------------
 
 def test_resolve_no_room_is_global():
