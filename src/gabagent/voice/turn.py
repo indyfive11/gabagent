@@ -705,7 +705,9 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
     _stamped: set[str] = set()
     _progress_task = None        # latency-gated progress-ack watchdog; created once routing commits to a turn
     _progress = {"acked": False}  # set when the watchdog OR the domain phrase emits the single per-turn filler
-    _arya_ttft0 = None           # round-0 arya ttft this turn → fed to the latency self-test (#6)
+    # #6 latency self-test samples per-round arya ttft inline at the gab_call site below (a round's ttft is
+    # pure model latency — tool exec falls BETWEEN rounds), so a slow round-1+ or a bad-cloud multi-round turn
+    # is caught; round-0-only sampling missed both.
 
     async def emit(ev):
         kind = getattr(ev, "type", None)
@@ -1013,10 +1015,13 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
             _stats = getattr(_call_client, "last_call_stats", None)
             if _stats is not None:
                 dlog(ctx, "gab_call", round=tool_rounds, backend=ctx.active_backend, **_stats)
-                if _arya_ttft0 is None and ctx.active_backend in (None, "gab"):
-                    # round-0 cloud ttft → latency self-test (#6). None = the unrouted default (arya);
-                    # an explicit "local"/"claude" backend is excluded (Turbo/local turns aren't arya).
-                    _arya_ttft0 = _stats.get("ttft_ms")
+                if ctx.active_backend in (None, "gab"):
+                    # EVERY arya round's ttft → latency self-test (#6). None = the unrouted default (arya);
+                    # an explicit "local"/"claude" backend is excluded (Turbo/local rounds aren't arya). A
+                    # round's ttft is pure model latency (tool exec is BETWEEN rounds), so it's an arya-only
+                    # sample — recording (ttft, ttft) is inherently "dominant", no attribution proxy needed.
+                    from gabagent.voice import latency_watch
+                    latency_watch.record(ctx, _stats.get("ttft_ms"), _stats.get("ttft_ms"))
 
             if text_buf:
                 ctx.session.append_message(
@@ -1132,15 +1137,14 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
             await emit(events.voice_volume(vv["op"], vv.get("value")))
             dlog(ctx, "voice_volume", op=vv["op"], value=vv.get("value"))
 
-        # Latency self-test → auto-Turbo (#6): record this turn's round-0 arya ttft (vs the turn total, the
-        # attribution gate) and, if the cloud is the DOMINANT slowness — or has recovered while in Turbo —
-        # speak a short Turbo offer + emit the hold event so the voice side keeps the window open for "yes".
-        # OFF unless voice_latency_watch. Deferred-NOT to a question turn (the offer would stack on a pending
-        # clarification): only appended after a terminal reply. Best-effort, never blocks `done`.
+        # Latency self-test → auto-Turbo (#6): per-round arya ttft was sampled at the gab_call site above; now
+        # decide whether to speak a short Turbo offer — the cloud is the DOMINANT slowness, or it has recovered
+        # while in Turbo — and emit the hold event so the voice side keeps the window open for "yes". OFF unless
+        # voice_latency_watch. The OFFER is deferred-NOT to a question turn (it would stack on a pending
+        # clarification): only after a terminal reply. Best-effort, never blocks `done`.
         if _is_terminal_reply(text_buf):
             try:
                 from gabagent.voice import latency_watch
-                latency_watch.record(ctx, _arya_ttft0, int((time.monotonic() - _t0) * 1000))
                 _offer = latency_watch.maybe_offer(ctx, ctx.session_id)
                 if _offer:
                     await emit(events.token(" " + _offer["text"]))

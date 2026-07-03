@@ -2,10 +2,14 @@
 DOMINANT cause of slow turns, offers to switch command turns to the fast (Claude) rung; "yes" toggles
 Turbo. When arya recovers it offers to switch back.
 
-Design (consensus with VAC, 2026-06-25):
-  - Detection is PASSIVE — off the round-0 arya ttft of real turns. No idle probing for detection.
-  - The OFFER is gated on arya being the dominant slowness (arya_ttft ≥ attribution × turn_total): a turn
-    that felt slow because of a long Tidal/command call (which Turbo can't speed) does NOT trigger it.
+Design (consensus with VAC, 2026-06-25; per-round sampling added 2026-07-03):
+  - Detection is PASSIVE — off EVERY arya round's ttft of real turns (round-0 and any tool-loop round). A
+    round's ttft is pure model latency (tool exec falls BETWEEN rounds), so it's an arya-only sample: a slow
+    round-1+ or a bad-cloud multi-round turn is caught, which round-0-only sampling missed. No idle probing.
+  - Tool time is therefore never counted as arya latency (that's what the attribution ratio in record() was a
+    proxy for — a fast-arya turn that felt slow from a long Tidal/command call does NOT trip). A movie that is
+    slow only from MANY normal-speed rounds is also (correctly) not a trip: that's round-count, not cloud
+    latency — offering Turbo there would mislabel a healthy cloud.
   - Recovery (while in Turbo, where commands route to Claude so there's no passive arya signal) uses a
     bounded ACTIVE probe — and self-suppresses if any room produced a recent real arya sample (the global
     sample buffer IS the "is any room feeding arya" signal, so no room registry is needed).

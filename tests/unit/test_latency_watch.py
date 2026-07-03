@@ -260,3 +260,58 @@ async def test_lapsed_offer_emits_release(tmp_path):
     evs = await run_turn(ctx, "what time is it")           # not an affirmation → lapses
     assert ctx.turbo_commands is False
     assert False in _holds(evs)                            # held window released before normal handling
+
+
+# -- per-round sampling (2026-07-03): every arya round is sampled, not just round-0 ------------
+
+from tests.unit.test_voice_turn import _spec
+
+
+class _MultiRoundStatsClient(FakeClient):
+    """Publishes a DIFFERENT per-round ttft each model call (like the real gab client across a tool loop),
+    so the turn loop feeds EACH arya round to the latency watcher — not just round-0."""
+    def __init__(self, responses, ttfts):
+        super().__init__(responses)
+        self.last_call_stats = None
+        self._ttfts = list(ttfts)
+
+    async def stream_complete(self, messages, tools=None, model=None, retry_model=None, **kw):
+        t = self._ttfts.pop(0)
+        self.last_call_stats = {"ttft_ms": t, "total_ms": t}
+        for c in self.responses.pop(0):
+            yield c
+
+
+async def test_per_round_catches_slow_tool_round(tmp_path, monkeypatch):
+    """A multi-round turn whose round-0 is fast but round-1 stalls past the hard ceiling must trip. This is
+    the live 74s-round-1 case the round-0-only sampler missed entirely."""
+    from gabagent.api.models import ToolResult
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, *a, **k):
+        return [ToolResult(output="ok") for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    ctx = make_ctx(tmp_path, [], voice_latency_watch=True, voice_latency_hard_ceiling_ms=15000)
+    ctx.client = _MultiRoundStatsClient(
+        [[[_spec("read_file", path="x")]], ["Here it is."]],   # round-0 tool call, round-1 final text
+        ttfts=[3000, 16000],                                    # fast round-0, stalled round-1
+    )
+    L._reset_for_test()
+    await run_turn(ctx, "read that file for me")
+    assert L.degraded(ctx) is True     # round-1's 16s was sampled; round-0-only would have seen only 3s
+
+
+async def test_per_round_healthy_many_rounds_do_not_trip(tmp_path, monkeypatch):
+    """A movie-style turn with MANY rounds that are each fast (healthy arya) must NOT trip — slowness from
+    round COUNT is not cloud-latency trouble, and offering Turbo there would mislabel a healthy cloud."""
+    from gabagent.api.models import ToolResult
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, *a, **k):
+        return [ToolResult(output="ok") for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    responses = [[[_spec("read_file", path="x")]] for _ in range(4)] + [["Playing it."]]
+    ctx = make_ctx(tmp_path, [], voice_latency_watch=True,
+                   voice_latency_ceiling_ms=5000, voice_latency_hard_ceiling_ms=10000)
+    ctx.client = _MultiRoundStatsClient(responses, ttfts=[2500] * 5)   # 5 fast rounds (each < ceiling)
+    L._reset_for_test()
+    await run_turn(ctx, "play tucker and dale vs evil")
+    assert L.degraded(ctx) is False    # median 2.5s < 5s ceiling, no single round > 10s → healthy, no trip
