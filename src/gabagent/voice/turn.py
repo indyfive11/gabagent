@@ -197,6 +197,15 @@ def _voice_system(ctx: AgentContext) -> str:
               "media player, timers) still works, but anything needing the internet — web search, online "
               "music/streaming, remote lookups — is unavailable right now, so don't attempt it; if asked, "
               "say briefly that you're offline and can't do that until your connection is back.")
+    if getattr(ctx.config, "introspect_enabled", True):
+        # Self-knowledge: only when this turn's user question is an explanatory self-question, append a
+        # curated "how I work" doc so Aria can answer it in one turn (plugin: gabagent.introspect). The
+        # `introspect` dlog tags the turn so the voice side can A/B first-audio (introspective vs normal).
+        from gabagent.introspect import introspect_brief
+        ib = introspect_brief(ctx)
+        if ib:
+            s += f"\n\n{ib}"
+            dlog(ctx, "introspect", injected=True)
     return s
 
 

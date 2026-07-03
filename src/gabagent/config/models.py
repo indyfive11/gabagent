@@ -301,6 +301,11 @@ class GabAgentConfig(BaseSettings):
     # used only when this is disabled/empty. Stored at data_dir()/persona/ (cwd-independent).
     persona_enabled: bool = True
     persona_reflect_on_shutdown: bool = True
+    # Self-knowledge introspection: on a voice turn whose user question is an explanatory self-question
+    # ("how do you pick a model", "what happens if the internet drops", "what are your limits"), inject a
+    # curated "how I work" doc into the system prompt so Aria explains herself in one turn. Gated on
+    # intent → zero cost on normal/command turns. Default-on (gated + benign); set false to disable.
+    introspect_enabled: bool = True
     voice_arm_seconds: int = 120
     # `/voice on` spawns the voice-agent front-end (mic + wake word) so the brain can hear, pointed at
     # the brain we just started. Empty → auto-resolve the `voice-agent` binary on PATH, then

@@ -206,6 +206,14 @@ def detect_meta_command(text: str) -> MetaCommand | None:
         return MetaCommand("quiet")
     if _UNDO.search(t):
         return MetaCommand("undo")
+    # Explanatory self-questions ("how do you decide which model", "what are your limits", "what happens
+    # if the internet drops") must REACH the model so the introspection layer can answer them from the
+    # injected self-knowledge doc — otherwise the canned _Q_MODEL/_Q_CAPS readouts below would swallow
+    # them with a one-line factual answer (the C1 fix). Episodic "why did you …" and control commands are
+    # excluded inside is_introspective, so they keep falling through to their normal handlers.
+    from gabagent.introspect.detect import is_introspective
+    if is_introspective(t):
+        return None
     if _Q_MODEL.search(t):
         return MetaCommand("query", "model")
     if _Q_WHERE.search(t):
