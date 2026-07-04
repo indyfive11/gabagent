@@ -32,6 +32,30 @@ Return ONLY the single integer for the right rung — no words, no punctuation.
 User request: {prompt}"""
 
 
+# Distinct catalog verdict-sets already logged this process — assemble() runs per turn, so we log a
+# drop/warn set ONCE (it's stable within a run; a refresh rewrites the cache → new set → logs again).
+_catalog_verdicts_logged: set = set()
+
+
+def _log_catalog_verdicts(verdicts) -> None:
+    """One dim line per dropped/warned rung, at most once per distinct verdict-set per process. Lands
+    in the voice brain's journal (journalctl --user -u aria-lan-brain) and the TUI. Silent when the
+    ladder validates clean or the cache is empty."""
+    notable = [v for v in verdicts if (not v.keep) or v.warn]
+    if not notable:
+        return
+    sig = tuple(sorted((v.model, v.keep, v.reason) for v in notable))
+    if sig in _catalog_verdicts_logged:
+        return
+    _catalog_verdicts_logged.add(sig)
+    for v in notable:
+        tag = "dropped rung" if not v.keep else "note"
+        console.print(
+            f"[gab.accent]▸[/gab.accent] [dim]model catalog: {tag} {v.model} ({v.backend}) — {v.reason}[/dim]",
+            markup=True,
+        )
+
+
 class ModelRouter:
     def __init__(
         self,
@@ -98,6 +122,17 @@ class ModelRouter:
             rungs.extend(config.claude.ladder)  # each already backend="claude"
         if not rungs:  # defensive — should not happen given the guard above
             return None
+
+        # Validate the gab-backend rungs against the live model catalog (cached; an empty/absent cache
+        # is a NO-OP, so an install that never ran `gab --models` behaves exactly as before). Drops a
+        # wrong / deprovisioned / non-tool-capable gab model before it costs a call and a bad turn;
+        # claude/local rungs are kept unchecked. NEVER empties the ladder — a wipeout keeps the raw rungs.
+        if getattr(config, "models_catalog_validate", True):
+            from gabagent.models_catalog import load_catalog, validate_ladder
+            kept, verdicts = validate_ladder(rungs, load_catalog())
+            _log_catalog_verdicts(verdicts)
+            if kept:
+                rungs = kept
 
         if include_claude:
             c0 = config.claude.ladder[0]

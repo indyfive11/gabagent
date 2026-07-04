@@ -306,6 +306,10 @@ class GabAgentConfig(BaseSettings):
     # curated "how I work" doc into the system prompt so Aria explains herself in one turn. Gated on
     # intent → zero cost on normal/command turns. Default-on (gated + benign); set false to disable.
     introspect_enabled: bool = True
+    # Validate the assembled router ladder's gab-backend rungs against the live model catalog
+    # (cached by `gab --models`). Default-on but a NO-OP until a cache exists, so an unconfigured
+    # install behaves exactly as before; set false to skip validation even when a cache is present.
+    models_catalog_validate: bool = True
     voice_arm_seconds: int = 120
     # `/voice on` spawns the voice-agent front-end (mic + wake word) so the brain can hear, pointed at
     # the brain we just started. Empty → auto-resolve the `voice-agent` binary on PATH, then

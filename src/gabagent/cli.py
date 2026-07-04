@@ -132,6 +132,7 @@ def main(
     voice_host: str = typer.Option("", "--voice-host", help="Voice server bind address (default: config voice_host, 127.0.0.1). Set a LAN IP for a remote satellite; pair with GABAI_VOICE_AUTH_TOKEN."),
     room_id: str = typer.Option("", "--room-id", help="Durable room key this brain serves (process-per-room), e.g. 'living_room'. Used by the tiered-memory layer; empty = single-room default."),
     set_claude_key: str = typer.Option("", "--set-claude-key", help="Save an Anthropic key, switch to the Claude backend, and exit"),
+    models: bool = typer.Option(False, "--models", help="Refresh + inspect the live model catalog and how it validates the router ladder, then exit"),
     version: bool = typer.Option(False, "--version", "-v", help="Show version"),
 ) -> None:
     _enable_faulthandler()
@@ -139,6 +140,12 @@ def main(
     if version:
         from gabagent import __version__
         typer.echo(f"gab-agent {__version__}")
+        raise typer.Exit()
+
+    if models:
+        from gabagent.config.loader import load_config
+        from gabagent.models_catalog.report import print_diagnostic
+        print_diagnostic(load_config())
         raise typer.Exit()
 
     if set_claude_key:

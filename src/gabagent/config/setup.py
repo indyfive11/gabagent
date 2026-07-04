@@ -60,8 +60,29 @@ async def run_first_time_setup(cfg: GabAgentConfig) -> GabAgentConfig:
     from gabagent.config.paths import settings_file
     save_config(cfg)
     console.print(f"\n[green]✓[/green] Saved to [dim]{settings_file()}[/dim]\n", markup=True)
+    _setup_models_catalog(cfg, console)
     console.print("[dim]Starting Gabagent...[/dim]\n", markup=True)
     return cfg
+
+
+def _setup_models_catalog(cfg: GabAgentConfig, console) -> None:
+    """Detect-and-write per the hardware-generalization SOP: fetch the live model catalog once and
+    cache it so the router can validate its ladder against reality. Best-effort — a network hiccup
+    or a local-only (no gab key) install just skips it (the router degrades to the configured ladder,
+    unchanged). Refreshable any time with `gab --models`."""
+    if not cfg.api_key:
+        return  # no Aria/Gab key (e.g. local-only) → nothing to fetch; router uses the raw ladder
+    try:
+        from gabagent.models_catalog import refresh_cache
+        cat = refresh_cache(cfg.base_url, cfg.api_key)
+        console.print(
+            f"[green]✓[/green] [dim]Model catalog cached ({len(cat)} models) — "
+            f"`gab --models` to refresh/inspect.[/dim]\n", markup=True)
+    except Exception as e:  # noqa: BLE001 — setup convenience, never fatal
+        console.print(
+            f"[yellow]○[/yellow] [dim]Model catalog fetch skipped ({type(e).__name__}); "
+            f"routing uses the configured ladder. Retry later with `gab --models`.[/dim]\n",
+            markup=True)
 
 
 async def _prompt(session, prompt_text: str, default: str = "") -> str:
