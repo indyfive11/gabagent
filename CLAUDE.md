@@ -59,6 +59,22 @@ Governed values include: GPU env (`HSA_OVERRIDE_GFX_VERSION` — now the `local_
 the Local-backend setup from `rocminfo`), `local_model` name, audio device sample-rate/channels/names,
 LAN bind IP, install paths. The sibling voice-agent repo follows the same SOP.
 
+## New-Module Deploy-Safety (HARD SOP — both repos)
+
+A change that adds a module which already-tracked / already-deployed code imports MUST do one of:
+
+1. **Guard the import at the call site** so an absent module degrades to the documented no-op (fail-soft) —
+   `try: from newmod import X` / `except ImportError: return None` (or equivalent), with the caller wiring
+   nothing when it's absent.
+2. **Ship the new module in the same commit / deploy-manifest as its importer.**
+
+**Never an importer without its import target.** Rationale: satellite deploys sync **git-tracked files only**
+(`git ls-files` — the Pi's `pi-voice-launch` rsync), so a new *untracked* module + a *tracked* importer =
+a guaranteed satellite crash (the Pi `ModuleNotFoundError: image_display` outage, 2026-07-04). Corollary:
+under a push-freeze, (1) is the freeze-safe path since (2) is blocked. Extend the guard to cover **construction**,
+not just the import — a fail-soft feature that still `ValueError`s while building its object isn't fail-soft.
+The sibling voice-agent repo carries the identical SOP.
+
 ## Testing
 
 ```bash
