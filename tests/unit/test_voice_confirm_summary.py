@@ -1,14 +1,37 @@
 """Consequential (Tier 2/3) voice confirms must SPEAK the resolved target so a fuzzy-salvaged WRONG
 argument is audible before the spoken/keyboard yes (fat-thin laptop design follow-up #1)."""
+import time
 import types
 
+from gabagent.config.models import GabAgentConfig
+from gabagent.credits import CreditBalance
+from gabagent.credits import credits as C
 from gabagent.permissions.voice_approve import _summarize, _summarize_command, _primary_target
 
 
+def _ctx_img(config=None):
+    return types.SimpleNamespace(command_catalog=None, config=config or GabAgentConfig())
+
+
 def test_generate_image_summary_is_brief_and_names_cost():
-    ctx = types.SimpleNamespace(command_catalog=None)
-    s = _summarize("generate_image", {"prompt": "a red bicycle"}, ctx)
+    s = _summarize("generate_image", {"prompt": "a red bicycle"}, _ctx_img())
     assert "of a red bicycle" in s and "credits" in s.lower()
+
+
+def test_generate_image_summary_appends_low_balance_note(monkeypatch, tmp_path):
+    monkeypatch.setattr(C, "credits_path", lambda: tmp_path / "c.json")
+    C.write_cache(CreditBalance.from_record({"total_available": 30}, fetched_at=time.time()))
+    cfg = GabAgentConfig()
+    cfg.credits_low_threshold = 100
+    s = _summarize("generate_image", {"prompt": "a cat"}, _ctx_img(cfg))
+    assert "low on credits" in s and "30" in s
+
+
+def test_generate_image_summary_no_note_when_guard_off(monkeypatch, tmp_path):
+    monkeypatch.setattr(C, "credits_path", lambda: tmp_path / "c.json")
+    C.write_cache(CreditBalance.from_record({"total_available": 30}, fetched_at=time.time()))
+    s = _summarize("generate_image", {"prompt": "a cat"}, _ctx_img())  # threshold 0 (default)
+    assert "low on credits" not in s and s.endswith("a few credits.")
 
 
 def test_generate_image_summary_truncates_long_prompt():

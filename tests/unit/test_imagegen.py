@@ -174,7 +174,8 @@ def _ctx(tmp_path, **over):
     cfg.base_url = "https://gab.ai/v1"
     cfg.image.output_dir = str(tmp_path)
     for k, v in over.items():
-        setattr(cfg.image, k, v)
+        target = cfg.image if hasattr(cfg.image, k) else cfg  # image.* vs top-level cfg fields
+        setattr(target, k, v)
     return types.SimpleNamespace(config=cfg)
 
 
@@ -253,6 +254,26 @@ async def test_tool_text_mode_does_not_enqueue(tmp_path, monkeypatch):
     ctx = _ctx(tmp_path)   # no voice_mode attr → text mode
     await GenerateImageTool().execute(ctx, prompt="x")
     assert A.poll("anyone", now=1.0) == []             # nothing enqueued in text mode
+
+
+async def test_tool_text_mode_appends_low_balance_note(tmp_path, monkeypatch):
+    desc = ImageDescriptor(path=str(tmp_path / "x.png"), url="u", mime="image/png", w=1, h=1,
+                           id="x", ttl_secs=60, credits_used=5)
+
+    async def fake_gen(prompt, **kw):
+        return [desc]
+
+    monkeypatch.setattr("gabagent.imagegen.tool.generate_images", fake_gen)
+    from gabagent.credits import credits as C
+    from gabagent.credits import CreditBalance
+    import time as _t
+    monkeypatch.setattr(C, "credits_path", lambda: tmp_path / "cred.json")
+    C.write_cache(CreditBalance.from_record({"total_available": 20}, fetched_at=_t.time()))
+
+    ctx = _ctx(tmp_path, credits_low_threshold=100)   # text mode (no voice_mode attr)
+    r = await GenerateImageTool().execute(ctx, prompt="x")
+    assert r.error is None
+    assert "low on credits" in r.output and "20" in r.output
 
 
 async def test_tool_wraps_generation_error(tmp_path, monkeypatch):

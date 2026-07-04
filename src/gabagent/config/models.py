@@ -337,6 +337,12 @@ class GabAgentConfig(BaseSettings):
     # (cached by `gab --models`). Default-on but a NO-OP until a cache exists, so an unconfigured
     # install behaves exactly as before; set false to skip validation even when a cache is present.
     models_catalog_validate: bool = True
+    # Low-balance guard for credit-spending tools (image-gen, video). When > 0, a spend tool adds a brief
+    # heads-up ("you're low on credits — N left") once the spendable pool (GET /v1/credits total_available)
+    # falls below this many credits; the check reads a short-TTL cache, never polling per call. 0 (default)
+    # disables the guard entirely — an unconfigured install behaves exactly as before. `gab --credits` shows
+    # the live balance and this guard's state. Env: GABAI_CREDITS_LOW_THRESHOLD.
+    credits_low_threshold: int = 0
     voice_arm_seconds: int = 120
     # `/voice on` spawns the voice-agent front-end (mic + wake word) so the brain can hear, pointed at
     # the brain we just started. Empty → auto-resolve the `voice-agent` binary on PATH, then

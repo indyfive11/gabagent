@@ -137,4 +137,14 @@ class GenerateImageTool(ToolBase):
         summary = "\n".join(lines)
         if credits:
             summary += f"\n({credits} credits used)"
+        # Low-balance heads-up in the result — text-mode surface (voice already warned at the spoken
+        # confirm before the spend). Best-effort; a guard failure never affects the generation.
+        if not getattr(ctx, "voice_mode", False):
+            try:
+                from gabagent.credits.credits import low_balance_note
+                note = low_balance_note(cfg)
+                if note:
+                    summary += f"\n(Heads up: {note}.)"
+            except Exception:
+                pass
         return ToolResult(output=summary)

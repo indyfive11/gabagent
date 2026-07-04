@@ -133,6 +133,7 @@ def main(
     room_id: str = typer.Option("", "--room-id", help="Durable room key this brain serves (process-per-room), e.g. 'living_room'. Used by the tiered-memory layer; empty = single-room default."),
     set_claude_key: str = typer.Option("", "--set-claude-key", help="Save an Anthropic key, switch to the Claude backend, and exit"),
     models: bool = typer.Option(False, "--models", help="Refresh + inspect the live model catalog and how it validates the router ladder, then exit"),
+    credits: bool = typer.Option(False, "--credits", help="Show the live Aria/Gab credit balance and the low-balance guard state, then exit"),
     version: bool = typer.Option(False, "--version", "-v", help="Show version"),
 ) -> None:
     _enable_faulthandler()
@@ -146,6 +147,12 @@ def main(
         from gabagent.config.loader import load_config
         from gabagent.models_catalog.report import print_diagnostic
         print_diagnostic(load_config())
+        raise typer.Exit()
+
+    if credits:
+        from gabagent.config.loader import load_config
+        from gabagent.credits.report import print_diagnostic as print_credits
+        print_credits(load_config())
         raise typer.Exit()
 
     if set_claude_key:

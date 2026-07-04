@@ -161,12 +161,19 @@ def _summarize(tool_name: str, args: dict, ctx: AgentContext) -> str:
         return f"Commit with the message: {msg}."
     if tool_name == "generate_image":
         # Spoken Tier-2 confirm: name the subject briefly so a misheard prompt is audible before the
-        # spend, and remind (very briefly) that it costs credits. Kept short for TTS.
+        # spend, and remind (very briefly) that it costs credits. Kept short for TTS. When the low-balance
+        # guard is tripped, append a heads-up so the user hears it BEFORE saying yes (the real pre-call gate).
         prompt = str(args.get("prompt", "")).strip().replace("\n", " ")
         if len(prompt) > 50:
             prompt = prompt[:50] + "…"
         subj = f" of {prompt}" if prompt else ""
-        return f"Generate an image{subj} — this uses a few credits."
+        base = f"Generate an image{subj} — this uses a few credits."
+        try:
+            from gabagent.credits.credits import low_balance_note
+            note = low_balance_note(ctx.config)
+        except Exception:
+            note = ""
+        return base + (f" Heads up, {note}." if note else "")
     if tool_name == "run_command":
         return _summarize_command(args, ctx)
     # Every summary is spoken aloud, so never read raw args/tool calls: humanize the tool
