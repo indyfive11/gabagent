@@ -213,6 +213,48 @@ async def test_tool_success_reports_path_and_stashes_descriptor(tmp_path, monkey
     assert ctx.image_descriptors == [desc.to_dict()]
 
 
+async def test_tool_voice_mode_enqueues_display_item(tmp_path, monkeypatch):
+    desc = ImageDescriptor(path=str(tmp_path / "abc.png"), url="https://cdn.gab.ai/u/abc.png",
+                           mime="image/png", w=1024, h=1024, id="abc", ttl_secs=3600,
+                           revised_prompt="a cat", credits_used=5)
+
+    async def fake_gen(prompt, **kw):
+        return [desc]
+
+    monkeypatch.setattr("gabagent.imagegen.tool.generate_images", fake_gen)
+    from gabagent.voice import announce_store as A
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+
+    ctx = _ctx(tmp_path)
+    ctx.voice_mode = True
+    ctx.voice_session = types.SimpleNamespace(session_id="room-em")
+    r = await GenerateImageTool().execute(ctx, prompt="a cat")
+    assert r.error is None
+
+    out = A.poll("room-em", now=1.0)
+    assert len(out) == 1
+    assert out[0]["job_id"] == "img-abc"
+    assert out[0]["text"] == ""                       # display-only, no spoken line
+    assert out[0]["display"]["url"] == "https://cdn.gab.ai/u/abc.png"
+    assert out[0]["display"]["path"] == str(tmp_path / "abc.png")
+
+
+async def test_tool_text_mode_does_not_enqueue(tmp_path, monkeypatch):
+    desc = ImageDescriptor(path=str(tmp_path / "x.png"), url="u", mime="image/png", w=1, h=1,
+                           id="x", ttl_secs=60)
+
+    async def fake_gen(prompt, **kw):
+        return [desc]
+
+    monkeypatch.setattr("gabagent.imagegen.tool.generate_images", fake_gen)
+    from gabagent.voice import announce_store as A
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data2"))
+
+    ctx = _ctx(tmp_path)   # no voice_mode attr → text mode
+    await GenerateImageTool().execute(ctx, prompt="x")
+    assert A.poll("anyone", now=1.0) == []             # nothing enqueued in text mode
+
+
 async def test_tool_wraps_generation_error(tmp_path, monkeypatch):
     async def boom(prompt, **kw):
         raise RuntimeError("upstream 500")

@@ -68,25 +68,32 @@ def _read(path: Path) -> dict | None:
 # -- producers (builder runner, timer ticker) — write a new ready item -------
 
 def enqueue(
-    text: str,
+    text: str = "",
     job_id: str | None = None,
     source: str = "",
     preferred_session: str | None = None,
+    display: dict | None = None,
     now: float | None = None,
 ) -> dict | None:
     """Enqueue a deferred announcement. `text` is the FULLY-PHRASED spoken line (the voice side speaks it
-    verbatim). `job_id` is the delivery key the poller acks on (defaults to a fresh unique id). Empty text
-    is dropped. Returns the item, or None if dropped. Lock-free: a unique filename + atomic write can't
-    collide with a concurrent poll/ack (which only ever touch existing files under the poll lock)."""
+    verbatim). `display` is an OPTIONAL structured payload the poller renders instead of/alongside speech —
+    the image-gen display descriptor {path,url,mime,w,h,id,ttl_secs,…} (transport 'a'): the voice side shows
+    it on the room's sink, picking `path` when co-located vs the public `url` cross-host. A display-only item
+    (empty text + a display payload) is valid — the image shows silently while the turn's own reply narrates.
+    An item with NEITHER text nor display is dropped. `job_id` is the delivery key the poller acks on
+    (defaults to a fresh unique id). Returns the item, or None if dropped. Lock-free: a unique filename +
+    atomic write can't collide with a concurrent poll/ack (which only ever touch existing files under the
+    poll lock)."""
     text = (text or "").strip()
-    if not text:
+    if not text and not display:
         return None
     now = time.time() if now is None else now
     item_id = job_id or f"ann-{int(now)}-{uuid.uuid4().hex[:8]}"
     item: dict[str, Any] = {
         "job_id": item_id,
         "text": text,
-        "source": source,                       # "builder" | "timer" | … (debugging; not on the wire)
+        "display": display,                     # None ⇒ spoken-only; else a render descriptor (on the wire)
+        "source": source,                       # "builder" | "timer" | "image" | … (debugging; not on the wire)
         "status": "ready",                      # ready -> delivering -> (removed on ack)
         "preferred_session": preferred_session, # originating-first; None ⇒ free-for-all
         "claimed_by": None,
@@ -166,7 +173,11 @@ def poll(session_id: str, now: float | None = None, lease_secs: float = DEFAULT_
                 )
                 if eligible:
                     item.update(status="delivering", claimed_by=session_id, claim_renewed_ts=now)
-                    assigned.append({"job_id": item["job_id"], "text": item["text"]})
+                    entry = {"job_id": item["job_id"], "text": item["text"]}
+                    disp = item.get("display")
+                    if disp is not None:          # add the render descriptor only when present, so a
+                        entry["display"] = disp   # plain spoken ring stays byte-identical on the wire
+                    assigned.append(entry)
                     dirty = True
             if dirty:
                 _atomic_write(path, item)

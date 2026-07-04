@@ -24,6 +24,28 @@ def test_empty_text_is_dropped(store):
     assert store.poll("sX", now=1.0) == []
 
 
+def test_display_only_item_survives_empty_text(store):
+    # A display-only item (image, no spoken line) is valid — empty text must NOT drop it.
+    desc = {"path": "/a.png", "url": "https://cdn.gab.ai/a.png", "mime": "image/png",
+            "w": 1024, "h": 1024, "id": "a", "ttl_secs": 3600}
+    assert store.enqueue("", job_id="img-a", display=desc) is not None
+    out = store.poll("sX", now=1.0)
+    assert out == [{"job_id": "img-a", "text": "", "display": desc}]
+
+
+def test_display_carried_alongside_text(store):
+    desc = {"path": "/b.png", "url": "", "mime": "image/png", "w": 1, "h": 1, "id": "b", "ttl_secs": 60}
+    store.enqueue("Here's your image.", job_id="img-b", display=desc)
+    out = store.poll("sX", now=1.0)
+    assert out == [{"job_id": "img-b", "text": "Here's your image.", "display": desc}]
+
+
+def test_spoken_only_ring_has_no_display_key(store):
+    # A plain ring stays byte-identical on the wire — no `display` key at all.
+    store.enqueue("Tea is ready.", job_id="j1")
+    assert store.poll("sX", now=1.0) == [{"job_id": "j1", "text": "Tea is ready."}]
+
+
 def test_ack_removes_item(store):
     store.enqueue("done", job_id="j1")
     assert store.poll("sX", now=1.0)  # claimed

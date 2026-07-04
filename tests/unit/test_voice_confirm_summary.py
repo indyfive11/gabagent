@@ -2,7 +2,26 @@
 argument is audible before the spoken/keyboard yes (fat-thin laptop design follow-up #1)."""
 import types
 
-from gabagent.permissions.voice_approve import _summarize_command, _primary_target
+from gabagent.permissions.voice_approve import _summarize, _summarize_command, _primary_target
+
+
+def test_generate_image_summary_is_brief_and_names_cost():
+    ctx = types.SimpleNamespace(command_catalog=None)
+    s = _summarize("generate_image", {"prompt": "a red bicycle"}, ctx)
+    assert "of a red bicycle" in s and "credits" in s.lower()
+
+
+def test_generate_image_summary_truncates_long_prompt():
+    ctx = types.SimpleNamespace(command_catalog=None)
+    long = "a photorealistic sprawling cyberpunk cityscape at night with neon signage everywhere"
+    s = _summarize("generate_image", {"prompt": long}, ctx)
+    assert "…" in s and "credits" in s.lower() and len(s) < 120
+
+
+def test_generate_image_summary_without_prompt_still_names_cost():
+    ctx = types.SimpleNamespace(command_catalog=None)
+    s = _summarize("generate_image", {}, ctx)
+    assert "credits" in s.lower() and s.startswith("Generate an image")
 
 
 def _ctx_with_command(*, summary="", confirm_template=""):

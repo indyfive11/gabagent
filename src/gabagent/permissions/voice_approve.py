@@ -159,6 +159,14 @@ def _summarize(tool_name: str, args: dict, ctx: AgentContext) -> str:
         if len(msg) > 80:
             msg = msg[:80] + "…"
         return f"Commit with the message: {msg}."
+    if tool_name == "generate_image":
+        # Spoken Tier-2 confirm: name the subject briefly so a misheard prompt is audible before the
+        # spend, and remind (very briefly) that it costs credits. Kept short for TTS.
+        prompt = str(args.get("prompt", "")).strip().replace("\n", " ")
+        if len(prompt) > 50:
+            prompt = prompt[:50] + "…"
+        subj = f" of {prompt}" if prompt else ""
+        return f"Generate an image{subj} — this uses a few credits."
     if tool_name == "run_command":
         return _summarize_command(args, ctx)
     # Every summary is spoken aloud, so never read raw args/tool calls: humanize the tool

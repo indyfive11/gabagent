@@ -158,6 +158,12 @@ def tier_of(
     if tool_name == "manage_builder":
         return 2 if args.get("action") in ("graduate", "cancel", "discard") else 1
 
+    # generate_image: spends a few credits + hits the network, but it's benign and non-destructive.
+    # The right gate is a spoken yes/no with a brief cost reminder (see voice_approve._summarize),
+    # never a keyboard confirm — you're talking, not at the keyboard.
+    if tool_name == "generate_image":
+        return 2
+
     # git_branch: listing is a read; create/switch is a local Tier-2 change.
     if tool_name == "git_branch":
         return 1 if args.get("action") == "list" else 2

@@ -102,12 +102,32 @@ class GenerateImageTool(ToolBase):
         if not descriptors:
             return ToolResult(output="", error="Image generation returned no images.")
 
-        # Stash the structured descriptors on the context so a future voice display-seam hook can route
-        # them to a screen by room-locality (dynamic attr — no spine field needed; inert in text mode).
+        # Stash the structured descriptors on the context (dynamic attr — no spine field; inert in text mode).
         try:
             ctx.image_descriptors = [d.to_dict() for d in descriptors]  # type: ignore[attr-defined]
         except Exception:
             pass
+
+        # Voice display seam (transport 'a', Rob-greenlit 2026-07-04): hand each image to the voice side via
+        # the deferred announce channel as a DISPLAY-ONLY item (empty text — the turn's own reply narrates).
+        # The voice consumer renders it on the room's mpv sink, picking `path` (:L co-located) vs the public
+        # `url` (:R cross-host) by locality. Prefer the originating session so it shows in the room that asked.
+        # Best-effort + voice-only: a store hiccup never fails the generation, and text mode never enqueues.
+        if getattr(ctx, "voice_mode", False):
+            try:
+                from gabagent.voice import announce_store
+
+                sid = getattr(getattr(ctx, "voice_session", None), "session_id", "") or ""
+                for d in descriptors:
+                    announce_store.enqueue(
+                        "",
+                        job_id=f"img-{d.id}",
+                        source="image",
+                        preferred_session=sid or None,
+                        display=d.to_dict(),
+                    )
+            except Exception:
+                pass
 
         lines = [
             f"Saved {d.path} ({d.w}×{d.h} {d.mime})" + (f" — {d.url}" if d.url else "")

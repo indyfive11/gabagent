@@ -32,6 +32,13 @@ def test_write_into_documents_is_tier1(home):
     assert tier_of("write_file", {"path": str(dest), "content": "hi"}, home / "proj", cfg) == 1
 
 
+def test_generate_image_is_tier2_spoken(home):
+    # A credit-spend but benign — voice-confirmable (spoken yes/no), never keyboard-gated.
+    cfg = _cfg()
+    assert tier_of("generate_image", {"prompt": "a sunset"}, home / "proj", cfg) == 2
+    assert tier_of("generate_image", {}, home / "proj", cfg) == 2
+
+
 def test_project_edit_is_tier2(home):
     cfg = _cfg()
     proj = home / "proj"
