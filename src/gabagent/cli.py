@@ -497,6 +497,10 @@ def _register_tools() -> None:
     except ImportError:
         pass
     try:
+        import gabagent.imagegen.tool  # noqa: F401
+    except ImportError:
+        pass
+    try:
         import gabagent.commands.tools  # noqa: F401
     except ImportError:
         pass

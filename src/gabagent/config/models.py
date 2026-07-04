@@ -210,6 +210,33 @@ class DesktopConfig(BaseModel):
     auto_fullscreen_movie: bool = True
 
 
+class ImageGenConfig(BaseModel):
+    """Image generation via the Gab/Aria `/v1/images/generations` endpoint (first-party provider).
+
+    The `generate_image` tool calls the endpoint, downloads the (public CDN) PNG to a local file under
+    the output dir, and produces a display descriptor {path,url,mime,w,h,id,ttl_secs} for the future voice
+    display seam. GA owns generation + local-file GC; the returned CDN url is PUBLIC, so no brain-side file
+    server is needed for cross-host satellites — they fetch the url directly. Default-on but inert until the
+    `generate_image` tool is actually invoked, so an unconfigured install behaves exactly as before."""
+    enabled: bool = True
+    # Default model for a plain "generate an image of X" (overridable per-call by the tool's `model` arg).
+    # Any /v1/models image-capable id. gpt-image-1 = flagship quality (~5 credits); gpt-image-2 / gpt-image-1-
+    # mini / image-generator are cheaper. The authoritative per-call charge is the response's usage.credits_used
+    # (the catalog base_cost is only a floor). Env: GABAI_IMAGE__MODEL.
+    model: str = "gpt-image-1"
+    # Default size ("WxH"). Empty ⇒ let the endpoint pick its own default. Env: GABAI_IMAGE__SIZE.
+    size: str = "1024x1024"
+    # Where generated PNGs are written. Empty (default) ⇒ data_dir()/images. A concrete path travels to any
+    # host. Env: GABAI_IMAGE__OUTPUT_DIR.
+    output_dir: str = ""
+    # Local-file GC: on each generation, delete files in the output dir older than this many seconds (GA owns
+    # cleanup per the image-seam contract; the CDN copy is Gab's to retain, not ours). 0 disables GC. 24h default.
+    # Env: GABAI_IMAGE__TTL_SECS.
+    ttl_secs: int = 86400
+    # Per-call request timeout (s). Image generation can take 10-30s. Env: GABAI_IMAGE__TIMEOUT_SECS.
+    timeout_secs: float = 120.0
+
+
 class GabAgentConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="GABAI_",
@@ -493,6 +520,7 @@ class GabAgentConfig(BaseSettings):
     jellyfin: JellyfinConfig = Field(default_factory=JellyfinConfig)
     tidal: TidalConfig = Field(default_factory=TidalConfig)
     desktop: DesktopConfig = Field(default_factory=DesktopConfig)
+    image: ImageGenConfig = Field(default_factory=ImageGenConfig)
     tmi: TmiConfig = Field(default_factory=TmiConfig)
     # Phase 10 / #62: per-room media-target overrides, keyed by room_id. Empty default = no override on any
     # room = today's single-target behavior (byte-identical). Written by the future `gab detect-media` sync.
