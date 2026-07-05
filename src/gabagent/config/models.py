@@ -440,6 +440,13 @@ class GabAgentConfig(BaseSettings):
     # False disables the emit (the command still speaks its confirm but no event crosses). Kill-switch.
     # Env: GABAI_VOICE_VOLUME_CONTROL.
     voice_volume_control: bool = True
+    # Media transport-intent signal (movie-night wake-media-pause resume-suppression). When a turn issues a
+    # user PAUSE/STOP of playing media, the turn emits a `transport_intent` SSE event so the voice side's
+    # wake-media-pauser does NOT auto-resume the movie it paused on wake — the user paused it themselves, so
+    # leave it paused ("Hey Aria, pause the movie"). False disables the emit only (the pause command still
+    # runs + confirms); the voice side then degrades to resume-unless-session-closed. Kill-switch.
+    # Env: GABAI_VOICE_TRANSPORT_INTENT.
+    voice_transport_intent: bool = True
     # Item C — STT wake-expansion guard. A bare wake ("Hey Aria", ~0.7s) can be fluently mis-transcribed
     # into a question ("Hey, how are you?"), defeating the text-only listen-first guard (no wake token
     # survives the rewrite; "how" even fast-passes as a question word). The voice side carries the

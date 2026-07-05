@@ -84,6 +84,68 @@ def test_session_locality_unaffected_without_duck_local():
     assert J._session_locality(ctx, s) == "remote"   # no per-room locality without duck_local
 
 
+# -- locality flap-hardening: remembered DeviceId pins the cast session local through the L↔R flap ------
+
+def test_seed_remembers_target_deviceid():
+    rm = {"raspi": RoomMediaProfile(jellyfin_client_target="raspi-jellyfin", duck_local=True)}
+    ctx = _ctx(_cfg(rm), room_id="raspi")
+    J._seed_owned_deviceid(ctx, [{"DeviceName": "raspi-jellyfin", "DeviceId": "01ad147b"}])
+    assert J._owned_deviceid_cache(ctx).get("raspi") == "01ad147b"
+
+
+def test_seed_from_idle_session_without_nowplaying():
+    """Seed scans the FULL /Sessions list, so it remembers the DeviceId even when the target is idle
+    (no NowPlayingItem) — so the DeviceId is known before playback flaps the locality verdict."""
+    rm = {"raspi": RoomMediaProfile(jellyfin_client_target="raspi-jellyfin", duck_local=True)}
+    ctx = _ctx(_cfg(rm), room_id="raspi")
+    # No NowPlayingItem key at all — still seeded.
+    J._seed_owned_deviceid(ctx, [{"DeviceName": "raspi-jellyfin", "DeviceId": "01ad147b"}])
+    assert J._owned_deviceid_cache(ctx).get("raspi") == "01ad147b"
+
+
+def test_session_locality_pins_by_remembered_deviceid_through_flap():
+    """The fix: after seeding, a poll where the SAME session (by stable DeviceId) reports a blank/mismatched
+    DeviceName + LAN endpoint (the cast-negotiation flap) still reads LOCAL — killing the L↔R flap that made
+    /media/state report the movie idle."""
+    rm = {"raspi": RoomMediaProfile(jellyfin_client_target="raspi-jellyfin", duck_local=True)}
+    ctx = _ctx(_cfg(rm), room_id="raspi")
+    J._seed_owned_deviceid(ctx, [{"DeviceName": "raspi-jellyfin", "DeviceId": "01ad147b"}])
+    flapped = {"DeviceName": "", "DeviceId": "01ad147b", "RemoteEndPoint": "192.168.1.108:5000"}
+    assert J._session_locality(ctx, flapped) == "local"
+
+
+def test_remembered_deviceid_does_not_leak_to_other_sessions():
+    """A genuinely different remote session (different DeviceId) must stay remote — the pin is exact."""
+    rm = {"raspi": RoomMediaProfile(jellyfin_client_target="raspi-jellyfin", duck_local=True)}
+    ctx = _ctx(_cfg(rm), room_id="raspi")
+    J._seed_owned_deviceid(ctx, [{"DeviceName": "raspi-jellyfin", "DeviceId": "01ad147b"}])
+    other = {"DeviceName": "Living Room TV", "DeviceId": "ffff", "RemoteEndPoint": "192.168.1.50:5000"}
+    assert J._session_locality(ctx, other) == "remote"
+
+
+def test_seed_noop_without_duck_local():
+    rm = {"raspi": RoomMediaProfile(jellyfin_client_target="raspi-jellyfin", duck_local=False)}
+    ctx = _ctx(_cfg(rm), room_id="raspi")
+    J._seed_owned_deviceid(ctx, [{"DeviceName": "raspi-jellyfin", "DeviceId": "01ad147b"}])
+    assert J._owned_deviceid_cache(ctx).get("raspi") is None
+
+
+def test_seed_refreshes_on_shim_restart():
+    """A shim restart re-registers under a new DeviceId — the seed refreshes each poll, never goes stale."""
+    rm = {"raspi": RoomMediaProfile(jellyfin_client_target="raspi-jellyfin", duck_local=True)}
+    ctx = _ctx(_cfg(rm), room_id="raspi")
+    J._seed_owned_deviceid(ctx, [{"DeviceName": "raspi-jellyfin", "DeviceId": "old"}])
+    J._seed_owned_deviceid(ctx, [{"DeviceName": "raspi-jellyfin", "DeviceId": "new"}])
+    assert J._owned_deviceid_cache(ctx).get("raspi") == "new"
+
+
+def test_seed_noop_for_default_room_no_target():
+    """EM/default (no room_id, no target) — seed is a pure no-op, cache stays empty (byte-identical)."""
+    ctx = _ctx(_cfg(), room_id=None)
+    J._seed_owned_deviceid(ctx, [{"DeviceName": "raspi-jellyfin", "DeviceId": "01ad147b"}])
+    assert J._owned_deviceid_cache(ctx) == {}
+
+
 # -- play() cast routing ----------------------------------------------------
 
 @pytest.mark.asyncio

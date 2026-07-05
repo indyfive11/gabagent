@@ -464,6 +464,28 @@ def _is_media_command(ctx: AgentContext, cid: str | None) -> bool:
     return bool(cmd is not None and getattr(cmd, "domain", "") == "media")
 
 
+def _is_transport_suppress(ctx: AgentContext, cid: str | None, args: dict | None = None) -> bool:
+    """True if this tool call is a user PAUSE/STOP of media — the transport intents whose auto-resume the
+    voice-side wake-media-pauser must suppress (the user paused the movie themselves during the command
+    window; don't un-pause it on window-close — the movie-night "pause the movie" case). The intent is read
+    from BOTH the command_id verb (`media.pause` / `tidal.pause`) AND the `action` arg
+    (`jellyfin.control(action="pause"|"stop")` — how Jellyfin VIDEO transport is routed, i.e. the movie case
+    itself), so a movie pause isn't missed just because its verb rides an arg. NARROW to pause/stop by
+    design: resume/toggle/next/previous/now_playing must NOT suppress (a resume wants it playing; a query/
+    skip keeps the same session, which the voice side resumes anyway). Gated on it being a real media command
+    so a stray '.pause'-suffixed non-media id can't trip it. Over-detection is the only harm (a wrongly-
+    suppressed resume leaves the movie paused); the gate makes that near-impossible, and under-detection
+    degrades safely to the voice side's resume-unless-session-closed."""
+    if not _is_media_command(ctx, cid):
+        return False
+    from gabagent.commands.resolve import _looks_like_media_transport, _MEDIA_VERB
+    intent = _looks_like_media_transport(cid or "")
+    if intent is None and isinstance(args, dict):
+        action = str(args.get("action") or "").replace("-", "_").lower()
+        intent = _MEDIA_VERB.get(action)
+    return intent in ("pause", "stop")
+
+
 def _terminal_confirmation(ctx: AgentContext, tool_calls, results) -> str | None:
     """If EVERY tool call this round was a run_command for a `terminal_confirm` command that SUCCEEDED,
     return the joined spoken confirmation built from their outputs — the turn can speak it and end,
@@ -891,6 +913,7 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
         status_emitted = False   # cap spoken status to ONE per turn (no "Opening… Trying… Looking…" chains)
         fell_back = False        # turn-level arya fallback fires at most once per turn
         media_ran = False        # any media-domain command this turn → emit a keepalive before `done`
+        transport_suppress = False  # a user PAUSE/STOP of media this turn → emit transport_intent before `done`
         ctx._voice_volume_signal = None   # cleared each turn; voice.set_volume sets it → emit before `done`
         sig_counts: dict[str, int] = {}   # tool-call signature → times seen this turn (loop detector)
         tool_rounds = 0                    # total tool rounds this turn (hard backstop)
@@ -1048,14 +1071,19 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
                 # turn (was inferred-by-tier before) — e.g. to see exactly what a "move the window" turn
                 # invoked, or whether a control command paused a movie.
                 cid = None
+                args = {}
                 if tc.name == "run_command":
                     try:
-                        cid = (json.loads(tc.arguments) if tc.arguments else {}).get("command_id") or None
+                        parsed = json.loads(tc.arguments) if tc.arguments else {}
+                        args = parsed if isinstance(parsed, dict) else {}
+                        cid = args.get("command_id") or None
                     except Exception:
-                        cid = None
+                        args, cid = {}, None
                 dlog(ctx, "tool", name=tc.name, command_id=cid, ok=result.success, error=result.error)
                 if _is_media_command(ctx, cid):
                     media_ran = True
+                    if _is_transport_suppress(ctx, cid, args):
+                        transport_suppress = True
                 ctx.session.append_message(
                     ChatMessage(role="tool", content=result.to_content(), tool_call_id=tc.id)
                 )
@@ -1113,6 +1141,17 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
         if media_ran and keepalive_secs > 0:
             await emit(events.keepalive(keepalive_secs))
             dlog(ctx, "keepalive", ttl_secs=keepalive_secs)
+
+        # Media transport-intent (movie-night resume-suppression): if THIS turn PAUSED/STOPPED playing media
+        # at the user's request, tell the voice side so its wake-media-pauser does NOT auto-resume the movie
+        # it paused on wake when the command window closes (the "Hey Aria, pause the movie" case — the wake
+        # already paused it; the user then confirmed pause, so leave it paused). Without this the voice side
+        # can't tell its own auto-pause from the user's pause — both leave the SAME session paused-present —
+        # and would wrongly resume. Rides the existing /respond SSE, arrival-keyed, safe to omit. 0/off ⇒ the
+        # voice side degrades to resume-unless-session-closed (stop still works via session-close).
+        if transport_suppress and getattr(ctx.config, "voice_transport_intent", True):
+            await emit(events.transport_intent())
+            dlog(ctx, "transport_intent", intent="pause_stop")
 
         # Conversation-hold release: tell the voice side to restore the bed-duck at BotStopped (instead of
         # holding it the full conversation-hold window) when THIS turn is a TERMINAL reply over playing media.

@@ -163,17 +163,60 @@ def _match_target_session(sessions: list[dict], target: str) -> dict | None:
     return None
 
 
+def _owned_deviceid_cache(ctx) -> dict:
+    """Per-ctx {room_id -> cast-target DeviceId}. The remembered STABLE DeviceId of a duck_local room's
+    mpv-shim, used to pin its locality LOCAL through transient flaps (see _seed_owned_deviceid)."""
+    c = getattr(ctx, "_jf_owned_deviceid", None)
+    if c is None:
+        c = {}
+        try:
+            ctx._jf_owned_deviceid = c
+        except Exception:
+            pass
+    return c
+
+
+def _seed_owned_deviceid(ctx, sessions: list[dict]) -> None:
+    """For a duck_local room, REMEMBER the stable DeviceId of its cast-target session (matched by
+    DeviceName/Client, even a session with NO NowPlayingItem), so _session_locality can pin the cast
+    session LOCAL through a transient DeviceName/NowPlayingItem flap that would otherwise read it REMOTE.
+    Root cause it kills (live 2026-07-04 Pi movie): the raspi mpv-shim's /Sessions entry read
+    `jellyfin:playing:R` (→ /media/state idle) for a ~2-3min cast-negotiation window before flipping to
+    `:L`, so the movie-duck signal saw the movie idle. The DeviceId is rock-stable (VAC live-confirmed);
+    keying on it removes the flap. Refreshed every poll (a shim restart re-seeds a new DeviceId, so it never
+    goes stale). Scoped strictly to duck_local rooms; no-op otherwise (byte-identical EM/unconfigured)."""
+    prof = _room_profile(ctx)
+    if prof is None or not getattr(prof, "duck_local", False):
+        return
+    target = (getattr(prof, "jellyfin_client_target", "") or "").strip()
+    rid = getattr(ctx, "room_id", None)
+    if not target or rid is None:
+        return
+    match = _match_target_session(sessions, target)
+    dev_id = (match.get("DeviceId") or "").strip() if match else ""
+    if dev_id:
+        _owned_deviceid_cache(ctx)[rid] = dev_id
+
+
 def _session_locality(ctx, s: dict) -> str:
     """Locality verdict for an observed session, with a per-room override: a duck_local room's OWN target
     session (its mpv-shim) counts as LOCAL-to-that-room so /media/state reports the room's video playing
     and the room's local-duck belt fires. A native Pi session would otherwise read REMOTE (LAN endpoint).
     Scoped strictly to per-room-configured duck_local rooms — every other path keeps the pure global
-    judge_locality verdict (byte-identical for EM / unconfigured)."""
+    judge_locality verdict (byte-identical for EM / unconfigured).
+
+    Flap-hardened (2026-07-04): matches on the target DeviceName first, else on the REMEMBERED stable
+    DeviceId (_seed_owned_deviceid) — so a poll whose DeviceName momentarily doesn't match still reads
+    local, killing the L↔R cast-negotiation flap that made /media/state report the movie idle."""
     from gabagent.commands.media import judge_locality
     prof = _room_profile(ctx)
     if prof is not None and getattr(prof, "duck_local", False):
         target = (getattr(prof, "jellyfin_client_target", "") or "").strip().lower()
         if target and (s.get("DeviceName") or "").strip().lower() == target:
+            return "local"
+        rid = getattr(ctx, "room_id", None)
+        dev_id = (s.get("DeviceId") or "").strip()
+        if rid is not None and dev_id and _owned_deviceid_cache(ctx).get(rid) == dev_id:
             return "local"
     return judge_locality(ctx, device_id=s.get("DeviceId", ""),
                           device_name=s.get("DeviceName", ""), endpoint=s.get("RemoteEndPoint", ""))
@@ -212,7 +255,11 @@ class JellyfinProvider:
                                 title=getattr(ctx, "jellyfin_playing_title", "") or "")]
         out = []
         try:
-            for s in await _sessions(jc):
+            sess = await _sessions(jc)
+            # Remember the duck_local room's cast-target DeviceId from the FULL session list (before the
+            # NowPlayingItem filter below drops idle ones) so _session_locality can pin it local through flaps.
+            _seed_owned_deviceid(ctx, sess)
+            for s in sess:
                 npi = s.get("NowPlayingItem")
                 if not npi:
                     continue

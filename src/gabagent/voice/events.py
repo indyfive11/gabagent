@@ -92,6 +92,20 @@ def convo_hold() -> VoiceEvent:
     return VoiceEvent(type="convo_hold", extra={"release": True})
 
 
+def transport_intent() -> VoiceEvent:
+    """Media transport-intent signal (brain → voice client). Emitted before `done` when THIS turn issued a
+    user-intended PAUSE or STOP of playing media. The voice side's wake-media-pauser reads it to SUPPRESS
+    its auto-resume: if the user themselves paused/stopped the media during the command window, the pauser
+    must NOT un-pause it on window-close (the movie-night "pause the movie" case — the wake already paused
+    it, the user then confirmed pause, so leave it paused). Rides the EXISTING /respond SSE response, NOT a
+    new proactive channel (that seam was deliberately dropped). Arrival-keyed by TYPE — a serializer dropping
+    a literal `true` can't disarm it (same robustness rule as `addressed`/`convo_hold`); the bool is carried
+    via `extra` for logging and to survive to_dict's empty-value filter. Provider-NEUTRAL per the brain↔voice
+    protocol invariant (no jellyfin/tidal name crosses). Safe to omit — a voice side that doesn't consume it
+    degrades to resume-unless-session-closed. Wire shape co-designed with the voice agent."""
+    return VoiceEvent(type="transport_intent", extra={"transport_intent": True})
+
+
 def voice_volume(op: str, value: float | None = None) -> VoiceEvent:
     """Change Aria's OWN TTS voice volume (brain → voice client, F3). Emitted before `done` when the user
     asks to change HER speaking volume — distinct from media/system volume, which the brain handles itself.

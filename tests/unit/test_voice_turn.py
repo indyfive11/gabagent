@@ -712,6 +712,111 @@ async def test_keepalive_disabled_when_secs_zero(home, monkeypatch):
     assert not any(e.type == "wake_hold" for e in evs)
 
 
+# -- Media transport-intent: suppress the voice-side wake-pause auto-resume on a user pause/stop --------
+
+def _transport_ctx(home, responses, **cfg_kw):
+    ctx = make_ctx(home, responses, **cfg_kw)
+    # Media ids spanning both routing shapes: jellyfin video via control(action=...), tidal via verb-in-cid.
+    ctx.command_catalog = _FakeCatalog(
+        {"jellyfin.control", "tidal.pause", "tidal.stop", "tidal.play"})
+    return ctx
+
+
+def _patch_addressed_yes(monkeypatch):
+    import gabagent.voice.addressed as _addr
+    async def _yes(ctx, text, wake=None):
+        return True, "fast"
+    monkeypatch.setattr(_addr, "is_addressed", _yes)
+
+
+def test_transport_intent_event_wire_shape():
+    from gabagent.voice import events
+    ev = events.transport_intent()
+    assert ev.type == "transport_intent"
+    assert ev.to_dict() == {"type": "transport_intent", "transport_intent": True}
+
+
+async def _run_transport(home, monkeypatch, cid, *, action=None, **cfg_kw):
+    """Drive one media run_command and return the emitted event types."""
+    from gabagent.api.models import ToolResult
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, *a, **k):
+        return [ToolResult(output="Done.") for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    _patch_addressed_yes(monkeypatch)
+    spec_kw = {"command_id": cid}
+    if action is not None:
+        spec_kw["action"] = action
+    ctx = _transport_ctx(home, [[[_spec("run_command", **spec_kw)]], ["Done."]], **cfg_kw)
+    evs = await run_turn(ctx, "do the media thing")
+    return [e.type for e in evs]
+
+
+async def test_jellyfin_pause_via_action_arg_emits_transport_intent(home, monkeypatch):
+    """The movie case: jellyfin.control(action='pause') — verb rides the ARG, not the cid — must still
+    emit transport_intent before done so the voice side won't auto-resume the movie it paused on wake."""
+    types_ = await _run_transport(home, monkeypatch, "jellyfin.control", action="pause")
+    assert "transport_intent" in types_
+    assert types_.index("transport_intent") < types_.index("done")
+    assert types_[-1] == "done"
+
+
+async def test_jellyfin_stop_via_action_arg_emits_transport_intent(home, monkeypatch):
+    types_ = await _run_transport(home, monkeypatch, "jellyfin.control", action="stop")
+    assert "transport_intent" in types_
+
+
+async def test_tidal_pause_verb_in_cid_emits_transport_intent(home, monkeypatch):
+    """Music/verb-in-cid shape: tidal.pause — detected from the command_id verb."""
+    types_ = await _run_transport(home, monkeypatch, "tidal.pause")
+    assert "transport_intent" in types_
+
+
+async def test_resume_does_not_emit_transport_intent(home, monkeypatch):
+    """A resume/play must NOT suppress — the user wants it playing; the voice side resumes anyway."""
+    types_ = await _run_transport(home, monkeypatch, "jellyfin.control", action="play")
+    assert "transport_intent" not in types_
+
+
+async def test_play_command_does_not_emit_transport_intent(home, monkeypatch):
+    types_ = await _run_transport(home, monkeypatch, "tidal.play")
+    assert "transport_intent" not in types_
+
+
+async def test_transport_intent_kill_switch_disables_emit(home, monkeypatch):
+    """voice_transport_intent=False suppresses only the wire event (the pause still ran)."""
+    types_ = await _run_transport(home, monkeypatch, "jellyfin.control", action="pause",
+                                  voice_transport_intent=False)
+    assert "transport_intent" not in types_
+
+
+async def test_non_media_pause_id_does_not_emit_transport_intent(home, monkeypatch):
+    """A non-media command whose id happens to end in '.pause' must not trip the suppress gate."""
+    from gabagent.api.models import ToolResult
+    import gabagent.voice.turn as turn_mod
+    async def fake_exec(tool_calls, *a, **k):
+        return [ToolResult(output="ok") for _ in tool_calls]
+    monkeypatch.setattr(turn_mod, "_execute_tool_calls", fake_exec)
+    _patch_addressed_yes(monkeypatch)
+    # 'system.pause' is NOT in the fake catalog's media set → _is_media_command False.
+    ctx = _transport_ctx(home, [[[_spec("run_command", command_id="system.pause")]], ["ok"]])
+    evs = await run_turn(ctx, "pause the system")
+    assert not any(e.type == "transport_intent" for e in evs)
+
+
+def test_is_transport_suppress_unit(home):
+    """Direct unit coverage of the classifier over both routing shapes."""
+    from gabagent.voice.turn import _is_transport_suppress
+    ctx = _transport_ctx(home, [["x"]])
+    assert _is_transport_suppress(ctx, "jellyfin.control", {"action": "pause"}) is True
+    assert _is_transport_suppress(ctx, "jellyfin.control", {"action": "stop"}) is True
+    assert _is_transport_suppress(ctx, "jellyfin.control", {"action": "play"}) is False
+    assert _is_transport_suppress(ctx, "tidal.pause", {}) is True
+    assert _is_transport_suppress(ctx, "tidal.play", {}) is False
+    assert _is_transport_suppress(ctx, "system.pause", {"action": "pause"}) is False  # not media
+    assert _is_transport_suppress(ctx, None, {}) is False
+
+
 # -- Terminal-command confirmation: speak the tool output, skip the narration model call -------------
 
 class _TermCatalog:
