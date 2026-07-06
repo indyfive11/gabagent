@@ -278,9 +278,10 @@ async def recommend(ctx, count=5, like="", genre="", decade=None) -> ToolResult:
             rec = slot["rec"]
             if rec.year is None or rec.vote < _MIN_VOTE or rec.votes < _MIN_VOTES:
                 continue
-            off = offered.get(str(tid))
-            if off and (now - off) < cd:
-                continue
+            if mode == "surprise":                  # cooldown is a surprise-me NOVELTY concept; directed
+                off = offered.get(str(tid))          # asks ("good 90s sci-fi", "like Interstellar") are
+                if off and (now - off) < cd:         # repeatable/quasi-factual and should return the same
+                    continue                         # canonical answers each time, not a worse second list.
             out.append(slot)
         if mode == "discover":
             # directed filter: rank by fame-within-the-filter (vote count), rating as tie-break — the
@@ -294,16 +295,23 @@ async def recommend(ctx, count=5, like="", genre="", decade=None) -> ToolResult:
     # --- candidate generation by mode ---
     anchor_title = ""
     if mode == "discover":
-        # directed filter — one /discover query, no seed/cache machinery (co-occurrence is degenerate here,
-        # so every candidate gets cooccur=1 and ranks on the popularity-penalty + rating).
+        # directed filter — /discover queries, no seed/cache machinery (co-occurrence is degenerate here,
+        # so every candidate gets cooccur=1 and ranks on fame-within-the-lane).
+        def _absorb_discover(recs):
+            for rec in recs:
+                if rec.tmdb_id not in owned_ids:
+                    candidates.setdefault(rec.tmdb_id, {"rec": rec, "cooccur": 1, "because": []})
         recs = await source.discover(genre=genre, year_from=year_from, year_to=year_to)
         if not recs:
             what = _directed_label(genre, year_from) or "movies"
             return ToolResult(output="", error=f"I couldn't find good {what} movies to suggest — "
                                                "try a different genre or decade.")
-        for rec in recs:
-            if rec.tmdb_id not in owned_ids:
-                candidates.setdefault(rec.tmdb_id, {"rec": rec, "cooccur": 1, "because": []})
+        _absorb_discover(recs)
+        if len(_ranked_picks()) < n:   # thin → page 2 before the honest floor. Symmetric with the seed
+            # path's rescue: a heavily-owned lane guts the top-20-by-votes (owned-exclusion), so a directed
+            # ask on a large library is the MOST likely to thin — go one page deeper, never lower the gate.
+            _absorb_discover(await source.discover(genre=genre, year_from=year_from,
+                                                   year_to=year_to, page=2))
     else:
         # seed-based expansion. surprise = owned seeds sampled by genre share; anchor = one resolved named
         # film (even if unowned). Both share the neighbor machinery + the page-2 thin-yield rescue.
@@ -326,10 +334,12 @@ async def recommend(ctx, count=5, like="", genre="", decade=None) -> ToolResult:
         return ToolResult(output="", error="I couldn't find good movies you don't already own right now — "
                                            "try again in a little while.")
 
-    # record offered (prune expired on write) + return the addable list
-    for s in top:
-        offered[str(s["rec"].tmdb_id)] = now
-    _save(_OFFERED_PATH, {k: v for k, v in offered.items() if (now - v) < cd})
+    # record offered (surprise-me ONLY — see the cooldown note in _ranked_picks; directed modes neither
+    # read nor write the store, so they stay repeatable and don't pollute surprise-me's novelty pool)
+    if mode == "surprise":
+        for s in top:
+            offered[str(s["rec"].tmdb_id)] = now
+        _save(_OFFERED_PATH, {k: v for k, v in offered.items() if (now - v) < cd})
 
     out = [{"tmdb_id": s["rec"].tmdb_id, "title": s["rec"].title, "year": s["rec"].year,
             "rating": round(s["rec"].vote, 1),

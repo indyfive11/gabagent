@@ -50,7 +50,7 @@ class DiscoverySource(Protocol):
         ...
 
     async def discover(self, genre: str = "", year_from: int | None = None,
-                       year_to: int | None = None) -> list[Rec]:
+                       year_to: int | None = None, page: int = 1) -> list[Rec]:
         """Directed discovery by filter — a genre name and/or release-year range — rather than by a seed.
         Returns quality-sorted candidates ([] if unsupported, the genre is unknown, or on failure)."""
         ...
@@ -111,7 +111,7 @@ class TmdbSource:
         return _to_rec(results[0]) if (results and results[0].get("id")) else None
 
     async def discover(self, genre: str = "", year_from: int | None = None,
-                       year_to: int | None = None) -> list[Rec]:
+                       year_to: int | None = None, page: int = 1) -> list[Rec]:
         try:
             async with httpx.AsyncClient(base_url=_TMDB_BASE, timeout=_CALL_TIMEOUT) as c:
                 # sort_by=vote_COUNT.desc (most-voted = most-watched/canonical within the filter), NOT
@@ -120,7 +120,7 @@ class TmdbSource:
                 # still drops single-vote junk; the recommender's rating gate (≥6.2) keeps quality. This is
                 # the deliberate INVERSE of the surprise-me popularity penalty: directing by genre means the
                 # user wants the famous-in-that-lane films, not adjacent-obscure ones.
-                params = {"api_key": self._key, "language": self._lang, "page": 1,
+                params = {"api_key": self._key, "language": self._lang, "page": max(1, int(page)),
                           "sort_by": "vote_count.desc", "vote_count.gte": _DISCOVER_MIN_VOTES}
                 if genre:
                     gid = await self._genre_id(c, genre)

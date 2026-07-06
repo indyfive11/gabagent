@@ -28,11 +28,13 @@ class FakeSource:
     `discover_result` is the list returned by discover() (directed mode)."""
     id = "tmdb"
 
-    def __init__(self, mapping=None, page2=None, resolve_map=None, discover_result=None):
+    def __init__(self, mapping=None, page2=None, resolve_map=None, discover_result=None,
+                 discover_page2=None):
         self.mapping = mapping or {}
         self.page2 = page2 or {}
         self.resolve_map = resolve_map or {}
         self.discover_result = discover_result or []
+        self.discover_page2 = discover_page2 or []
         self.calls = []
         self.discover_calls = []
 
@@ -48,9 +50,9 @@ class FakeSource:
         self.calls.append(("resolve", title))
         return self.resolve_map.get(title)
 
-    async def discover(self, genre="", year_from=None, year_to=None):
-        self.discover_calls.append((genre, year_from, year_to))
-        return list(self.discover_result)
+    async def discover(self, genre="", year_from=None, year_to=None, page=1):
+        self.discover_calls.append((genre, year_from, year_to, page))
+        return list(self.discover_page2 if page == 2 else self.discover_result)
 
 
 def _ctx(**over):
@@ -75,8 +77,9 @@ def _rec(tid, title="X", year=2020, vote=7.5, votes=1000, pop=10.0):
     return Rec(tmdb_id=tid, title=title, year=year, vote=vote, votes=votes, popularity=pop)
 
 
-def _use_source(monkeypatch, mapping=None, page2=None, resolve_map=None, discover_result=None):
-    src = FakeSource(mapping, page2, resolve_map, discover_result)
+def _use_source(monkeypatch, mapping=None, page2=None, resolve_map=None, discover_result=None,
+                discover_page2=None):
+    src = FakeSource(mapping, page2, resolve_map, discover_result, discover_page2)
     monkeypatch.setattr(ms, "select_source", lambda cfg: src)
     return src
 
@@ -328,9 +331,9 @@ async def test_discover_by_genre_and_decade(monkeypatch):
         _rec(300, "90s SciFi A", 1995, vote=7.8, votes=2000),
         _rec(301, "90s SciFi B", 1993, vote=7.1, votes=900),
     ])
-    out = json.loads((await ms.recommend(_ctx(), genre="sci-fi", decade=1990)).output)
+    out = json.loads((await ms.recommend(_ctx(), count=2, genre="sci-fi", decade=1990)).output)
     assert [o["tmdb_id"] for o in out] == [300, 301]           # ranked by vote COUNT (fame) desc
-    assert src.discover_calls == [("sci-fi", 1990, 1999)]      # decade → (from,to) range
+    assert src.discover_calls == [("sci-fi", 1990, 1999, 1)]   # decade → (from,to) range; page 1 filled n=2
     assert "sci-fi" in out[0]["because"] and "90s" in out[0]["because"]
     assert not src.calls                                        # no neighbors/seed machinery in discover mode
 
@@ -362,6 +365,32 @@ async def test_discover_works_with_empty_library(monkeypatch):
     _use_source(monkeypatch, discover_result=[_rec(300, "A Good One", 1995, votes=2000)])
     out = json.loads((await ms.recommend(_ctx(), genre="horror", decade=1990)).output)
     assert [o["tmdb_id"] for o in out] == [300]
+
+
+@respx.mock
+async def test_discover_page2_rescue_when_page1_thin(monkeypatch):
+    # MED-1: a heavily-owned lane guts page 1 (owned-exclusion) → fall to page 2 before the honest floor.
+    _owned((300, "Owned A", ["X"]), (301, "Owned B", ["X"]))   # both page-1 canonicals already owned
+    src = _use_source(monkeypatch,
+        discover_result=[_rec(300, "Owned A", 1995, votes=9000), _rec(301, "Owned B", 1996, votes=8000)],
+        discover_page2=[_rec(302, "Unowned C", 1994, votes=2000), _rec(303, "Unowned D", 1997, votes=1500)])
+    out = json.loads((await ms.recommend(_ctx(), genre="sci-fi", decade=1990)).output)
+    assert [o["tmdb_id"] for o in out] == [302, 303]           # page-2 unowned filled the pool
+    assert [c[3] for c in src.discover_calls] == [1, 2]        # page 1 then page 2 fetched
+
+
+@respx.mock
+async def test_discover_ignores_and_does_not_write_offered_cooldown(monkeypatch):
+    # MED-2: directed asks are repeatable — a title offered "recently" must STILL come back, and a
+    # directed result must NOT be recorded to the offered store (that's a surprise-me novelty concept).
+    import time
+    _owned((1, "Owned", ["X"]))
+    _use_source(monkeypatch, discover_result=[_rec(300, "Canonical", 1995, votes=9000)])
+    ms._OFFERED_PATH.write_text(json.dumps({"300": time.time()}))   # 300 "offered" moments ago
+    out = json.loads((await ms.recommend(_ctx(), genre="sci-fi", decade=1990)).output)
+    assert [o["tmdb_id"] for o in out] == [300]                     # NOT cooldown-suppressed for directed
+    # and the directed result did not overwrite/expand the store beyond what was already there
+    assert set(json.loads(ms._OFFERED_PATH.read_text())) == {"300"}
 
 
 @respx.mock
