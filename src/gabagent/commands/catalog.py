@@ -14,6 +14,12 @@ _ID_ALIASES = {
     "system.set_volume_level": "tidal.set_volume",
     "system.set_volume": "tidal.set_volume",
     "media.set_volume": "tidal.set_volume",
+    # The model reliably invents a bare `.add` on the *arr providers for "add a movie/show to download".
+    "radarr.add": "radarr.add_movie",
+    "radarr.download": "radarr.add_movie",
+    "sonarr.add": "sonarr.add_show",
+    "sonarr.add_series": "sonarr.add_show",
+    "sonarr.download": "sonarr.add_show",
 }
 
 

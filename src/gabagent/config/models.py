@@ -122,6 +122,45 @@ class JellyfinConfig(BaseModel):
     cast_duck_exclude_match: str = ""
 
 
+class RadarrConfig(BaseModel):
+    """Radarr integration — voice "add a movie to download" (first-party provider).
+
+    A single household downloader (no per-room dimension). base_url/api_key live in settings.json only
+    (installation-specific secret; nested-env is intentionally NOT wired, so there is no GABAI_RADARR__*).
+    Unconfigured (empty api_key) ⇒ the provider never surfaces (detect() returns False) ⇒ an install with
+    no Radarr behaves exactly as before. Every install-specific value is a config field with a safe default:
+    an ambiguous instance (multiple root folders / quality profiles) is refused with spoken guidance rather
+    than silently guessing (auto-pick only when exactly one exists) — see providers/_arr.py."""
+    enabled: bool = True
+    base_url: str = "http://localhost:7878"
+    api_key: str = ""                     # Radarr → Settings → General → API Key
+    # Quality profile to add under, matched by NAME (portable across installs; ids are install-local).
+    # Empty ⇒ auto-pick only if the instance has exactly one profile, else refuse (Radarr ships several
+    # defaults incl. "Any", and auto-picking the first can grab any-quality releases — so require a choice).
+    quality_profile: str = ""
+    # Root download folder PATH. Empty ⇒ auto-pick only if exactly one accessible root exists, else refuse
+    # (a wrong pick sends a multi-GB download to the wrong/offline disk).
+    root_folder_path: str = ""
+    minimum_availability: str = "released"   # MovieStatusType: tba|announced|inCinemas|released|deleted
+    monitor: str = "movieOnly"               # MonitorTypes: movieOnly|movieAndCollection|none
+    search_on_add: bool = True               # kick off a search immediately after adding
+
+
+class SonarrConfig(BaseModel):
+    """Sonarr integration — voice "add a show to download" (first-party provider). Sibling of RadarrConfig
+    (same /api/v3 + X-Api-Key shape); see it for the config/secret/ambiguity philosophy. Series carry
+    seasons, so `add` echoes the looked-up seasons and monitors per the `monitor` mode. languageProfileId is
+    resolved at runtime (present on Sonarr v3, gone on v4) — never a config-hardcoded id."""
+    enabled: bool = True
+    base_url: str = "http://localhost:8989"
+    api_key: str = ""                     # Sonarr → Settings → General → API Key
+    quality_profile: str = ""             # by name; empty ⇒ auto-if-one-else-refuse (see RadarrConfig)
+    root_folder_path: str = ""            # empty ⇒ auto-if-one-else-refuse
+    season_folder: bool = True            # organise episodes into per-season folders
+    monitor: str = "all"                  # Sonarr MonitorTypes: all|future|missing|existing|firstSeason|latestSeason|pilot|none
+    search_on_add: bool = True
+
+
 class TidalConfig(BaseModel):
     """TIDAL via a local Mopidy + mopidy-tidal server (first-party provider).
 
@@ -531,6 +570,8 @@ class GabAgentConfig(BaseSettings):
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
     attestation: AttestationConfig = Field(default_factory=AttestationConfig)
     jellyfin: JellyfinConfig = Field(default_factory=JellyfinConfig)
+    radarr: RadarrConfig = Field(default_factory=RadarrConfig)
+    sonarr: SonarrConfig = Field(default_factory=SonarrConfig)
     tidal: TidalConfig = Field(default_factory=TidalConfig)
     desktop: DesktopConfig = Field(default_factory=DesktopConfig)
     image: ImageGenConfig = Field(default_factory=ImageGenConfig)
