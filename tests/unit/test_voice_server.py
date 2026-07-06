@@ -465,3 +465,35 @@ async def test_prewarm_disabled_no_call(tmp_path):
         assert r.json().get("skipped") == "disabled"
     await _settle()
     assert ctx.client.warm_calls == []
+
+
+# --- cross-room wake arbiter (Stage 2) rides on /prewarm when enabled ------
+
+async def test_prewarm_wake_claim_returns_proceed_verdict(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))   # isolate the arbiter store
+    ctx = make_ctx(tmp_path, [])
+    ctx.client = _RecordingClient()
+    ctx.config.voice_wake_arbiter_enabled = True
+    ctx.config.voice_wake_arbiter_window_secs = 0.0               # decide immediately, no real sleep
+    app = build_app(ctx)
+    async with _client(app) as client:
+        r = await client.post("/prewarm", json={"room": "host", "wake_claim": {"detector_latency_ms": 0}})
+        arb = r.json()["arbiter"]
+        assert arb["verdict"] == "proceed" and arb["winner_room"] == "host"
+        assert arb["window_id"] and "resolve_after_ms" in arb
+    await _settle()
+    assert ctx.client.warm_calls == ["arya"]                      # the winner warms the cloud session
+
+
+async def test_prewarm_wake_arbiter_disabled_is_warm_only(tmp_path, monkeypatch):
+    # Flag OFF (default): a wake_claim is ignored and /prewarm is byte-identical warm-only behavior.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    ctx = make_ctx(tmp_path, [])
+    ctx.client = _RecordingClient()
+    app = build_app(ctx)
+    async with _client(app) as client:
+        r = await client.post("/prewarm", json={"room": "host", "wake_claim": {"detector_latency_ms": 0}})
+        body = r.json()
+        assert "arbiter" not in body and body["warming"] is True
+    await _settle()
+    assert ctx.client.warm_calls == ["arya"]

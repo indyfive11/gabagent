@@ -133,6 +133,12 @@ def build_app(ctx: AgentContext):
                 {"error": "a turn is already in progress for this session"}, status_code=409
             )
         start_turn(ctx, vs, text, wake=wake)
+        if getattr(ctx.config, "voice_wake_arbiter_enabled", False):
+            # Winner is now actually answering → mark its wake window so a stood-down peer's fallback stays
+            # down. An UNMARKED window releases the peer (never-zero). Cheap flock touch; no-op if no window.
+            # Keys on the same room id the voice side put in the /prewarm wake_claim.
+            from gabagent.voice import wake_arbiter
+            wake_arbiter.mark_answered(vs.room_id or sid)
         return _sse(drain(vs))
 
     async def confirm(request):
@@ -233,22 +239,21 @@ def build_app(ctx: AgentContext):
         # while the user is still speaking, overlapping arya's ~18-21s deep-cold spin with dead time the user
         # already spends. The brain has no earlier turn signal (it first hears a turn at /respond, AFTER STT),
         # which is why this seam exists. Idempotent + per-room rate-limited; the caller ignores the response.
+        #
+        # This same pre-STT seam ALSO carries the cross-room wake arbiter (Stage 2 of the double-answer fix)
+        # when `voice_wake_arbiter_enabled` — a /prewarm with a `wake_claim` opens/joins a short grace window
+        # and RETURNS a proceed|stand_down verdict the voice side honors before burning STT (a real round-trip
+        # semantic, unlike the fire-and-forget warm). Disabled ⇒ this whole branch is skipped and behavior is
+        # byte-identical to the warm-only path below. See wake_arbiter.py for the design.
         import time
         import asyncio as _aio
         from gabagent.api.models import ChatMessage
         from gabagent.voice.debuglog import dlog
-        if not getattr(ctx.config, "voice_prewarm_enabled", True):
-            return JSONResponse({"ok": True, "skipped": "disabled"})
         try:
             body = await request.json()
         except Exception:
             body = {}
         room = str(body.get("room") or body.get("session_id") or "default")
-        cooldown = float(getattr(ctx.config, "voice_prewarm_cooldown_secs", 4.0))
-        now = time.monotonic()
-        if now - _prewarm_last.get(room, 0.0) < cooldown:
-            return JSONResponse({"ok": True, "skipped": "cooldown"})
-        _prewarm_last[room] = now
 
         async def _warm(client_ts):
             rt = getattr(ctx.config, "router", None)
@@ -261,6 +266,63 @@ def build_app(ctx: AgentContext):
             except Exception as e:
                 dlog(ctx, "prewarm", room=room, model=model, error=type(e).__name__)
 
+        if getattr(ctx.config, "voice_wake_arbiter_enabled", False):
+            from gabagent.voice import wake_arbiter
+            # Liveness commit: the winner stamps it the instant it accepts `proceed` (before STT) so the
+            # never-zero fallback keys on "did the winner START" (lands in ms) not "did it FINISH" (6-26s).
+            commit_req = body.get("wake_commit")
+            if isinstance(commit_req, dict):
+                ok = wake_arbiter.mark_committed(str(commit_req.get("window_id") or ""), room)
+                dlog(ctx, "wake_arbiter", room=room, phase="commit", committed=ok)
+                return JSONResponse({"ok": True, "arbiter": {"committed": ok}})
+            # Fallback probe: a stood-down room asking whether the winner actually took the turn.
+            resolve_req = body.get("wake_resolve")
+            if isinstance(resolve_req, dict):
+                liveness = float(getattr(ctx.config, "voice_wake_arbiter_liveness_secs", 0.0))
+                v = wake_arbiter.check_fallback(str(resolve_req.get("window_id") or ""), room,
+                                                liveness_secs=liveness)
+                dlog(ctx, "wake_arbiter", room=room, phase="resolve", verdict=v.get("verdict"))
+                return JSONResponse({"ok": True, "arbiter": v})
+            # Claim: register, hold until the grace window closes, then return the verdict.
+            claim_req = body.get("wake_claim")
+            if isinstance(claim_req, dict):
+                window_secs = float(getattr(ctx.config, "voice_wake_arbiter_window_secs", 0.25))
+                resolve_secs = float(getattr(ctx.config, "voice_wake_arbiter_resolve_secs", 2.5))
+                c = wake_arbiter.claim(
+                    room,
+                    detector_latency_ms=float(claim_req.get("detector_latency_ms") or 0.0),
+                    media_playing=bool(claim_req.get("media_playing")),
+                    window_secs=window_secs,
+                )
+                wait = c["decide_at"] - time.time()  # async wait, NEVER under the store lock
+                if wait > 0:
+                    await _aio.sleep(wait)
+                verdict = wake_arbiter.resolve(c["window_id"], room)
+                v = verdict.get("verdict")
+                if v == "pending":  # shouldn't happen (we waited past decide_at) — fail open
+                    v = "proceed"
+                dlog(ctx, "wake_arbiter", room=room, phase="claim", verdict=v,
+                     winner=verdict.get("winner_room"), window=c["window_id"])
+                out = {
+                    "verdict": v,
+                    "window_id": c["window_id"],
+                    "claim_id": c["claim_id"],
+                    "winner_room": verdict.get("winner_room"),
+                    "resolve_after_ms": int(resolve_secs * 1000),
+                }
+                if v == "proceed" and getattr(ctx.config, "voice_prewarm_enabled", True):
+                    _prewarm_last[room] = time.monotonic()  # dovetail the warm-only cooldown
+                    _aio.create_task(_warm(body.get("ts")))
+                return JSONResponse({"ok": True, "arbiter": out})
+            # arbiter on but a plain warm-only /prewarm → fall through to the warm path below.
+
+        if not getattr(ctx.config, "voice_prewarm_enabled", True):
+            return JSONResponse({"ok": True, "skipped": "disabled"})
+        cooldown = float(getattr(ctx.config, "voice_prewarm_cooldown_secs", 4.0))
+        now = time.monotonic()
+        if now - _prewarm_last.get(room, 0.0) < cooldown:
+            return JSONResponse({"ok": True, "skipped": "cooldown"})
+        _prewarm_last[room] = now
         _aio.create_task(_warm(body.get("ts")))
         return JSONResponse({"ok": True, "warming": True})
 

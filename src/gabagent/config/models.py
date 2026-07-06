@@ -458,6 +458,32 @@ class GabAgentConfig(BaseSettings):
     # Per-room cooldown (seconds) between pre-warm completions, so a chatty onset or a double-fire can't
     # spend repeated arya calls. Env: GABAI_VOICE_PREWARM_COOLDOWN_SECS.
     voice_prewarm_cooldown_secs: float = 4.0
+    # Cross-room wake arbiter (Stage 2 of the double-answer fix) — the brain-side first-to-hear referee that
+    # rides on /prewarm. OFF by default: unset ⇒ /prewarm is warm-only and behavior is byte-identical to
+    # today (Stage 1 threshold-zoning ships first; this is the door-open fallback, flipped on only if the
+    # gross acoustic separation isn't enough). When on, a /prewarm carrying a `wake_claim` opens/joins a
+    # short grace window and returns a proceed|stand_down verdict the voice side honors before burning STT.
+    # Arbitration is EM-disk-local (an flock'd window file) → a cross-host brain physically can't touch it,
+    # so it never participates and any solo/remote install stays byte-identical. Env: GABAI_VOICE_WAKE_ARBITER_ENABLED.
+    voice_wake_arbiter_enabled: bool = False
+    # Grace window (seconds) a wake claim is held to collect near-simultaneous peers before the winner is
+    # picked by earliest NORMALIZED receipt (server-side EM-clock arrival minus each device's calibrated
+    # detector latency). Must cover hall-leak acoustic delay + the calibrated detector delta and NO wider —
+    # a wider window raises the one worse-than-today case (two DISTINCT simultaneous utterances false-merged).
+    # ~0.25s is enough for a same-house tens-of-ms acoustic delta. Env: GABAI_VOICE_WAKE_ARBITER_WINDOW_SECS.
+    voice_wake_arbiter_window_secs: float = 0.25
+    # Never-zero fallback: how long a stood-down room waits before probing whether the winner took the turn,
+    # then un-stands-down if it didn't — so the worst case is today's double answer, never a zero answer. The
+    # winner stamps `committed` the instant it accepts `proceed` (BEFORE STT, lands in ms), so this only needs
+    # to cover claim→verdict→commit round-trip, NOT the 6-26s a real turn takes to reach /respond. Env:
+    # GABAI_VOICE_WAKE_ARBITER_RESOLVE_SECS.
+    voice_wake_arbiter_resolve_secs: float = 1.0
+    # Liveness grace for the commit mark. 0 ⇒ PRESENCE-based: any commit means the winner started → the peer
+    # stays down (a winner that started then died mid-turn is a single-device failure, out of arbiter scope).
+    # >0 ⇒ HEARTBEAT mode: the winner must refresh `committed` within this grace or the peer un-stands-down
+    # (covers mid-turn death); set it comfortably above the voice-side heartbeat interval to tolerate a missed
+    # beat. Default 0 (presence) — the simplest correct fix for the double-answer. Env: GABAI_VOICE_WAKE_ARBITER_LIVENESS_SECS.
+    voice_wake_arbiter_liveness_secs: float = 0.0
     # Latency self-test → auto-Turbo (#6). OFF by default (Rob's call) — it auto-spends (Turbo billing +
     # recovery probes), so it stays opt-in: flip voice_latency_watch on for a bad-cloud day. When on, the
     # brain passively watches real arya ttft and, when arya is the DOMINANT slowness, offers to switch
