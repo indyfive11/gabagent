@@ -161,6 +161,30 @@ class SonarrConfig(BaseModel):
     search_on_add: bool = True
 
 
+class TmdbConfig(BaseModel):
+    """The Movie Database — the first (default) discovery source for MovieScout (voice "suggest N good
+    movies to download"). A read-only credential for TMDB's public v3 API; installation-specific secret,
+    settings.json only (nested-env deliberately unwired, mirrors RadarrConfig — no GABAI_TMDB__*). Empty
+    api_key ⇒ MovieScout never surfaces (detect() is config-only, so EM/Pi stay byte-identical). Free key
+    from themoviedb.org → Settings → API. This is the SOURCE credential; recommender policy lives in
+    MoviescoutConfig so a second source (Trakt) slots in with its own credential block and zero policy
+    duplication."""
+    api_key: str = ""
+    lang: str = "en-US"   # TMDB result language/region for titles + overviews
+
+
+class MoviescoutConfig(BaseModel):
+    """MovieScout recommender policy — source-agnostic (the discovery source is configured separately via
+    its own credential block, e.g. TmdbConfig). Every value is a plain, user-editable field with a safe
+    default; nothing here is install-specific. The only cache is the expensive discovery map (neighbor
+    lists per owned movie), TTL'd below — the owned metadata itself is already fast from one GET
+    /api/v3/movie, so there is deliberately no metadata cache."""
+    enabled: bool = True
+    recs_ttl_days: int = 45          # a seed's cached neighbor list is refreshed after this many days
+    offered_cooldown_days: int = 21  # don't re-offer a title suggested within this window (re-offer after)
+    seed_count: int = 12             # owned movies sampled per ask (genre-proportional) to expand from
+
+
 class TidalConfig(BaseModel):
     """TIDAL via a local Mopidy + mopidy-tidal server (first-party provider).
 
@@ -575,6 +599,8 @@ class GabAgentConfig(BaseSettings):
     tidal: TidalConfig = Field(default_factory=TidalConfig)
     desktop: DesktopConfig = Field(default_factory=DesktopConfig)
     image: ImageGenConfig = Field(default_factory=ImageGenConfig)
+    tmdb: TmdbConfig = Field(default_factory=TmdbConfig)
+    moviescout: MoviescoutConfig = Field(default_factory=MoviescoutConfig)
     tmi: TmiConfig = Field(default_factory=TmiConfig)
     # Phase 10 / #62: per-room media-target overrides, keyed by room_id. Empty default = no override on any
     # room = today's single-target behavior (byte-identical). Written by the future `gab detect-media` sync.
