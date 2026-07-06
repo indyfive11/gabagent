@@ -24,13 +24,17 @@ def _isolate_data(tmp_path, monkeypatch):
 
 class FakeSource:
     """Deterministic stand-in for TmdbSource. `mapping` is {seed_tmdb_id: [Rec,…]} for page 1; `page2` is
-    the optional {seed_tmdb_id: [Rec,…]} served for page 2 (empty ⇒ page 2 returns nothing)."""
+    the optional {seed_tmdb_id: [Rec,…]} for page 2. `resolve_map` is {title: Rec|None} for anchor mode;
+    `discover_result` is the list returned by discover() (directed mode)."""
     id = "tmdb"
 
-    def __init__(self, mapping, page2=None):
-        self.mapping = mapping
+    def __init__(self, mapping=None, page2=None, resolve_map=None, discover_result=None):
+        self.mapping = mapping or {}
         self.page2 = page2 or {}
+        self.resolve_map = resolve_map or {}
+        self.discover_result = discover_result or []
         self.calls = []
+        self.discover_calls = []
 
     def available(self):
         return True
@@ -39,6 +43,14 @@ class FakeSource:
         self.calls.append((tmdb_id, page))
         src = self.mapping if page == 1 else self.page2
         return list(src.get(tmdb_id, []))
+
+    async def resolve(self, title):
+        self.calls.append(("resolve", title))
+        return self.resolve_map.get(title)
+
+    async def discover(self, genre="", year_from=None, year_to=None):
+        self.discover_calls.append((genre, year_from, year_to))
+        return list(self.discover_result)
 
 
 def _ctx(**over):
@@ -63,8 +75,8 @@ def _rec(tid, title="X", year=2020, vote=7.5, votes=1000, pop=10.0):
     return Rec(tmdb_id=tid, title=title, year=year, vote=vote, votes=votes, popularity=pop)
 
 
-def _use_source(monkeypatch, mapping, page2=None):
-    src = FakeSource(mapping, page2)
+def _use_source(monkeypatch, mapping=None, page2=None, resolve_map=None, discover_result=None):
+    src = FakeSource(mapping, page2, resolve_map, discover_result)
     monkeypatch.setattr(ms, "select_source", lambda cfg: src)
     return src
 
@@ -269,6 +281,98 @@ async def test_recs_cache_prunes_expired_on_write(monkeypatch):
     saved = json.loads(ms._RECS_PATH.read_text())
     assert "tmdb:9999:p1" not in saved                  # stale entry pruned on write
     assert any(k.startswith("tmdb:1:") for k in saved)  # this ask's fresh entry kept
+
+
+# -- directed search: anchor on a named film ("like X", even unowned) ------------------------------
+
+@respx.mock
+async def test_anchor_like_resolves_then_neighbors(monkeypatch):
+    _owned((1, "Owned", ["X"]))   # Blade Runner is NOT owned
+    anchor = _rec(78, "Blade Runner", 1982)
+    src = _use_source(monkeypatch,
+                      mapping={78: [_rec(100, "Neighbor A"), _rec(200, "Neighbor B")]},
+                      resolve_map={"Blade Runner": anchor})
+    out = json.loads((await ms.recommend(_ctx(), like="Blade Runner")).output)
+    ids = sorted(o["tmdb_id"] for o in out)
+    assert ids == [100, 200]                       # neighbors of the resolved film, not owned-seeded
+    assert ("resolve", "Blade Runner") in src.calls
+    assert (78, 1) in src.calls                     # neighbors() called on the RESOLVED id
+    assert out[0]["because"] == "like Blade Runner"
+
+
+@respx.mock
+async def test_anchor_unknown_title_errors(monkeypatch):
+    _owned((1, "Owned", ["X"]))
+    _use_source(monkeypatch, resolve_map={})       # resolve returns None
+    res = await ms.recommend(_ctx(), like="Not A Real Film")
+    assert res.error and "Not A Real Film" in res.error and not res.output
+
+
+@respx.mock
+async def test_anchor_excludes_owned_neighbor(monkeypatch):
+    _owned((1, "Owned", ["X"]), (100, "Also Owned", ["X"]))
+    anchor = _rec(78, "Blade Runner", 1982)
+    _use_source(monkeypatch,
+                mapping={78: [_rec(100, "Owned neighbor"), _rec(200, "Fresh")]},
+                resolve_map={"Blade Runner": anchor})
+    out = json.loads((await ms.recommend(_ctx(), like="Blade Runner")).output)
+    assert [o["tmdb_id"] for o in out] == [200]    # owned neighbor (100) dropped
+
+
+# -- directed search: genre / decade filter via discover -------------------------------------------
+
+@respx.mock
+async def test_discover_by_genre_and_decade(monkeypatch):
+    _owned((1, "Owned", ["X"]))
+    src = _use_source(monkeypatch, discover_result=[
+        _rec(300, "90s SciFi A", 1995, vote=7.8, votes=2000),
+        _rec(301, "90s SciFi B", 1993, vote=7.1, votes=900),
+    ])
+    out = json.loads((await ms.recommend(_ctx(), genre="sci-fi", decade=1990)).output)
+    assert [o["tmdb_id"] for o in out] == [300, 301]           # ranked by vote COUNT (fame) desc
+    assert src.discover_calls == [("sci-fi", 1990, 1999)]      # decade → (from,to) range
+    assert "sci-fi" in out[0]["because"] and "90s" in out[0]["because"]
+    assert not src.calls                                        # no neighbors/seed machinery in discover mode
+
+
+@respx.mock
+async def test_discover_ranks_by_fame_not_blockbuster_penalty(monkeypatch):
+    # the anime-skew fix in miniature: a much-voted canonical film outranks a higher-RATED niche one
+    # (opposite of the surprise-me penalty, which would demote the famous one).
+    _owned((1, "Owned", ["X"]))
+    _use_source(monkeypatch, discover_result=[
+        _rec(400, "Niche high-avg", 1997, vote=8.3, votes=2000),    # higher rating, fewer votes
+        _rec(401, "Canonical", 1999, vote=7.0, votes=25000),        # lower rating, hugely more votes
+    ])
+    out = json.loads((await ms.recommend(_ctx(), genre="sci-fi", decade=1990)).output)
+    assert [o["tmdb_id"] for o in out] == [401, 400]              # famous-in-lane first
+
+
+@respx.mock
+async def test_discover_empty_result_errors(monkeypatch):
+    _owned((1, "Owned", ["X"]))
+    _use_source(monkeypatch, discover_result=[])   # unknown genre / nothing matches
+    res = await ms.recommend(_ctx(), genre="nonsense-genre")
+    assert res.error and not res.output
+
+
+@respx.mock
+async def test_discover_works_with_empty_library(monkeypatch):
+    _owned()   # empty library is NOT fatal for a directed search
+    _use_source(monkeypatch, discover_result=[_rec(300, "A Good One", 1995, votes=2000)])
+    out = json.loads((await ms.recommend(_ctx(), genre="horror", decade=1990)).output)
+    assert [o["tmdb_id"] for o in out] == [300]
+
+
+@respx.mock
+async def test_no_directed_slots_is_surprise_mode(monkeypatch):
+    # regression guard: with no like/genre/decade it must still be the owned-seeded surprise path
+    _owned((1, "A", ["X"]), (2, "B", ["X"]))
+    src = _use_source(monkeypatch, {1: [_rec(100, "P")], 2: [_rec(100, "P")]})
+    out = json.loads((await ms.recommend(_ctx())).output)
+    assert [o["tmdb_id"] for o in out] == [100]
+    assert src.discover_calls == []                 # discover NOT used
+    assert any(c[0] == 1 or c[0] == 2 for c in src.calls)   # owned seeds expanded
 
 
 # -- genre-proportional seed sampling (determinism + proportionality) ------------------------------
