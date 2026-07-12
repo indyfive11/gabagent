@@ -991,3 +991,91 @@ async def test_fast_start_single_track_keeps_simple_path():
     assert res.success
     assert seen == ["core.playlists.get_items", "core.tracklist.clear",
                     "core.tracklist.add", "core.playback.play"]
+
+
+# --- P2(a): TIDAL search-result cache ------------------------------------------------------------
+
+_HIT = [{"tracks": [{"uri": "tidal:track:1", "name": "So What",
+                     "artists": [{"name": "Miles Davis"}], "album": {"name": "Kind of Blue"}}]}]
+
+
+def _counting_rpc(results_seq):
+    """An async _rpc_resilient stand-in that pops from results_seq (a value or an Exception to raise)
+    and counts calls."""
+    calls = {"n": 0}
+
+    async def fake(tc, method, params=None, timeout=None):
+        calls["n"] += 1
+        r = results_seq[min(calls["n"] - 1, len(results_seq) - 1)]
+        if isinstance(r, Exception):
+            raise r
+        return r
+    return fake, calls
+
+
+async def test_search_cache_hit_avoids_second_rpc(monkeypatch):
+    fake, calls = _counting_rpc([_HIT])
+    monkeypatch.setattr(td, "_rpc_resilient", fake)
+    ctx = types.SimpleNamespace()
+    r1 = await td._search_cached(ctx, object(), "Miles Davis")
+    r2 = await td._search_cached(ctx, object(), "Miles Davis")
+    assert r1 is _HIT and r2 is _HIT
+    assert calls["n"] == 1  # second served from cache, no RPC
+
+
+async def test_search_cache_normalizes_query(monkeypatch):
+    fake, calls = _counting_rpc([_HIT])
+    monkeypatch.setattr(td, "_rpc_resilient", fake)
+    ctx = types.SimpleNamespace()
+    await td._search_cached(ctx, object(), "Miles Davis")
+    await td._search_cached(ctx, object(), "  miles   DAVIS ")  # same normalized key
+    assert calls["n"] == 1
+
+
+async def test_search_cache_does_not_pin_empty_result(monkeypatch):
+    # A cold-miss / empty result must NOT be cached, or "play X" would keep failing for the whole TTL.
+    fake, calls = _counting_rpc([[], _HIT])  # first empty, then a real hit
+    monkeypatch.setattr(td, "_rpc_resilient", fake)
+    ctx = types.SimpleNamespace()
+    r1 = await td._search_cached(ctx, object(), "obscure")
+    assert _flatten_empty(r1)                      # first returns empty
+    r2 = await td._search_cached(ctx, object(), "obscure")
+    assert calls["n"] == 2                         # empty wasn't pinned → real RPC ran again
+    assert td._flatten_tracks(r2)                  # and now finds the track
+
+
+async def test_search_cache_expires_after_ttl(monkeypatch):
+    fake, calls = _counting_rpc([_HIT, _HIT])
+    monkeypatch.setattr(td, "_rpc_resilient", fake)
+    ctx = types.SimpleNamespace()
+    await td._search_cached(ctx, object(), "Miles Davis")
+    # age the cached entry past the TTL by rewriting its timestamp
+    key = td._search_key("Miles Davis")
+    results, ts = ctx._tidal_search[key]
+    ctx._tidal_search[key] = (results, ts - td._SEARCH_CACHE_TTL - 1.0)
+    await td._search_cached(ctx, object(), "Miles Davis")
+    assert calls["n"] == 2  # stale entry re-fetched
+
+
+async def test_search_cache_error_propagates_uncached(monkeypatch):
+    fake, calls = _counting_rpc([RuntimeError("boom"), _HIT])
+    monkeypatch.setattr(td, "_rpc_resilient", fake)
+    ctx = types.SimpleNamespace()
+    with pytest.raises(RuntimeError):
+        await td._search_cached(ctx, object(), "Miles Davis")
+    # the raised error was NOT cached → the next call actually retries and succeeds
+    r = await td._search_cached(ctx, object(), "Miles Davis")
+    assert calls["n"] == 2 and td._flatten_tracks(r)
+
+
+async def test_search_cache_is_bounded(monkeypatch):
+    fake, _ = _counting_rpc([_HIT])
+    monkeypatch.setattr(td, "_rpc_resilient", fake)
+    ctx = types.SimpleNamespace()
+    for i in range(td._SEARCH_CACHE_MAX + 10):
+        await td._search_cached(ctx, object(), f"query {i}")
+    assert len(ctx._tidal_search) <= td._SEARCH_CACHE_MAX
+
+
+def _flatten_empty(results):
+    return not (td._flatten_tracks(results) or td._flatten_albums(results))

@@ -99,6 +99,34 @@ async def _tidal_op(ctx, *, optimistic=None, result=None):
         c["inflight"] = max(0, c["inflight"] - 1)
 
 
+# --- search-result cache (P2a) -------------------------------------------------------------------
+# A cold `core.library.search` blocks the spoken reply for seconds. This per-session cache serves a
+# REPEAT search of the same normalized query instantly. Deliberately conservative:
+#   * SUCCESSFUL, NON-EMPTY results only — a cold-miss / empty / transient RPC failure is NEVER
+#     pinned, or "play X" would keep failing for the whole TTL on one hiccup (a worse regression than
+#     the latency we're fixing).
+#   * short TTL — the search space drifts only when the user edits their library in the TIDAL app;
+#     this provider has NO in-process library-mutating op to invalidate against, so a short window is
+#     the staleness bound (no drop-on-mutation hook exists to wire — see the polish rescope).
+#   * bounded — cap entries so a long session can't grow it without limit.
+# Per-ctx (per session); no global state, mirroring _pb_cache.
+_SEARCH_CACHE_TTL = 120.0
+_SEARCH_CACHE_MAX = 32
+
+
+def _search_cache(ctx) -> dict:
+    c = getattr(ctx, "_tidal_search", None)
+    if c is None:
+        c = {}
+        ctx._tidal_search = c
+    return c
+
+
+def _search_key(query: str) -> str:
+    # lowercase + collapse whitespace only — conservative, so distinct queries never collide.
+    return " ".join(query.split()).lower()
+
+
 class TidalProvider:
     id = "tidal"
 
@@ -467,12 +495,30 @@ def _play_timing(ctx, **fields) -> None:
 
 # -- backend callables -----------------------------------------------------
 
+async def _search_cached(ctx, tc, query):
+    """`core.library.search` behind the per-session query cache. Serves a fresh, non-empty cached
+    result for a repeat of the same normalized query; otherwise hits Mopidy and caches ONLY a
+    non-empty result. Never caches an empty result, and lets a raised RPC error propagate uncached
+    (the call-sites handle both as before). See the _SEARCH_CACHE notes above."""
+    key = _search_key(query)
+    c = _search_cache(ctx)
+    hit = c.get(key)
+    if hit is not None and (time.monotonic() - hit[1]) <= _SEARCH_CACHE_TTL:
+        return hit[0]
+    results = await _rpc_resilient(tc, "core.library.search", {"query": {"any": [query]}})
+    if _flatten_tracks(results) or _flatten_albums(results):   # successful, non-empty only
+        c[key] = (results, time.monotonic())
+        while len(c) > _SEARCH_CACHE_MAX:
+            del c[list(c)[0]]   # bound the cache (evict oldest inserted); NB module shadows builtin next()
+    return results
+
+
 async def search(ctx, query="", limit=8) -> ToolResult:
     tc = resolve_tidal(ctx)
     if not query:
         return ToolResult(output="", error="nothing to search for")
     try:
-        results = await _rpc_resilient(tc, "core.library.search", {"query": {"any": [query]}})
+        results = await _search_cached(ctx, tc, query)
     except Exception as e:
         return ToolResult(output="", error=f"TIDAL search failed: {_human_err(e)}")
     tracks = [t for t in _flatten_tracks(results) if t["uri"]][:limit]
@@ -534,7 +580,7 @@ async def play(ctx, query="", uri="", album=False, playlist="", shuffle=False) -
         if not uri and query:
             _s = time.monotonic()
             try:
-                results = await _rpc_resilient(tc, "core.library.search", {"query": {"any": [query]}})
+                results = await _search_cached(ctx, tc, query)
             except Exception as e:
                 return ToolResult(output="", error=f"TIDAL search failed: {_human_err(e)}")
             search_ms = int((time.monotonic() - _s) * 1000)
@@ -729,7 +775,7 @@ async def _play_container(ctx, tc, query="", uri="", album=False, shuffle=False,
         if not container_uri and album and query:
             _s = time.monotonic()
             try:
-                results = await _rpc_resilient(tc, "core.library.search", {"query": {"any": [query]}})
+                results = await _search_cached(ctx, tc, query)
             except Exception as e:
                 return ToolResult(output="", error=f"TIDAL search failed: {_human_err(e)}")
             search_ms = int((time.monotonic() - _s) * 1000)
