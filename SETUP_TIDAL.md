@@ -78,6 +78,31 @@ Or as a user service so it's always available:
 systemctl --user enable --now mopidy    # if the AUR package ships a user unit
 ```
 
+## 4b. See ALL your playlists (created + favorited) — required patch
+
+Stock **mopidy-tidal** (through at least `0.3.13.r142`) syncs playlists from *favorites only*
+(`session.user.favorites.playlists_paginated()`). Playlists you **created** but never favorited are
+therefore invisible to `core.playlists.as_list` — so the voice brain truthfully-but-wrongly reports
+"you have no playlist called X" for a playlist you really own (playback by URI works fine; only
+*discovery* is broken). Live-hit 2026-07-12: a 461-track "Retro Favorites" couldn't be found by name.
+
+This repo ships a tiny fail-soft runtime patch that makes mopidy-tidal enumerate the **union of
+created + favorited** playlists (TIDAL's `playlistsAndFavoritePlaylists` endpoint, paginated). Launch
+Mopidy through the wrapper so it loads before Mopidy starts:
+
+```ini
+# ~/.config/systemd/user/mopidy.service  (or wherever your unit lives)
+ExecStart=/usr/bin/python /path/to/gabagent/contrib/mopidy/mopidy_launch.py
+```
+
+Then `systemctl --user daemon-reload && systemctl --user restart mopidy`. Notes:
+- Must run under the **same interpreter** as Mopidy (system `/usr/bin/python` for the AUR package) so
+  `mopidy_tidal`/`tidalapi` are importable.
+- **Fail-soft:** if the patch can't load (or the TIDAL endpoint is unavailable on an older `tidalapi`),
+  Mopidy starts normally with stock favorites-only behavior — never worse than unpatched.
+- Verify: `as_list` count should jump to your full playlist total, e.g.
+  `curl -s -X POST -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"core.playlists.as_list"}' http://localhost:6680/mopidy/rpc | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["result"]))'`
+
 ## 5. Verify the API (what the skill calls)
 
 ```bash
