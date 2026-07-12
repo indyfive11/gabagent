@@ -422,6 +422,8 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
                     text_buf = prose
         except Exception as e:
             streaming.stop()
+            _stop_eye_hb()               # else the 2s heartbeat re-stamps "thinking" over the error
+            _eye(ctx, "error")           # light the eye's error state (TUI writer; voice mode leaves aria_eye off)
             if not ctx.headless:
                 from gabagent.tui.diagnostic import render_diagnostic
                 thinking.set_state("ERROR")
