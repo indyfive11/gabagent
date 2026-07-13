@@ -40,3 +40,6 @@ cache/
 /PIPECAT_HARVEST_*.md
 /PLAN_*.md
 /REVIEW_LATER_*.md
+
+# Local-only archive of superseded planning scratch (see ROADMAP.md)
+/docs/archive/

@@ -2,6 +2,39 @@
 
 A Claude Code-style AI coding assistant built on the Gab AI Developer API.
 
+## Project Scope & Charter (living — updated 2026-07-12)
+
+**gabagent is two products in one repo, sharing one spine:**
+
+1. **gabagent** — a Claude-Code-style terminal coding assistant on the Gab AI API. The founding
+   product (2026-05-19) and the engine everything else is built on.
+2. **Aria** — a voice-driven home/media brain built on that engine: an HTTP+SSE "brain" server plus a
+   pluggable capability plane (media, desktop, timers, and more).
+
+Both are **first-class**. They share the agent loop, tool registry, config, and the Key Invariants
+below. Design rules: **AI-agnostic** (voice never *requires* the gabagent brain — `BRAIN=local/ollama`
+stays first-class) and **new capabilities are plugins, never spine edits**.
+
+**Single source of truth for plan & status: [ROADMAP.md](ROADMAP.md).** These founding docs are
+*living*: where we diverged from the original scope, we record it below rather than pretend the plan
+never moved.
+
+### Divergences from founding intent (and why)
+
+Founding intent (README `72f07b6`, 2026-05-19): *"A Claude Code-style AI coding assistant"* — a terminal
+coding tool, with no voice, media, or home control. Recorded divergences:
+
+- **2026-06-01 — Voice + media pivot (birth of "Aria").** Added a voice brain (HTTP+SSE) and, the *same
+  day*, media control (Jellyfin, TIDAL) via a new command-provider framework. *Justified:* built on the
+  existing agent spine as plugins; the coding invariants were untouched; driven by real daily use.
+- **2026-06-20 → now — Whole-house expansion.** LAN brain, room addressing, Pi satellite, per-room
+  media, cross-room arbiter. *Justified:* natural extension of the voice product to multiple rooms, still
+  plugin-shaped.
+- **2026-07 — Breadth grafts.** Image generation, movie *downloading* (Radarr/Sonarr), a taste
+  recommender (MovieScout), self-introspection, a headless "builder." *Caveat, not a clean win:* each is a
+  plugin so the core stayed clean, but this is where scope sprawl set in — hence the **close-the-loop
+  gate** in ROADMAP.md (no new domain until the installer MVP lands and a release ships the backlog).
+
 ## Dev Setup
 
 ```bash

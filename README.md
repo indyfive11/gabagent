@@ -1,6 +1,8 @@
 # gabagent
 
-A Claude Code-style AI coding assistant built on the [Gab AI](https://gab.ai) Developer API.
+A Claude Code-style AI coding assistant built on the [Gab AI](https://gab.ai) Developer API — and,
+on the same engine, the pluggable **voice-driven home/media brain** ("Aria") described under
+[Voice Mode](#voice-mode).
 
 ## Features
 
