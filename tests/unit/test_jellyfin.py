@@ -21,7 +21,7 @@ def _no_real_movie_sink(monkeypatch):
     async def _none(_ctx):
         return None
     monkeypatch.setattr(_dk, "_jellyfin_sink_input", _none)
-    # These tests exercise the owned-browser play path, which is the KDE/EM behavior; the new non-KDE guard
+    # These tests exercise the owned-browser play path, which is the KDE/host behavior; the new non-KDE guard
     # (jellyfin._is_kde_wayland_desktop) would otherwise short-circuit it in a headless/non-KDE test env.
     monkeypatch.setattr(jf, "_is_kde_wayland_desktop", lambda: True)
 

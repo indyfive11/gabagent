@@ -160,7 +160,7 @@ def _hint_ctx(playing_title=None, page=None):
 
 
 async def test_hint_prefers_known_title_and_stamps_owned_page():
-    page = _FakePage(title="EndeavorMain")   # Jellyfin's lagging server-name title — must NOT win
+    page = _FakePage(title="HomeServer")   # Jellyfin's lagging server-name title — must NOT win
     ctx = _hint_ctx(playing_title="The Martian (2015)", page=page)
     assert await dk._movie_window_hint(ctx) == "the martian"   # known title, cleaned
     assert page.stamped == "the martian"                       # owned window self-named to match

@@ -49,7 +49,7 @@ _JS_ACTIVE_TO_SCREEN = (
 # A window only counts as a movie host if it's a BROWSER. We always play into Chromium (the owned
 # path) or the user's open Chrome (the unowned path), so every movie-window matcher is gated on the
 # resourceClass looking like a browser. Matching by caption substring ALONE moved+fullscreened the
-# wrong window: Jellyfin's page title reads the SERVER NAME for a beat after play (here "EndeavorMain"
+# wrong window: Jellyfin's page title reads the SERVER NAME for a beat after play (here "HomeServer"
 # — the hostname), and a Conky/desktop window whose caption also carries the hostname matched first,
 # so KWin relocated Conky instead of the movie while still reporting success.
 _JS_IS_BROWSER = (
@@ -260,7 +260,7 @@ async def _movie_window_hint(ctx) -> str:
     play time). Empty if no movie is in play.
 
     Prefer the KNOWN movie title (the one we searched for) over the page's live document.title: Jellyfin
-    reads the server name — here "EndeavorMain", the hostname — into document.title for a beat after play,
+    reads the server name — here "HomeServer", the hostname — into document.title for a beat after play,
     and that hostname-bearing title matched the Conky window's caption, so the move/fullscreen hit Conky.
     For a page WE own we also re-stamp document.title to the known title, so OUR browser window carries a
     self-named caption that disambiguates it from any other Chrome the user has open (the window caption

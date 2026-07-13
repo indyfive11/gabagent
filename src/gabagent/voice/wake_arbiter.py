@@ -4,16 +4,16 @@ two-stage fix; Stage 1 (per-room wake-threshold zoning, voice-side) ships first 
 flipped on only if the gross acoustic separation still doubles. OFF by default (`voice_wake_arbiter_enabled`).
 
 WHY THIS SHAPE (converged GA↔VAC design, 2026-07-06):
-- HOME = an EM-disk-local flock'd window file, mirroring `announce_store`'s single-holder discipline. The two
-  colliding rooms are two brain PROCESSES on EM (host-loopback + Pi-facing), so they share EM's disk and its
-  single wall clock — a co-located referee is real. A third brain on another host (the ZeroTier laptop) can't
-  touch EM's disk → it never joins a window → any solo/remote install is byte-identical to today, for free.
+- HOME = a host-disk-local flock'd window file, mirroring `announce_store`'s single-holder discipline. The two
+  colliding rooms are two brain PROCESSES on the host (host-loopback + satellite-facing), so they share the host's disk and its
+  single wall clock — a co-located referee is real. A third brain on another host (a VPN-connected laptop) can't
+  touch the host's disk → it never joins a window → any solo/remote install is byte-identical to today, for free.
   Do NOT move this to a LAN broadcast/multicast home that a cross-host brain would half-join.
 - SIGNAL = windowed EARLIEST-*NORMALIZED*-RECEIPT, not first-wins and not loudest (the reSpeaker AEC/AGC
-  inverts level, so "loudest" is backwards for proximity). Each claim's server-side EM arrival time minus that
+  inverts level, so "loudest" is backwards for proximity). Each claim's server-side host arrival time minus that
   device's CALIBRATED detector latency (wake models differ ~0.5s vs ~2.3s; un-normalized arrival would let a
   fast-detector far room beat a slow-detector near room). Server-receipt time, never the client `ts` — two
-  client clocks would reintroduce the NTP skew the one-EM-clock design exists to avoid.
+  client clocks would reintroduce the NTP skew the single-host-clock design exists to avoid.
 - NEVER-ZERO = exactly one winner per window, and if that winner never actually answers (its /respond never
   marks the window), the stood-down room un-stands-down after a grace. Worst case is today's double answer,
   never a zero answer. The stood-down room learns this ONLY by asking the referee (`check_fallback`), never by
@@ -123,7 +123,7 @@ def claim(
     `now < decide_at`) or opens a fresh one. Idempotent per room per window — a re-fire keeps the earliest
     normalized time. Returns `{window_id, claim_id, decide_at}`; the endpoint waits until `decide_at` then
     calls `resolve()`. `detector_latency_ms` is the device's calibrated wake-model latency, subtracted from
-    the server-receipt time to normalize near-vs-far. `now` = server EM receipt time (wall clock)."""
+    the server-receipt time to normalize near-vs-far. `now` = server host receipt time (wall clock)."""
     now = time.time() if now is None else now
     room = room or "default"
     normalized_ts = now - max(0.0, float(detector_latency_ms)) / 1000.0

@@ -10,7 +10,7 @@ Each suggestion carries its tmdb id / title / year — exactly radarr.add_movie'
 "add the first two" rides the existing tier-2 confirm with NO new add code.
 
 detect() is config-only (radarr key + tmdb key present) — unset ⇒ the provider never surfaces, no HTTP,
-EM/Pi byte-identical (fail-soft). The only cache is the expensive discovery map (neighbor lists per owned
+host/satellite byte-identical (fail-soft). The only cache is the expensive discovery map (neighbor lists per owned
 movie) in data_dir(), TTL'd and reused across asks; the owned metadata is already fast, so it isn't cached.
 """
 from __future__ import annotations

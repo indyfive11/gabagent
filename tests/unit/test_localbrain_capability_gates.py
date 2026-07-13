@@ -67,7 +67,7 @@ async def test_desktop_detect_true_on_plasma(monkeypatch):
     )
     assert await DesktopProvider().detect(ctx=None) is True
     ids = [c.id for c in DesktopProvider().commands(ctx=None)]
-    assert "window.to_largest_screen" in ids  # EM behavior preserved
+    assert "window.to_largest_screen" in ids  # host behavior preserved
 
 
 # ---- Fork E: media honesty gate ---------------------------------------------
@@ -89,8 +89,8 @@ def test_has_media_false_when_no_media_domain_and_no_cast_target():
 
 def test_has_media_true_for_cast_target_room_without_local_player():
     # A control room with no local media provider but a configured Jellyfin cast client is NOT muzzled.
-    cfg = GabAgentConfig(api_key="test", room_media={"raspi": {"jellyfin_client_target": "raspi-jellyfin"}})
-    ctx = types.SimpleNamespace(command_catalog=None, config=cfg, room_id="raspi")
+    cfg = GabAgentConfig(api_key="test", room_media={"satellite": {"jellyfin_client_target": "satellite-jellyfin"}})
+    ctx = types.SimpleNamespace(command_catalog=None, config=cfg, room_id="satellite")
     assert _has_media_capability(ctx) is True
 
 
@@ -120,6 +120,6 @@ def test_voice_system_injects_honest_line_when_no_media(tmp_path, monkeypatch):
 
 def test_voice_system_no_line_for_cast_target_room(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    ctx = _voice_ctx(tmp_path, room_media={"raspi": {"jellyfin_client_target": "raspi-jellyfin"}})
-    ctx.room_id = "raspi"
+    ctx = _voice_ctx(tmp_path, room_media={"satellite": {"jellyfin_client_target": "satellite-jellyfin"}})
+    ctx.room_id = "satellite"
     assert _HONEST not in _voice_system(ctx)

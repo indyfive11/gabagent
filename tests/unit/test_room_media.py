@@ -9,7 +9,7 @@ import pytest
 from gabagent.config.models import GabAgentConfig, RoomMediaProfile
 from gabagent.commands.providers.tidal import resolve_tidal
 
-PI = "http://192.168.1.108:6680/mopidy/rpc"
+PI = "http://192.0.2.108:6680/mopidy/rpc"
 GLOBAL = "http://localhost:6680/mopidy/rpc"
 
 
@@ -26,9 +26,9 @@ def test_config_defaults_are_noop():
 
 
 def test_room_media_coerces_dict_to_profile():
-    cfg = GabAgentConfig(api_key="t", room_media={"raspi": {"tidal_rpc_url": PI}})
-    assert isinstance(cfg.room_media["raspi"], RoomMediaProfile)
-    assert cfg.room_media["raspi"].tidal_rpc_url == PI
+    cfg = GabAgentConfig(api_key="t", room_media={"satellite": {"tidal_rpc_url": PI}})
+    assert isinstance(cfg.room_media["satellite"], RoomMediaProfile)
+    assert cfg.room_media["satellite"].tidal_rpc_url == PI
 
 
 # --- resolver: fall-through (byte-identical) cases ------------------------
@@ -41,34 +41,34 @@ def test_no_room_id_returns_global_object():
 
 
 def test_room_without_profile_returns_global():
-    cfg = GabAgentConfig(api_key="t", room_media={"raspi": {"tidal_rpc_url": PI}})
-    tc = resolve_tidal(_ctx(cfg, "EndeavorMain"))     # a different room, no entry
+    cfg = GabAgentConfig(api_key="t", room_media={"satellite": {"tidal_rpc_url": PI}})
+    tc = resolve_tidal(_ctx(cfg, "HomeServer"))     # a different room, no entry
     assert tc is cfg.tidal
 
 
 def test_empty_override_returns_global():
-    cfg = GabAgentConfig(api_key="t", room_media={"raspi": {"tidal_rpc_url": ""}})
-    assert resolve_tidal(_ctx(cfg, "raspi")) is cfg.tidal
+    cfg = GabAgentConfig(api_key="t", room_media={"satellite": {"tidal_rpc_url": ""}})
+    assert resolve_tidal(_ctx(cfg, "satellite")) is cfg.tidal
 
 
 def test_none_when_tidal_unconfigured():
     ctx = types.SimpleNamespace(
-        config=types.SimpleNamespace(tidal=None, room_media={}), room_id="raspi")
+        config=types.SimpleNamespace(tidal=None, room_media={}), room_id="satellite")
     assert resolve_tidal(ctx) is None
 
 
 # --- resolver: the override case ------------------------------------------
 
 def test_override_redirects_rpc_url_only():
-    cfg = GabAgentConfig(api_key="t", room_media={"raspi": {"tidal_rpc_url": PI}})
-    tc = resolve_tidal(_ctx(cfg, "raspi"))
+    cfg = GabAgentConfig(api_key="t", room_media={"satellite": {"tidal_rpc_url": PI}})
+    tc = resolve_tidal(_ctx(cfg, "satellite"))
     assert tc.rpc_url == PI
     assert tc.enabled == cfg.tidal.enabled            # other fields preserved
 
 
 def test_override_does_not_mutate_global():
-    cfg = GabAgentConfig(api_key="t", room_media={"raspi": {"tidal_rpc_url": PI}})
-    _ = resolve_tidal(_ctx(cfg, "raspi"))
+    cfg = GabAgentConfig(api_key="t", room_media={"satellite": {"tidal_rpc_url": PI}})
+    _ = resolve_tidal(_ctx(cfg, "satellite"))
     assert cfg.tidal.rpc_url == GLOBAL                # the shared global stays put (model_copy, not in-place)
 
 
@@ -81,8 +81,8 @@ def test_rpc_timeout_defaults_to_zero():
 
 
 def test_room_timeout_override_applied():
-    cfg = GabAgentConfig(api_key="t", room_media={"raspi": {"tidal_rpc_timeout": 90.0}})
-    tc = resolve_tidal(_ctx(cfg, "raspi"))
+    cfg = GabAgentConfig(api_key="t", room_media={"satellite": {"tidal_rpc_timeout": 90.0}})
+    tc = resolve_tidal(_ctx(cfg, "satellite"))
     assert tc.rpc_timeout == 90.0
     assert tc.rpc_url == GLOBAL                        # endpoint untouched when only the timeout is set
     assert cfg.tidal.rpc_timeout == 0.0               # global not mutated
@@ -90,8 +90,8 @@ def test_room_timeout_override_applied():
 
 def test_room_timeout_and_url_override_together():
     cfg = GabAgentConfig(api_key="t",
-                         room_media={"raspi": {"tidal_rpc_url": PI, "tidal_rpc_timeout": 90.0}})
-    tc = resolve_tidal(_ctx(cfg, "raspi"))
+                         room_media={"satellite": {"tidal_rpc_url": PI, "tidal_rpc_timeout": 90.0}})
+    tc = resolve_tidal(_ctx(cfg, "satellite"))
     assert tc.rpc_url == PI and tc.rpc_timeout == 90.0
 
 
@@ -120,8 +120,8 @@ async def test_duck_local_skips_mixer_rpc_for_that_room(monkeypatch):
     logged = []
     monkeypatch.setattr(ducking, "_tidal_dlog", lambda ctx, **k: logged.append(k))
 
-    cfg = GabAgentConfig(api_key="t", room_media={"raspi": {"tidal_rpc_url": PI, "duck_local": True}})
-    ctx = types.SimpleNamespace(config=cfg, room_id="raspi")
+    cfg = GabAgentConfig(api_key="t", room_media={"satellite": {"tidal_rpc_url": PI, "duck_local": True}})
+    ctx = types.SimpleNamespace(config=cfg, room_id="satellite")
     assert await ducking._duck_tidal(ctx, on=True) is False
     assert await ducking._duck_tidal(ctx, on=False) is False
     assert calls == []                                          # the mixer-RPC never fired
@@ -147,15 +147,15 @@ async def test_duck_local_default_false_still_ducks(monkeypatch):
         return None
     monkeypatch.setattr(ducking, "_duck_tidal_sink", _noop_sink)
 
-    cfg = GabAgentConfig(api_key="t", room_media={"raspi": {"tidal_rpc_url": PI}})   # no duck_local
-    ctx = types.SimpleNamespace(config=cfg, room_id="raspi")
+    cfg = GabAgentConfig(api_key="t", room_media={"satellite": {"tidal_rpc_url": PI}})   # no duck_local
+    ctx = types.SimpleNamespace(config=cfg, room_id="satellite")
     assert await ducking._duck_tidal(ctx, on=True) is True
     assert "core.mixer.set_volume" in calls                     # ducked normally
 
 
 async def test_room_media_duck_local_coerces_and_defaults():
-    cfg = GabAgentConfig(api_key="t", room_media={"raspi": {"duck_local": True}})
-    assert cfg.room_media["raspi"].duck_local is True
+    cfg = GabAgentConfig(api_key="t", room_media={"satellite": {"duck_local": True}})
+    assert cfg.room_media["satellite"].duck_local is True
     assert RoomMediaProfile().duck_local is False               # default off
 
 
@@ -179,8 +179,8 @@ async def test_duck_targets_the_resolved_room_endpoint(monkeypatch):
         return None
     monkeypatch.setattr(ducking, "_duck_tidal_sink", _noop_sink)
 
-    cfg = GabAgentConfig(api_key="t", room_media={"raspi": {"tidal_rpc_url": PI}})
-    ctx = types.SimpleNamespace(config=cfg, room_id="raspi")
+    cfg = GabAgentConfig(api_key="t", room_media={"satellite": {"tidal_rpc_url": PI}})
+    ctx = types.SimpleNamespace(config=cfg, room_id="satellite")
     ok = await ducking._duck_tidal(ctx, on=True)
     assert ok is True
     assert seen and all(url == PI for url in seen)    # every duck RPC hit the Pi's Mopidy, not localhost

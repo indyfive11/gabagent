@@ -108,7 +108,7 @@ class JellyfinConfig(BaseModel):
     # playing" notice. Env: GABAI_JELLYFIN__ANNOUNCE_OTHER_SESSIONS.
     announce_other_sessions: bool = False
     # GLOBAL Jellyfin cast target (the native-client DeviceName to PlayNow+control via REST, e.g. a Jellyfin
-    # Media Player / mpv-shim). Empty (default) ⇒ no global target ⇒ the owned-browser play path (EM/KDE
+    # Media Player / mpv-shim). Empty (default) ⇒ no global target ⇒ the owned-browser play path (host/KDE
     # behavior, byte-identical). This is the SINGLE-ROOM analog of room_media[<room>].jellyfin_client_target:
     # a single-room install whose desktop is NOT KDE (the Cinnamon laptop — the owned-browser path's KWin
     # fullscreen can't run there) sets this so play() casts to a native client instead, with no room_media /
@@ -117,7 +117,7 @@ class JellyfinConfig(BaseModel):
     # A PipeWire sink-input substring the brain's universal full-mute local-duck (voice/ducking.py
     # _duck_local_sinks) must NOT touch, because a satellite-side gentle-duck belt already owns that node.
     # Set to the cast movie node (e.g. the laptop JMP/mpv `node.name`) so the brain doesn't ALSO hard-mute it
-    # on window-open and race the belt on restore. Empty (default) ⇒ no extra exclusion ⇒ EM/Pi byte-identical.
+    # on window-open and race the belt on restore. Empty (default) ⇒ no extra exclusion ⇒ host/satellite byte-identical.
     # Env: GABAI_JELLYFIN__CAST_DUCK_EXCLUDE_MATCH.
     cast_duck_exclude_match: str = ""
 
@@ -165,7 +165,7 @@ class TmdbConfig(BaseModel):
     """The Movie Database — the first (default) discovery source for MovieScout (voice "suggest N good
     movies to download"). A read-only credential for TMDB's public v3 API; installation-specific secret,
     settings.json only (nested-env deliberately unwired, mirrors RadarrConfig — no GABAI_TMDB__*). Empty
-    api_key ⇒ MovieScout never surfaces (detect() is config-only, so EM/Pi stay byte-identical). Free key
+    api_key ⇒ MovieScout never surfaces (detect() is config-only, so host/satellite stay byte-identical). Free key
     from themoviedb.org → Settings → API. This is the SOURCE credential; recommender policy lives in
     MoviescoutConfig so a second source (Trakt) slots in with its own credential block and zero policy
     duplication."""
@@ -201,7 +201,7 @@ class RoomMediaProfile(BaseModel):
     provider endpoint for ONE room (keyed by room_id in GabAgentConfig.room_media). Empty ⇒ fall through
     to the global provider config, so a room with no profile — and any unconfigured install — behaves
     EXACTLY as today (byte-identical). Example:
-        room_media = {"raspi": {"tidal_rpc_url": "http://192.168.1.108:6680/mopidy/rpc"}}
+        room_media = {"living_room": {"tidal_rpc_url": "http://192.0.2.50:6680/mopidy/rpc"}}
     routes that room's music control AND its RPC duck to the Pi's Mopidy instead of the brain-host's."""
     tidal_rpc_url: str = ""   # override TidalConfig.rpc_url for this room's Mopidy endpoint (unset ⇒ global)
     tidal_rpc_timeout: float = 0.0   # override TidalConfig.rpc_timeout for this room (s); 0 ⇒ global default
@@ -210,16 +210,16 @@ class RoomMediaProfile(BaseModel):
     # ducked over RPC (e.g. the Pi — value changes but output doesn't, or a phantom-0 right after play), the
     # brain's mixer duck is at best a no-op that mis-reports `ducked:["tidal"]` and at worst saves a 0 prior
     # that restores the music to silence. True ⇒ the brain skips its tidal duck for this room and the
-    # satellite owns it. Default false ⇒ the brain ducks as before (EM/global byte-identical).
+    # satellite owns it. Default false ⇒ the brain ducks as before (host/global byte-identical).
     duck_local: bool = False
-    # Per-room Jellyfin (Phase 10 / #62 video half). In THIS deployment both rooms share the ONE EM
+    # Per-room Jellyfin (Phase 10 / #62 video half). In THIS deployment both rooms share the ONE home
     # Jellyfin server; a room is distinguished only by WHICH session it casts to — so the active per-room
     # override is `jellyfin_client_target` (the room's native client, e.g. the Pi's mpv-shim, which streams
-    # from the shared EM server and plays on the room's own screen instead of the brain-host's browser).
+    # from the shared home server and plays on the room's own screen instead of the brain-host's browser).
     jellyfin_client_target: str = ""   # Jellyfin DeviceName to cast+control (the room's mpv-shim client)
     # base_url/api_key/user_id are an OPTIONAL future multi-server hook (mirrors the Tidal per-room
     # override) — UNUSED in this single-server deployment: leave empty ⇒ fall through to the shared global
-    # EM Jellyfin (byte-identical). Only set these if a room ever points at a DIFFERENT Jellyfin server.
+    # home Jellyfin (byte-identical). Only set these if a room ever points at a DIFFERENT Jellyfin server.
     jellyfin_base_url: str = ""        # override the room's Jellyfin server URL (empty ⇒ shared global)
     jellyfin_api_key: str = ""         # per-room API key (empty ⇒ global key)
     jellyfin_user_id: str = ""         # per-room user id for played/unwatched filters (empty ⇒ global)
@@ -346,8 +346,8 @@ class GabAgentConfig(BaseSettings):
     voice_port: int = 8765
     # Bind address for the voice-brain HTTP+SSE server. Default 127.0.0.1 = loopback-only (the brain and
     # the voice front-end share a host, the historical assumption). For a remote satellite (a thin voice
-    # box on the LAN talking to this brain — Pi Topology B), bind a SPECIFIC host IP (e.g. the EM LAN
-    # address "192.168.1.155"), NOT 0.0.0.0 — a specific bind narrows the exposed surface to one interface.
+    # box on the LAN talking to this brain — Pi Topology B), bind a SPECIFIC host IP (e.g. the brain's LAN
+    # address "192.0.2.10"), NOT 0.0.0.0 — a specific bind narrows the exposed surface to one interface.
     # Pair a non-loopback bind with `voice_auth_token` (a LAN-reachable /respond is a remote command surface).
     # CLI --voice-host overrides this. Env: GABAI_VOICE_HOST.
     voice_host: str = "127.0.0.1"
@@ -463,11 +463,11 @@ class GabAgentConfig(BaseSettings):
     # today (Stage 1 threshold-zoning ships first; this is the door-open fallback, flipped on only if the
     # gross acoustic separation isn't enough). When on, a /prewarm carrying a `wake_claim` opens/joins a
     # short grace window and returns a proceed|stand_down verdict the voice side honors before burning STT.
-    # Arbitration is EM-disk-local (an flock'd window file) → a cross-host brain physically can't touch it,
+    # Arbitration is host-disk-local (an flock'd window file) → a cross-host brain physically can't touch it,
     # so it never participates and any solo/remote install stays byte-identical. Env: GABAI_VOICE_WAKE_ARBITER_ENABLED.
     voice_wake_arbiter_enabled: bool = False
     # Grace window (seconds) a wake claim is held to collect near-simultaneous peers before the winner is
-    # picked by earliest NORMALIZED receipt (server-side EM-clock arrival minus each device's calibrated
+    # picked by earliest NORMALIZED receipt (server-side host-clock arrival minus each device's calibrated
     # detector latency). Must cover hall-leak acoustic delay + the calibrated detector delta and NO wider —
     # a wider window raises the one worse-than-today case (two DISTINCT simultaneous utterances false-merged).
     # ~0.25s is enough for a same-house tens-of-ms acoustic delta. Env: GABAI_VOICE_WAKE_ARBITER_WINDOW_SECS.
@@ -613,7 +613,7 @@ class GabAgentConfig(BaseSettings):
     # Env: GABAI_VOICE_ANNOUNCE_LEASE_SECS.
     voice_announce_lease_secs: float = 8.0
     # This machine's friendly name, used to tag media sources as LOCAL vs on another device/room (e.g.
-    # "EndeavorMain"). Empty → defaults to the hostname at use. The brain only AUTO-ducks/controls media it
+    # "HomeServer"). Empty → defaults to the hostname at use. The brain only AUTO-ducks/controls media it
     # judges local to this device; remote sources are visible (for future explicit control) but never touched
     # automatically. Env: GABAI_LOCAL_DEVICE.
     local_device: str = ""

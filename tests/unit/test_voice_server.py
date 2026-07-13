@@ -423,7 +423,7 @@ async def test_prewarm_fires_warm_call(tmp_path):
     ctx.client = _RecordingClient()
     app = build_app(ctx)
     async with _client(app) as client:
-        r = await client.post("/prewarm", json={"room": "raspi", "ts": 123})
+        r = await client.post("/prewarm", json={"room": "satellite", "ts": 123})
         assert r.status_code == 200 and r.json()["warming"] is True
     await _settle()
     assert ctx.client.warm_calls == ["arya"]          # warmed the simple model
@@ -435,8 +435,8 @@ async def test_prewarm_cooldown_skips_second(tmp_path):
     ctx.config.voice_prewarm_cooldown_secs = 60.0
     app = build_app(ctx)
     async with _client(app) as client:
-        await client.post("/prewarm", json={"room": "raspi"})
-        r2 = await client.post("/prewarm", json={"room": "raspi"})
+        await client.post("/prewarm", json={"room": "satellite"})
+        r2 = await client.post("/prewarm", json={"room": "satellite"})
         assert r2.json().get("skipped") == "cooldown"
     await _settle()
     assert ctx.client.warm_calls == ["arya"]          # only the first warmed
@@ -448,8 +448,8 @@ async def test_prewarm_per_room_independent(tmp_path):
     ctx.config.voice_prewarm_cooldown_secs = 60.0
     app = build_app(ctx)
     async with _client(app) as client:
-        await client.post("/prewarm", json={"room": "raspi"})
-        r = await client.post("/prewarm", json={"room": "EndeavorMain"})
+        await client.post("/prewarm", json={"room": "satellite"})
+        r = await client.post("/prewarm", json={"room": "HomeServer"})
         assert r.json()["warming"] is True            # a different room is not cooled down
     await _settle()
     assert ctx.client.warm_calls == ["arya", "arya"]
@@ -461,7 +461,7 @@ async def test_prewarm_disabled_no_call(tmp_path):
     ctx.config.voice_prewarm_enabled = False
     app = build_app(ctx)
     async with _client(app) as client:
-        r = await client.post("/prewarm", json={"room": "raspi"})
+        r = await client.post("/prewarm", json={"room": "satellite"})
         assert r.json().get("skipped") == "disabled"
     await _settle()
     assert ctx.client.warm_calls == []

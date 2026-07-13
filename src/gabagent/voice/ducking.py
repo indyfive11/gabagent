@@ -678,7 +678,7 @@ def _cast_duck_exclude_match(ctx) -> str:
     gentle-duck belt already owns that node (the cast Jellyfin movie on a non-KDE room — e.g. the laptop's
     JMP/mpv: brain gentle-duck no-ops it on the cast path, but this full-mute would hard-mute it and race the
     belt on restore). config jellyfin.cast_duck_exclude_match; empty (default) ⇒ no extra exclusion ⇒
-    EM/Pi byte-identical."""
+    host/satellite byte-identical."""
     jc = getattr(getattr(ctx, "config", None), "jellyfin", None)
     return (getattr(jc, "cast_duck_exclude_match", "") or "").strip().lower() if jc is not None else ""
 
@@ -704,7 +704,7 @@ async def _duck_local_sinks(ctx, on: bool, mute: bool = False) -> bool:
             owned_jf_idx = jf_saved[0] if jf_saved else None
             # A cast movie node (e.g. the laptop's JMP/mpv) is owned by the satellite's gentle-duck belt; the
             # owned_jf_idx exclusion above only covers the brain's OWN browser sink, so exclude the cast node
-            # explicitly by its configured substring (empty ⇒ no-op ⇒ EM/Pi unchanged).
+            # explicitly by its configured substring (empty ⇒ no-op ⇒ host/satellite unchanged).
             cast_excl = _cast_duck_exclude_match(ctx)
             priors = {}
             for si in _parse_sink_inputs(out):
@@ -953,7 +953,7 @@ def _room_duck_local(ctx) -> bool:
     """True when THIS room ducks its music locally at the sink (a satellite-side PipeWire belt), so the
     brain must NOT also duck via the Mopidy mixer-RPC. #62: set room_media[<room>].duck_local for a
     satellite whose Mopidy software-mixer can't be reliably ducked over RPC. Default false ⇒ the brain
-    ducks as before (EM / single-room / unconfigured installs byte-identical)."""
+    ducks as before (host / single-room / unconfigured installs byte-identical)."""
     rid = getattr(ctx, "room_id", None)
     if not rid:
         return False

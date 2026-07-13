@@ -24,7 +24,7 @@ class ImageDescriptor:
 
     `path` is always present (the local file GA wrote). `url` is the public CDN url when the endpoint
     returned one (empty for a b64-only response). VAC picks `path` when the generator host == the display
-    host (co-located, e.g. EM), else `url` (cross-host satellites). GA owns GC of the local file per
+    host (co-located, e.g. the brain host), else `url` (cross-host satellites). GA owns GC of the local file per
     `ttl_secs`; the CDN copy's retention is Gab's, not ours.
     """
     path: str

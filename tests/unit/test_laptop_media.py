@@ -1,7 +1,7 @@
 """Laptop media (Jellyfin cast + local Mopidy on a non-KDE single-room brain). Covers the three additive,
 empty-default brain changes agreed with VAC: the global jellyfin.client_target fallback, the non-KDE
 owned-browser desktop guard, and the cast-movie node exclusion from the brain's full-mute local-duck (the
-satellite belt owns that node). All defaults keep EM/Pi byte-identical."""
+satellite belt owns that node). All defaults keep host/Pi byte-identical."""
 from types import SimpleNamespace
 
 import pytest
@@ -33,9 +33,9 @@ def test_client_target_global_fallback_when_no_room_media():
 
 
 def test_client_target_per_room_wins_over_global():
-    rm = {"raspi": RoomMediaProfile(jellyfin_client_target="raspi-jellyfin")}
-    ctx = _ctx(_cfg(client_target="laptop-jellyfin", room_media=rm), room_id="raspi")
-    assert J._room_client_target(ctx) == "raspi-jellyfin"
+    rm = {"satellite": RoomMediaProfile(jellyfin_client_target="satellite-jellyfin")}
+    ctx = _ctx(_cfg(client_target="laptop-jellyfin", room_media=rm), room_id="satellite")
+    assert J._room_client_target(ctx) == "satellite-jellyfin"
 
 
 def test_client_target_falls_to_global_when_room_profile_has_no_target():
@@ -46,7 +46,7 @@ def test_client_target_falls_to_global_when_room_profile_has_no_target():
 
 
 def test_client_target_empty_when_neither_set_is_em_browser_path():
-    # EM/default: no global, no per-room → "" → owned-browser path (byte-identical).
+    # host/default: no global, no per-room → "" → owned-browser path (byte-identical).
     assert J._room_client_target(_ctx(_cfg())) == ""
 
 
@@ -65,12 +65,12 @@ def test_media_capability_false_when_no_catalog_and_no_target():
 
 
 def test_media_capability_true_via_per_room_target():
-    rm = {"raspi": RoomMediaProfile(jellyfin_client_target="raspi-jellyfin")}
-    assert _has_media_capability(_ctx(_cfg(room_media=rm), room_id="raspi")) is True
+    rm = {"satellite": RoomMediaProfile(jellyfin_client_target="satellite-jellyfin")}
+    assert _has_media_capability(_ctx(_cfg(room_media=rm), room_id="satellite")) is True
 
 
 def test_media_capability_true_when_catalog_has_media():
-    # EM/default: no cast target, but the catalog detected media → True (unchanged).
+    # host/default: no cast target, but the catalog detected media → True (unchanged).
     class _Cat:
         def domains(self):
             return ["media", "system"]
@@ -163,7 +163,7 @@ async def test_full_mute_excludes_cast_movie_node_but_ducks_others(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_full_mute_no_exclude_match_ducks_everything(monkeypatch):
-    # Empty default ⇒ no extra exclusion ⇒ EM/Pi behavior: every non-excluded local sink is hard-muted.
+    # Empty default ⇒ no extra exclusion ⇒ host/Pi behavior: every non-excluded local sink is hard-muted.
     monkeypatch.setattr(_dk.shutil, "which", lambda _: "/usr/bin/pactl")
     set_calls = []
 

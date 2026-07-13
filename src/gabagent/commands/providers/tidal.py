@@ -279,7 +279,7 @@ PROVIDER = TidalProvider()
 
 def _rpc_timeout(tc, timeout: float | None) -> float:
     """Resolve the per-call RPC timeout: an explicit arg wins; else the (per-room-resolved) tc.rpc_timeout;
-    else the module default. Lets a slow room (e.g. a cold Pi Mopidy) carry a larger budget than EM via
+    else the module default. Lets a slow room (e.g. a cold Pi Mopidy) carry a larger budget than the host via
     room_media without touching the fast explicit-timeout callers (get_state/get_current_track at 2.0s)."""
     if timeout is not None:
         return timeout

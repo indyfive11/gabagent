@@ -98,7 +98,7 @@ def resolve_jellyfin(ctx):
     """Effective JellyfinConfig for this turn's room (#62 video half) — the Jellyfin mirror of
     resolve_tidal. Per-room overrides from room_media[room_id] (base_url / api_key / user_id) are layered
     onto the GLOBAL JellyfinConfig via model_copy; no room / no profile / no overrides ⇒ the global config
-    UNCHANGED (byte-identical for EM, single-room, and unconfigured installs). None when jellyfin is
+    UNCHANGED (byte-identical for the host, single-room, and unconfigured installs). None when jellyfin is
     unconfigured (matches the prior getattr(ctx.config, "jellyfin", None) the call-sites used)."""
     jc = getattr(getattr(ctx, "config", None), "jellyfin", None)
     if jc is None:
@@ -128,7 +128,7 @@ def _room_client_target(ctx) -> str:
     Precedence: the per-room room_media[room_id].jellyfin_client_target, else the GLOBAL
     jellyfin.client_target (a single-room install — e.g. the Cinnamon laptop — with no room_media that still
     needs to cast to a native client rather than the KWin-only owned-browser path). Empty ⇒ no native target
-    → the brain-host owned-browser path (EM behavior, byte-identical)."""
+    → the brain-host owned-browser path (host behavior, byte-identical)."""
     prof = _room_profile(ctx)
     if prof is not None:
         t = (getattr(prof, "jellyfin_client_target", "") or "").strip()
@@ -180,11 +180,11 @@ def _seed_owned_deviceid(ctx, sessions: list[dict]) -> None:
     """For a duck_local room, REMEMBER the stable DeviceId of its cast-target session (matched by
     DeviceName/Client, even a session with NO NowPlayingItem), so _session_locality can pin the cast
     session LOCAL through a transient DeviceName/NowPlayingItem flap that would otherwise read it REMOTE.
-    Root cause it kills (live 2026-07-04 Pi movie): the raspi mpv-shim's /Sessions entry read
+    Root cause it kills (live 2026-07-04 Pi movie): the satellite mpv-shim's /Sessions entry read
     `jellyfin:playing:R` (→ /media/state idle) for a ~2-3min cast-negotiation window before flipping to
     `:L`, so the movie-duck signal saw the movie idle. The DeviceId is rock-stable (VAC live-confirmed);
     keying on it removes the flap. Refreshed every poll (a shim restart re-seeds a new DeviceId, so it never
-    goes stale). Scoped strictly to duck_local rooms; no-op otherwise (byte-identical EM/unconfigured)."""
+    goes stale). Scoped strictly to duck_local rooms; no-op otherwise (byte-identical host/unconfigured)."""
     prof = _room_profile(ctx)
     if prof is None or not getattr(prof, "duck_local", False):
         return
@@ -203,7 +203,7 @@ def _session_locality(ctx, s: dict) -> str:
     session (its mpv-shim) counts as LOCAL-to-that-room so /media/state reports the room's video playing
     and the room's local-duck belt fires. A native Pi session would otherwise read REMOTE (LAN endpoint).
     Scoped strictly to per-room-configured duck_local rooms — every other path keeps the pure global
-    judge_locality verdict (byte-identical for EM / unconfigured).
+    judge_locality verdict (byte-identical for the host / unconfigured).
 
     Flap-hardened (2026-07-04): matches on the target DeviceName first, else on the REMEMBERED stable
     DeviceId (_seed_owned_deviceid) — so a poll whose DeviceName momentarily doesn't match still reads
@@ -638,7 +638,7 @@ async def control(ctx, action="", position=None) -> ToolResult:
         return await _browser_control(ctx, page, action, secs)
     # No owned page → drive a native/controllable Jellyfin client over REST. For a per-room target (the
     # Pi's mpv-shim) prefer THAT session, so pause/resume/stop/seek/volume hit the room's own player; else
-    # fall back to whatever's actually playing (EM/global behavior, unchanged).
+    # fall back to whatever's actually playing (host/global behavior, unchanged).
     sessions = await _sessions(jc)
     _target_name = _room_client_target(ctx)
     target = (_match_target_session(sessions, _target_name) if _target_name else None) \
@@ -720,14 +720,14 @@ async def play(ctx, item_id="", title="", position=None) -> ToolResult:
     # Guard the owned-browser path on a non-KDE desktop. That path full-screens via KWin (desktop.py /
     # `qdbus6 org.kde.KWin`), which only exists on KDE — on e.g. the laptop's Cinnamon it fails cryptically.
     # Reaching here means no cast target is configured for this room, so surface a clear, actionable error
-    # instead. KDE (EM) is unaffected; this only bites a non-KDE install that fell through to the browser path.
+    # instead. KDE (the host) is unaffected; this only bites a non-KDE install that fell through to the browser path.
     if not _is_kde_wayland_desktop():
         return ToolResult(output="", error=(
             "I can't play the movie here: this isn't a KDE desktop, so the built-in browser player can't run, "
             "and no Jellyfin cast target is configured. Set jellyfin.client_target to a native client "
             "(e.g. a Jellyfin Media Player device) so I can cast to it."))
 
-    # No per-room target (EM / default): open OUR controllable browser window and drive the <video>. We
+    # No per-room target (host / default): open OUR controllable browser window and drive the <video>. We
     # deliberately do NOT branch on the /Sessions list to offer "play there?" — that list usually reflects
     # sessions on OTHER devices, and a web client can't be REST-controlled anyway.
     if emit:

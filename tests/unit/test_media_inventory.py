@@ -40,7 +40,7 @@ def test_is_loopback():
     assert _m._is_loopback("127.0.0.1:53124")
     assert _m._is_loopback("[::1]:9000")
     assert _m._is_loopback("::1")
-    assert not _m._is_loopback("192.168.1.42:8096")
+    assert not _m._is_loopback("192.0.2.42:8096")
     assert not _m._is_loopback("")
 
 
@@ -55,13 +55,13 @@ def test_judge_locality_own_device_id_is_local():
 
 
 def test_judge_locality_configured_device_name_is_local():
-    ctx = _ctx(local_device="EndeavorMain")
-    assert judge_locality(ctx, device_name="endeavormain", endpoint="192.168.1.5:5000") == "local"
+    ctx = _ctx(local_device="HomeServer")
+    assert judge_locality(ctx, device_name="homeserver", endpoint="192.0.2.5:5000") == "local"
 
 
 def test_judge_locality_lan_ip_defaults_remote():
-    ctx = _ctx(local_device="EndeavorMain")
-    assert judge_locality(ctx, device_name="Living Room TV", endpoint="192.168.1.77:5000") == "remote"
+    ctx = _ctx(local_device="HomeServer")
+    assert judge_locality(ctx, device_name="Living Room TV", endpoint="192.0.2.77:5000") == "remote"
 
 
 def test_judge_locality_unprovable_defaults_remote():
@@ -143,7 +143,7 @@ async def test_jellyfin_remote_session_is_visible_but_not_owned():
     from gabagent.commands.providers.jellyfin import PROVIDER as jf
     respx.get(BASE + "/Sessions").mock(side_effect=_sessions_resp([
         {"Id": "abc", "DeviceName": "Living Room TV", "DeviceId": "tv-1",
-         "RemoteEndPoint": "192.168.1.77:5000", "Client": "Jellyfin Web",
+         "RemoteEndPoint": "192.0.2.77:5000", "Client": "Jellyfin Web",
          "NowPlayingItem": {"Name": "Some Episode"}, "PlayState": {"IsPaused": False}},
     ]))
     ctx = _ctx()
@@ -174,7 +174,7 @@ async def test_jellyfin_loopback_session_is_local():
 async def test_jellyfin_skips_sessions_without_nowplaying():
     from gabagent.commands.providers.jellyfin import PROVIDER as jf
     respx.get(BASE + "/Sessions").mock(side_effect=_sessions_resp([
-        {"Id": "idle", "DeviceName": "Phone", "RemoteEndPoint": "192.168.1.9:5000"},
+        {"Id": "idle", "DeviceName": "Phone", "RemoteEndPoint": "192.0.2.9:5000"},
     ]))
     ctx = _ctx()
     ctx.jellyfin_playing_page = None
@@ -192,7 +192,7 @@ async def test_inventory_aggregates_and_scopes(monkeypatch):
     monkeypatch.setattr("gabagent.voice.ducking._run_pactl", _no_pactl)
     respx.post(RPC).mock(side_effect=_tidal_rpc("playing"))
     respx.get(BASE + "/Sessions").mock(side_effect=_sessions_resp([
-        {"Id": "r", "DeviceName": "Bedroom", "RemoteEndPoint": "192.168.1.50:5000",
+        {"Id": "r", "DeviceName": "Bedroom", "RemoteEndPoint": "192.0.2.50:5000",
          "NowPlayingItem": {"Name": "Movie"}, "PlayState": {"IsPaused": False}},
     ]))
     ctx = _ctx()

@@ -4,7 +4,7 @@ observe" with "what I may control."
 
 The governing rule (see the architecture plan): the brain only AUTO-ducks/controls media it judges LOCAL to
 this device; media on another device/room is visible (for future explicit commands like "stop all movies
-outside EndeavorMain") but NEVER touched automatically. This is what kills the cross-device control bug — a
+outside HomeServer") but NEVER touched automatically. This is what kills the cross-device control bug — a
 remote Jellyfin session can no longer drive `/media/state.kind` or get auto-paused when the user speaks.
 
 Providers contribute sources via an optional `async sources(ctx) -> list[MediaSource]` (duck-typed; a provider
