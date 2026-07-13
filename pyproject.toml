@@ -40,9 +40,13 @@ dev = [
 [project.scripts]
 gabagent = "gabagent.cli:app"
 gab = "gabagent.cli:app"
+gabagent-install = "gabagent.install.workstation:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/gabagent"]
+# installkit is a top-level, app-agnostic subtree (Layer A) shipped alongside gabagent so the installer
+# works from a wheel too; it is later vendored into voice-agent at a pinned SHA (import-isolation enforced
+# by tests/unit/test_installkit_import_isolation.py).
+packages = ["src/gabagent", "installkit"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
