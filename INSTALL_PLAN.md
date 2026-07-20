@@ -4,8 +4,13 @@
 **Status (2026-07-12):** packaging model **LOCKED (for now)** after a full adversarial design pass with the
 voice-agent side, then a **3-way pressure test** (GA red-team × VAC audit × maintainer) that confirmed the
 four forks + layered model and folded in six execution-level corrections (see the change log at the end).
-**Nothing is built.** Every phase is gated on explicit approval. The canonical home of the shared core
-remains open (§10b). The four MVP "forks" (§1) are locked provisionally pending a maintainer re-review.
+**Nothing is built.** Every phase is gated on explicit approval. The canonical home of the shared core is
+now **decided — its own repo** (§10b, resolved 2026-07-20). The four MVP "forks" (§1) are locked
+provisionally pending a maintainer re-review.
+
+> **Update 2026-07-20:** `installkit/` is now a standalone public repo (github.com/indyfive11/installkit),
+> vendored by both layers at a pinned SHA. The Phase-3 shared surface (A.4 templating + A.5 tokens) has
+> landed there at pin **`d3451cb`** (GA-audited, signed, pushed). See §4 and §10b.
 
 > Companion memory: `project-gabagent-installer-roadmap.md` (Tier-1) carries the same model plus the
 > internal-topology/process notes that don't belong in a repo doc.
@@ -92,8 +97,10 @@ Plugin-discovered addon installers (§5) + the backend-picker steps (Gab / Claud
   only behind an explicit `--yes` (never an unprompted `curl … | sh`).
 
 ## 4. Distribution of the shared core — VENDORED at a pinned SHA (not a published package)
-`installkit/` is born as a neutral-named top-level subtree in gabagent at the MVP, then **vendored** into the
-voice-agent tree at a **pinned commit SHA** when `voice-agent-install` is built (Phase-3). **The vendor-pin +
+`installkit/` was born as a neutral-named subtree in gabagent at the MVP, then **promoted to its own repo**
+(github.com/indyfive11/installkit, 2026-07-20 — resolves §10b). Both gabagent and voice-agent now **vendor**
+it in at a **pinned commit SHA** (current pin **`d3451cb`**; FF-only from here). Consumed by copy, never pip —
+`bootstrap.sh` must not need PyPI. **The vendor-pin +
 SHA-match CI activate at that Phase-3 vendor point — NOT at the MVP:** the interfaces stay provisional until
 voice forces the real shared surface (see the Layer-A note), so freezing them at the MVP would stamp
 "proven" on a surface a text install never met. Guards (live from the Phase-3 vendor onward):
@@ -162,9 +169,10 @@ release cadence, the "installs separately but coordinated" rule, and the Debian 
 ## 10. Open decisions / status
 - **(a) The four MVP forks (§1) are under maintainer re-review.** Locked *provisionally*. The layered model
   survives a fork change; the piece most exposed is the **build order** (MVP = text-first).
-- **(b) Phase-3 canonical home for `installkit/`** — promote it to its own tiny repo (both vendor from it) vs
-  keep the voice-agent side vendoring from the gabagent subtree. **Deferred to phase 3**, decided on the
-  measured surface. Non-blocking.
+- **(b) Canonical home for `installkit/` — DECIDED 2026-07-20: its own repo.** Promoted to
+  github.com/indyfive11/installkit; both layers vendor from it at a pinned SHA. Chosen to dissolve the
+  authorship deadlock (voice-agent git-operates only its own tree, so shared code inside gabagent couldn't be
+  authored there). A.4/A.5 shaped + landed at pin `d3451cb`. *(was: deferred to Phase-3.)*
 - **Current directive: stop at scope.** No build until a Phase-1 go.
 
 ---

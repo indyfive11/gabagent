@@ -41,8 +41,8 @@ _Between milestones — no gabagent build is in flight. The next active piece is
 - **reSpeaker mic-wedge cures** _(voice-agent side)_ — Class A solved; Class B USB-power-cycle rung shipped. Remaining: a live watchdog-driven cycle (maintainer-gated). voice-agent is currently **push-frozen** — this + the confirm-parser stack await the maintainer's direct go.
 
 ## NEXT — queued (gate is closed; pick to pull in)
-- **Installer — Phase-2 (plugin-installer contract).** The natural continuation of Phase-1. Each plugin package ships an `install.py` exposing `manifest` + `check`/`install`/`configure`, wired through a **new explicit registry to build** — deliberately *not* auto-discovery. Biggest coherent next chunk on the gabagent side.
-- **Installer — Phase-3 (voice)** _(voice-agent's build, not ours)_ — voice-agent vendors `installkit/` at a pinned SHA and unfreezes its surface. Blocked on us only for a snapshot of the live reference-host + satellite units first.
+- **Installer — Phase-2 (plugin-installer contract)** — _built, committed local (`a5a8317`/`1ac6cf0`/`66cae4f`), unpushed._ Each plugin package ships an installer exposing `manifest` + `check`/`install`/`configure`, wired through an **explicit registry** — deliberately *not* auto-discovery.
+- **Installer — Phase-3 (voice)** _(voice-agent's build, not ours)_ — `installkit/` is now its **own repo** (github.com/indyfive11/installkit); the shared surface A.4 templating + A.5 tokens landed there at pin **`d3451cb`** (GA-audited + signed). Voice-agent vendors from that pin. Blocked on us only for a snapshot of the live reference-host + satellite units first.
 - **Cross-room arbiter** — brain lane done + committed, **flag-off**. Next: Stage-1 threshold-zoning (voice-side, ~zero code), then enable only if a doorway still double-answers.
 - **✦ Builder** — dormant but wired in the CLI. Keep tracked and **surface regularly** ("use the builder").
 - **✦ MovieScout LOW-3/4/5** — deferred, but **surface soon & often** (Jellyfin overlay, Trakt, cooldown-on-add).
@@ -83,6 +83,6 @@ _Between milestones — no gabagent build is in flight. The next active piece is
 - **Last release:** **v0.7.0 (2026-07-13)** — image gen, movie downloads, MovieScout, headless builder, first installer; closed the close-the-loop gate. (Prior: v0.6.0, 2026-06-20.)
 
 ## Open questions the maintainer owns
-- Phase-3 `installkit/` canonical home (deferred to phase 3, decided on the measured surface).
+- ~~Phase-3 `installkit/` canonical home~~ — **RESOLVED 2026-07-20: its own repo** (github.com/indyfive11/installkit), both layers vendor at a pinned SHA.
 - Whether **model-change** and **builder** survive long-term.
 - Whether to wire the mechanical pre-push content guard (see NEXT).
