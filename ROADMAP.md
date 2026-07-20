@@ -4,7 +4,8 @@
 Supersedes the scattered `PLAN_*` / roadmap docs (archived locally in `docs/archive/`, gitignored).
 Keep this living: when a plan changes, change it *here* — don't start a new plan doc.
 
-_Last reconciled: 2026-07-12 (full founding-vs-shipped audit)._
+_Last reconciled: 2026-07-20 (post-v0.7.0 — the close-the-loop gate is now CLOSED)._
+_Prior: 2026-07-12 (full founding-vs-shipped audit)._
 
 ---
 
@@ -18,26 +19,34 @@ Both first-class. Shared agent loop, tool registry, config, and Key Invariants. 
 
 ---
 
-## ★ THE GATE — close the loop before opening new domains
+## ★ THE GATE — CLOSED 2026-07-13 (kept as a standing forcing function)
 **Rule (2026-07-12):** no **new feature domain** starts until the current release loop closes —
 1. Land the **installer MVP** (Phase-1: text-only workstation) → see [`INSTALL_PLAN.md`](INSTALL_PLAN.md).
-2. **Cut a release** that ships the ~43 commits unreleased since v0.6.0 (2026-06-20).
+2. **Cut a release** that ships the commits unreleased since v0.6.0 (2026-06-20).
 3. **Then** new domains, each with explicit maintainer sign-off.
+
+**Status: SATISFIED.** Both halves landed — installer Phase-1 MVP built (`74b5d68`, births `installkit/`)
+and **v0.7.0 released 2026-07-13** (shipped the full backlog). New feature domains are unblocked again;
+the gate did its job. The rule stays on the books as the reusable forcing function for the *next* loop:
+whenever the unreleased backlog starts growing again, re-invoke it.
 
 _Bugfixes and hardening on already-shipped features are always allowed. Net-new domains are gated._
 _Why: live feature requests kept deferring the release gate indefinitely — this is the forcing function._
 
 ---
 
-## NOW — active, inside the loop
-- **Installer — Phase-1 MVP.** Scope LOCKED (`INSTALL_PLAN.md`); awaiting the build go. Births `installkit/`. The 4 MVP "forks" are under maintainer re-review.
-- **reSpeaker mic-wedge cures** _(voice-agent side)_ — Class A solved; Class B USB-power-cycle rung shipped. Remaining: a live watchdog-driven cycle (maintainer-gated).
+## NOW — active
+_Between milestones — no gabagent build is in flight. The next active piece is the maintainer's call
+(see NEXT). Standing item:_
+- **reSpeaker mic-wedge cures** _(voice-agent side)_ — Class A solved; Class B USB-power-cycle rung shipped. Remaining: a live watchdog-driven cycle (maintainer-gated). voice-agent is currently **push-frozen** — this + the confirm-parser stack await the maintainer's direct go.
 
-## NEXT — queued (post-gate, unless explicitly pulled forward)
+## NEXT — queued (gate is closed; pick to pull in)
+- **Installer — Phase-2 (plugin-installer contract).** The natural continuation of Phase-1. Each plugin package ships an `install.py` exposing `manifest` + `check`/`install`/`configure`, wired through a **new explicit registry to build** — deliberately *not* auto-discovery. Biggest coherent next chunk on the gabagent side.
+- **Installer — Phase-3 (voice)** _(voice-agent's build, not ours)_ — voice-agent vendors `installkit/` at a pinned SHA and unfreezes its surface. Blocked on us only for a snapshot of the live reference-host + satellite units first.
 - **Cross-room arbiter** — brain lane done + committed, **flag-off**. Next: Stage-1 threshold-zoning (voice-side, ~zero code), then enable only if a doorway still double-answers.
-- **Polish pass (rescoped 2026-07-12, VAC-vetted)** — the stale `PLAN_polish` collapsed to **4 real items** after ground-truth (9 of its items were already shipped). **Built (uncommitted, unit-green, 1379 tests):** P1 `system.fix_audio` (idempotent "can't hear" recovery — unmute + 50% floor, default-sink only, user-invoked), P2 TIDAL normalized-query cache, P3 eye `error` state. **P1 live-drive** pending a coordinated voice-up window (mutates audio). **P4 → DEFERRED** (below). Ships with the release.
 - **✦ Builder** — dormant but wired in the CLI. Keep tracked and **surface regularly** ("use the builder").
 - **✦ MovieScout LOW-3/4/5** — deferred, but **surface soon & often** (Jellyfin overlay, Trakt, cooldown-on-add).
+- **Pre-push content guard** _(offered, not wired)_ — a mechanical private-IP + internal-hostname denylist gate on the tip tree, extending the global pre-push identity hook. Proposed after the v0.7.0 install-specifics scrub; awaiting the go to wire it.
 
 ## DEFERRED — tracked, not active
 - **Model-change voice feature** (enumerate catalog + switch to a named model) — revived; needs rescope + an implementation decision. May cut later. _Today only the local↔cloud toggle exists._
@@ -67,11 +76,13 @@ _Why: live feature requests kept deferring the release gate indefinitely — thi
 - **Coding-assistant core** (v0.2.x) — agent loop, 28 tools, Rich TUI, resumable JSONL sessions, local Ollama, Claude/Anthropic backend, cascading model ladder, plan/approve, MCP / LSP / hooks.
 - **Voice brain + command framework** (v0.3.0) — HTTP+SSE protocol, tiered safety/confirmation, addressed-to-me filter, the pluggable provider plane.
 - **Media** (v0.3–v0.6) — Jellyfin (search/play/duck/fullscreen/seek), TIDAL via Mopidy, Radarr/Sonarr voice-add, MovieScout recommender.
-- **Multi-room** _(unreleased)_ — LAN brain + bearer token, room-id capability handshake, Pi satellite, per-room media, offline local failover, cross-room arbiter (flag-off).
-- **Other domains** _(unreleased)_ — image generation, credit-balance guard, self-introspection, self-learning persona, timers + proactive channel, auto-Turbo latency, loop-detector + escalation ladder.
-- **Last release:** v0.6.0 (2026-06-20). ~43 commits unreleased since — that backlog is the gate's payload.
+- **Multi-room** (v0.7.0) — LAN brain + bearer token, room-id capability handshake, satellite, per-room media, offline local failover, cross-room arbiter (flag-off).
+- **Other domains** (v0.7.0) — image generation, credit-balance guard, self-introspection, self-learning persona, timers + proactive channel, auto-Turbo latency, loop-detector + escalation ladder, movie downloads (Radarr/Sonarr), MovieScout recommender, headless builder.
+- **Installer — Phase-1 MVP** (v0.7.0) — text-only workstation wizard + top-level `installkit/` (Layer-A, stdlib-only) + `bootstrap.sh` + `gabagent-install`. Closed the gate's installer half.
+- **Polish pass** (v0.7.0) — P1 `system.fix_audio` (`944730e`, idempotent "can't hear" recovery — unmute + 50% floor, default-sink only, user-invoked), P2 TIDAL normalized-query cache (`bd3f99f`), P3 eye `error` state (`5c50467`). P4 → DEFERRED (below).
+- **Last release:** **v0.7.0 (2026-07-13)** — image gen, movie downloads, MovieScout, headless builder, first installer; closed the close-the-loop gate. (Prior: v0.6.0, 2026-06-20.)
 
 ## Open questions the maintainer owns
-- The 4 installer MVP forks (provenance re-review).
 - Phase-3 `installkit/` canonical home (deferred to phase 3, decided on the measured surface).
 - Whether **model-change** and **builder** survive long-term.
+- Whether to wire the mechanical pre-push content guard (see NEXT).
