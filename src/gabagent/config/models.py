@@ -357,6 +357,19 @@ class GabAgentConfig(BaseSettings):
     # is non-loopback, so a LAN-exposed /respond can't be driven by anything but the paired satellite (which
     # carries the same token in its .env). Env: GABAI_VOICE_AUTH_TOKEN.
     voice_auth_token: str = ""
+    # Advertise the brain on the LAN via mDNS/DNS-SD (_voice-brain._tcp) so a satellite can discover the
+    # host without a hand-typed IP. Default False = the historical no-op: an install that never opted in
+    # broadcasts nothing (a LAN brain announcing its presence is a deliberate choice, not a side effect of
+    # upgrading). The voice-host installer role WRITES this True when it provisions a LAN brain; a manual
+    # install sets it here or via GABAI_VOICE_ADVERTISE. A loopback `voice_host` is never advertised even
+    # when True (nothing to discover). Fail-soft: absent `zeroconf` (optional dep) degrades to no
+    # advertisement, never a crash. Discovery is a PARALLEL enhancement over a hand-configured host.
+    voice_advertise: bool = False
+    # This brain's own room identity, published in the mDNS TXT (`room_id`) so a multi-room satellite can
+    # filter its browse to the RIGHT brain. Empty (default) = a single-room install: the advertiser still
+    # publishes an empty `room_id`, which a satellite reads as "the default/only brain" — unchanged behavior.
+    # Env: GABAI_VOICE_ROOM_ID.
+    voice_room_id: str = ""
     voice_safe_zones: list[str] = Field(default_factory=list)
     # Builder auto-run guardrail: directory roots inside which `send_to_builder` may dispatch WITHOUT a
     # keyboard confirm (Tier 1). A target outside every root stays keyboard-gated (fail-safe). Empty

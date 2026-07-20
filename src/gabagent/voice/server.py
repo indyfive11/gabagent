@@ -386,7 +386,17 @@ async def serve_voice(ctx: AgentContext, host: str = "127.0.0.1", port: int = 87
     import asyncio
     from gabagent.voice.timers import ticker as _timer_ticker
     timer_task = asyncio.create_task(_timer_ticker(ctx, app.state.sessions))
+
+    # LAN discovery: advertise _voice-brain._tcp so a satellite finds this host without a typed IP.
+    # Opt-in (`voice_advertise`, written True by the voice-host installer role) and additionally gated on a
+    # non-loopback bind, fail-soft on absent zeroconf. The getattr default mirrors the schema default, so an
+    # unconfigured install — or an older config object without the field — advertises nothing.
+    from gabagent.voice.advertiser import BrainAdvertiser
+    advertiser = BrainAdvertiser()
+    if getattr(ctx.config, "voice_advertise", False):
+        advertiser.start(host, port, room_id=getattr(ctx.config, "voice_room_id", ""))
     try:
         await server.serve()
     finally:
         timer_task.cancel()
+        advertiser.stop()

@@ -27,6 +27,7 @@ dependencies = [
 voice = [
     "starlette>=0.37",
     "uvicorn>=0.30",
+    "zeroconf>=0.130",  # optional LAN discovery (_voice-brain._tcp); advertiser fail-softs if absent
 ]
 dev = [
     "pytest>=8.0",
