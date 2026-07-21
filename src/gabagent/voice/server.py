@@ -391,12 +391,16 @@ async def serve_voice(ctx: AgentContext, host: str = "127.0.0.1", port: int = 87
     # Opt-in (`voice_advertise`, written True by the voice-host installer role) and additionally gated on a
     # non-loopback bind, fail-soft on absent zeroconf. The getattr default mirrors the schema default, so an
     # unconfigured install — or an older config object without the field — advertises nothing.
+    # The advertised room falls back to the launch `--room-id` when `voice_room_id` is unset (Rob, 2026-07-21):
+    # a brain started `--room-id raspi` DOES serve a named room, so advertising "" was a dishonest TXT that a
+    # room-filtering satellite could only match by accident. Config still wins when explicitly set.
     from gabagent.voice.advertiser import BrainAdvertiser
     advertiser = BrainAdvertiser()
     if getattr(ctx.config, "voice_advertise", False):
-        advertiser.start(host, port, room_id=getattr(ctx.config, "voice_room_id", ""))
+        advert_room = (getattr(ctx.config, "voice_room_id", "") or getattr(ctx, "room_id", "") or "").strip()
+        await advertiser.start(host, port, room_id=advert_room)
     try:
         await server.serve()
     finally:
         timer_task.cancel()
-        advertiser.stop()
+        await advertiser.stop()
