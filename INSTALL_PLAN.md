@@ -130,9 +130,13 @@ intentional, not a gap.
 ## 6. Role matrix (the installer's first question)
 1. **Workstation** — CLI/TUI, text-only, pick AI backend(s). No voice. ← MVP target.
 2. **Full voice host** — brain + full voice co-located + optional media/desktop addons. **Must WRITE
-   `voice_advertise: true`** into `settings.json` when it provisions a LAN-bound brain: the code default is
-   `false` (unset = the historical no-op, nothing broadcast), so mDNS discovery is an install-time opt-in the
-   detect-and-write step owns — per the hardware/config-generalization SOP.
+   `voice_advertise: true`** when it provisions a LAN-bound brain: the code default is `false` (unset = the
+   historical no-op, nothing broadcast), so mDNS discovery is an install-time opt-in the detect-and-write step
+   owns — per the hardware/config-generalization SOP. **Layer split:** the role is provisioned by Layer B, but
+   `voice_advertise` is a gabagent pydantic `settings.json` field, so per §2's "each repo writes its own
+   config" the WRITE is **Layer C's** — Layer B invokes the Layer-C step, never edits `settings.json` itself
+   (it cannot `from gabagent…`). Conditional on the gabagent brain: a `BRAIN=local/ollama` voice host has no
+   gabagent config and nothing to write.
 3. **Satellite** — voice + local STT/TTS, attaches to a remote LAN brain (token-paired), no desktop. (Debian/apt.)
 4. **Laptop** — Gab-Agent + optional voice; own brain or thin client.
 
