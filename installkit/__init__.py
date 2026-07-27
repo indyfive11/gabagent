@@ -5,19 +5,24 @@ between the gabagent and voice-agent installers; it is later vendored into the v
 pinned commit SHA (Phase-3), so it carries two hard invariants:
 
   1. IMPORT ISOLATION — installkit imports ONLY the Python standard library (plus anything it
-     explicitly declares). It must NEVER `import gabagent` / `from gabagent …`; a per-repo layer owns
-     all app-specific config knowledge and writes. Enforced by tests/unit/test_installkit_import_isolation.py.
-  2. PROVISIONAL INTERFACES — the text MVP exercises only the wizard primitives, the system dep-engine,
-     and hardware detection. Unit/env templating (A.4) and token pairing (A.5) are deliberately NOT here
-     yet: they are first shaped by voice in Phase-3, which is when this surface stabilizes and the
-     vendor-pin activates. Keep additions minimal until then.
+     explicitly declares). It must NEVER import a consuming app (`gabagent`, `voice_agent`, …); a per-repo
+     layer owns all app-specific config knowledge and writes. Enforced by tests/test_import_isolation.py.
+  2. RETURN-DATA + THIN-WRITE — every engine RETURNS rendered data; a separate thin writer does the
+     filesystem side, so a consumer's wizard can diff/preview before committing. No engine embeds an app
+     name or an install-specific constant (portability SOP).
 
-What lives here today (the MVP-exercised third of Layer A):
-  - wizard   — pure-stdlib interactive primitives (prompt / choose / confirm / save-confirm + panels).
-  - deps     — the dependency-engine SYSTEM layer (distro detect, uv presence, system-pkg readiness).
-  - hardware — one-shot hardware detection that RETURNS values (never writes config); the GPU probe
-               reports the vendor triple `amd | nvidia | none` needed for the STT split.
+What lives here (Layer A, as of Phase-3 — the templating/token surface has now stabilized and the
+vendor-pin is active):
+  - wizard     — pure-stdlib interactive primitives (prompt / choose / confirm / save-confirm + panels).
+  - deps       — the dependency-engine SYSTEM layer (distro detect, uv presence, system-pkg readiness).
+  - hardware   — one-shot hardware detection that RETURNS values (never writes config); the GPU probe
+                 reports the vendor triple `amd | nvidia | none` needed for the STT split.
+  - templating — the artifact engine (A.4): render + atomic/mode-safe writers for `.env` / systemd
+                 `--user` unit / `.desktop`. The unit renderer is the structural boot-safety chokepoint
+                 (no Type=/Requires=/ExecStartPre → the Tier-0 boot-network violation is unexpressible).
+  - secrets    — the token engine (A.5): ensure_tokens (authority: mint-when-absent) vs require_tokens
+                 (consumer/satellite: fail-loud, never mint a shared secret the server never heard of).
 """
 
-__all__ = ["wizard", "deps", "hardware"]
+__all__ = ["wizard", "deps", "hardware", "templating", "secrets"]
 __version__ = "0.1.0"
