@@ -249,11 +249,42 @@ release cadence, the "installs separately but coordinated" rule, and the Debian 
   *new* public pin + SHA-match CI. installkit is public and FF-only, so the pin-publish + CI wiring
   **cannot ship while the push freeze is on** — the vendored copy records `78ff1cd` as
   *provisional-until-pushed*; finalizing is gated on the maintainer lifting the freeze. Each commit/push its own go.
-- **(d) OPEN — §6's firewall/discovery section is unwritten.** A default-drop host input policy silently
-  drops mDNS query/response, so discovery returns nothing and the symptom is indistinguishable from a broken
-  advertiser (measured 2026-07-21). The discriminator: the satellite catches the announce burst but sees
-  nothing when it merely queries. The detect-and-report check must live on the **satellite-install** path —
-  the brain host structurally cannot run an off-box reachability check on itself. Unbuilt.
+- **(d) Firewall / discovery reachability check — DESIGN RATIFIED 2026-07-21 (GA↔VAC consensus), authoring
+  gated.** A brain host with a default-drop input policy silently drops inbound mDNS (5353/udp). Because mDNS
+  is query/response, discovery then returns nothing and the symptom is **indistinguishable from a broken
+  advertiser** — the failure looks like the wrong layer. Measured on a live default-drop host: firewall
+  closed → `12.2s → None`; the same host with `224.0.0.251:5353/udp` allowed → `0.27s → BrainEndpoint`. This
+  is a PoC-blocker class, not a single-box quirk: any locked-down brain host hits it.
+  - **Discriminator (how the check tells the two apart):** a satellite catches the host's unsolicited
+    *announce burst* (sent on service start) but sees nothing when it merely *queries*. So a check that
+    browses and gets silence, when the advertiser is known-good, is diagnosing a **filtered responder**, not
+    a dead one.
+  - **Where it lives — the satellite-install path only.** An off-box reachability check needs a *second* box
+    to run the query, and at voice-host install time the satellite may not exist yet — so the brain host
+    **structurally cannot run this check on itself.** It belongs on the satellite installer, after the brain
+    host + port are known.
+  - **Layer split (ratified, no new shared surface):** **Layer B (voice-agent)** owns the browse, the reason
+    vocabulary, and the rendered operator remedy · **Layer A (installkit)** gets **nothing new** · **Layer C
+    (gabagent)** does one thing: the voice-host role enables the advertiser (`voice_advertise: true`, per §6
+    role 2). That is its entire involvement here.
+  - **Rules the check obeys:** (1) **detect-and-report, never mutate** — the installer prints the gap and the
+    remedy, it never edits a host firewall; (2) **effect-check, not rule-parse** — verify by attempting the
+    browse and observing the result, never by parsing nftables/iptables/firewalld rules (not portably
+    introspectable, fail-open); (3) **non-fatal** — a filtered/absent responder does not abort the install;
+    the satellite falls back to the typed `host + port` path (§10c pairing floor) and prints the gap.
+    Auto-discovery is a **parallel enhancement (CR-4)**, never a hard dependency.
+  - **Reason vocabulary the browse reports** (drives the operator remedy text): `no-adverts` (nothing seen —
+    likely filtered or advertiser off), `filtered=N` (adverts seen for other services but not the brain),
+    `unconfirmed` (advert seen but the resolved endpoint didn't answer a probe), `loopback-advert` (advert
+    resolves to a loopback address — misconfigured bind).
+  - **Build state (measured, do not read the design above as shipped):** the browse *primitive* exists and is
+    tested (`voice_agent_install/discovery.py`) but is **UNWIRED** — `discover_brain`/`default_providers`
+    have **no production caller** outside the boot re-resolve path; the reason-vocabulary reporting and the
+    operator remedy rendering are **unbuilt**. This section specifies work to do, not work done.
+  - **Corollary carried from the mDNS close-out:** a fail-soft `except` around discovery converts a hard
+    failure into a silent absence — so any discovery path owes an **out-of-process, off-box effect check**;
+    `discovery.py`'s bare `except Exception` (not `except ImportError`) means an *installed-but-broken*
+    zeroconf renders identically to "no adverts," which this check must not mask.
 - **Current directive:** Phases 1–3b are built; every further build, commit, push, and pin move is
   individually gated.
 
