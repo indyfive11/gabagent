@@ -248,7 +248,7 @@ release cadence, the "installs separately but coordinated" rule, and the Debian 
   **Ordering:** decision (done) → build + unit-test + Pi-deploy-test (freeze-safe, offline-complete) →
   *new* public pin + SHA-match CI. installkit is public and FF-only, so the pin-publish + CI wiring
   **cannot ship while the push freeze is on** — the vendored copy records `78ff1cd` as
-  *provisional-until-pushed*; finalizing is gated on Rob lifting the freeze. Each commit/push its own go.
+  *provisional-until-pushed*; finalizing is gated on the maintainer lifting the freeze. Each commit/push its own go.
 - **(d) OPEN — §6's firewall/discovery section is unwritten.** A default-drop host input policy silently
   drops mDNS query/response, so discovery returns nothing and the symptom is indistinguishable from a broken
   advertiser (measured 2026-07-21). The discriminator: the satellite catches the announce burst but sees

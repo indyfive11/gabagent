@@ -13,7 +13,7 @@ Discovery is a PARALLEL ENHANCEMENT over a manual host, never a floor (CR-4). Th
 RESOLVED IPv4, never a `.local` name (CR-5): a satellite that can't resolve mDNS names still gets a usable
 A-record it can connect to.
 
-App-agnostic on the wire: the service TYPE is the Rob-blessed `_voice-brain._tcp.local.` — satellites match
+App-agnostic on the wire: the service TYPE is the maintainer-blessed `_voice-brain._tcp.local.` — satellites match
 on it, so it must never change.
 
 ASYNC-ONLY by necessity. The sole caller (`serve_voice`) runs inside a live asyncio loop, and zeroconf's
@@ -31,7 +31,7 @@ import socket
 # wedged network stack can never hold up the brain's startup — discovery is an enhancement, never a floor.
 _REGISTER_BUDGET_SECS = 5.0
 
-# Rob-blessed wire name (2026-07-20). Satellites discover on this exact string — DO NOT CHANGE.
+# Maintainer-blessed wire name (2026-07-20). Satellites discover on this exact string — DO NOT CHANGE.
 _SERVICE_TYPE = "_voice-brain._tcp.local."
 
 

@@ -119,7 +119,7 @@ def test_two_brains_on_one_host_get_distinct_instance_names():
     # The collision that motivated this: process-per-room puts a room brain and the LAN brain on the SAME
     # box. python-zeroconf's register_service defaults to allow_name_change=False, so a duplicate name raises
     # and the fail-soft `except` swallows it — the second brain silently never advertises.
-    assert _instance_name("raspi", 8765) != _instance_name("living_room", 8765)
+    assert _instance_name("bedroom", 8765) != _instance_name("living_room", 8765)
 
 
 def test_instance_name_falls_back_to_the_bind_port_when_the_room_is_empty():
