@@ -1,16 +1,23 @@
 # Install Plan — Gab-Agent + Voice-Agent Installer
 
 **Purpose:** the single reference for the installer's scope, packaging model, and build order.
-**Status (2026-07-12):** packaging model **LOCKED (for now)** after a full adversarial design pass with the
-voice-agent side, then a **3-way pressure test** (GA red-team × VAC audit × maintainer) that confirmed the
-four forks + layered model and folded in six execution-level corrections (see the change log at the end).
-**Nothing is built.** Every phase is gated on explicit approval. The canonical home of the shared core is
-now **decided — its own repo** (§10b, resolved 2026-07-20). The four MVP "forks" (§1) are locked
-provisionally pending a maintainer re-review.
+**Status (reconciled 2026-07-22):** packaging model still **LOCKED (for now)** — the four forks + 3-layer
+model survived the 2026-07-12 3-way pressure test and have not been overturned since. Every phase remains
+gated on explicit approval.
 
-> **Update 2026-07-20:** `installkit/` is now a standalone public repo (github.com/indyfive11/installkit),
-> vendored by both layers at a pinned SHA. The Phase-3 shared surface (A.4 templating + A.5 tokens) has
-> landed there at pin **`d3451cb`** (GA-audited, signed, pushed). See §4 and §10b.
+**What is built (this replaces the former "Nothing is built"):**
+
+| Phase | State | Evidence |
+|---|---|---|
+| 1 — text-only workstation wizard | **built** | `src/gabagent/install/workstation.py` |
+| 2 — plugin-installer contract + reference plugin | **built** | `src/gabagent/install/{contract,aggregate,registry}.py` |
+| 3a — audio/GPU detect-and-write, mDNS discovery | **built** (voice-agent) | its `voice_agent_install/{audio_detect,discovery}.py` |
+| 3b — satellite role provisioner (`.env` composition) | **built, not yet reachable** | see the divergence ledger below |
+| 3c — credential claim handshake | not started | — |
+| 4–5 — addon installers, orchestrator + release | not started | — |
+
+**Read the divergence ledger at the end before trusting any section below it.** Three things this document
+asserted for a month did not happen, and one of them is a live drift.
 
 > Companion memory: `project-gabagent-installer-roadmap.md` (Tier-1) carries the same model plus the
 > internal-topology/process notes that don't belong in a repo doc.
@@ -42,6 +49,12 @@ Only Layer A is shared. B and C sit *above* it, each in its own installer.
 > (A.3). Those are first shaped in Phase-3 (voice). So the MVP does **not** prove the shared interfaces —
 > `installkit/` stays **unfrozen** through Phase-3; the vendor-pin + SHA-match CI (§4) activate only at the
 > Phase-3 vendor point, letting voice force the real shared surface. (Sizes below are rough and un-load-bearing.)
+>
+> **⚠ 2026-07-22 — the vendor point came and went and this never activated.** Phase 3 has shipped; no
+> vendor-pin check and no SHA-match CI exist in either repo. Worse, the premise turned out to be wrong in
+> the other direction: voice *did* force the shared surface, and the surface **failed to express it** —
+> A.4's unit renderer cannot emit `RestartSec` or `WorkingDirectory`, so voice-agent wrote its own renderer
+> instead of consuming A.4. See divergence **D2**.
 
 ### Layer A — GENUINELY SHARED (`installkit/`) — rough ~430–530 lines, small + stable-*domain*
 1. **Wizard PRIMITIVES only** — `prompt()` + a render/panel helper + `save-confirm` (~30 lines). The *control
@@ -97,16 +110,40 @@ Plugin-discovered addon installers (§5) + the backend-picker steps (Gab / Claud
   only behind an explicit `--yes` (never an unprompted `curl … | sh`).
 
 ## 4. Distribution of the shared core — VENDORED at a pinned SHA (not a published package)
-`installkit/` was born as a neutral-named subtree in gabagent at the MVP, then **promoted to its own repo**
-(github.com/indyfive11/installkit, 2026-07-20 — resolves §10b). Both gabagent and voice-agent now **vendor**
-it in at a **pinned commit SHA** (current pin **`d3451cb`**; FF-only from here). Consumed by copy, never pip —
-`bootstrap.sh` must not need PyPI. **The vendor-pin +
-SHA-match CI activate at that Phase-3 vendor point — NOT at the MVP:** the interfaces stay provisional until
-voice forces the real shared surface (see the Layer-A note), so freezing them at the MVP would stamp
-"proven" on a surface a text install never met. Guards (live from the Phase-3 vendor onward):
+
+**The intended model.** `installkit/` was born as a neutral-named subtree in gabagent at the MVP, then
+**promoted to its own repo** (github.com/indyfive11/installkit, 2026-07-20 — resolves §10b), to be vendored
+by both layers at a **pinned commit SHA**, FF-only. Consumed by copy, never pip — `bootstrap.sh` must not
+need PyPI. The pin + SHA-match CI were to activate at the Phase-3 vendor point, not the MVP, so that
+freezing them early would not stamp "proven" on a surface a text install never met. Intended guards:
+
 - `make vendor-sync` + a CI/precommit **SHA-match check** in both repos (a mismatch fails the check).
 - **Import-isolation invariant:** `installkit/` imports only the standard library + what it declares — never
-  `from gabagent…` — enforced by a one-line precommit grep, so it always stays vendorable.
+  a consuming app — so it always stays vendorable.
+
+**⚠ The actual state, measured 2026-07-22 — vendoring was never carried out. Do not read the paragraph
+above as a description of this repo.**
+
+| Claim this doc made | Measured reality |
+|---|---|
+| Both repos vendor at pin `d3451cb` | **Neither does.** `d3451cb` is vendored nowhere. |
+| gabagent vendors the pin | gabagent's `installkit/` subtree is a **pre-promotion snapshot** — 4 modules (`__init__`, `wizard`, `deps`, `hardware`) — matching **no upstream commit**. `templating.py` and `secrets.py` (the whole A.4/A.5 surface) were never copied, and `__init__`'s docstring still says the vendor-pin activates in the *future*. **Scope of the drift, measured:** `deps.py`, `hardware.py` and `wizard.py` are **byte-identical to upstream HEAD**; only `__init__.py` differs (docstring + a two-name-short `__all__`). So this is documentation drift, not code drift — nothing gabagent runs is affected. |
+| voice-agent vendors the pin | voice-agent has **no `installkit/` directory and no import of it** anywhere. |
+| `make vendor-sync` exists | No such target in either repo. |
+| SHA-match CI is live | Does not exist. |
+
+Consequence: **`installkit.templating` (A.4) and `installkit.secrets` (A.5) have zero production consumers
+in either repo** — nothing outside installkit's own test suite imports them. They were specced, twice
+audited, hardened, and pushed to a public repo for a single intended consumer that then could not use them.
+See **D2**. And the sharper form: **the public `installkit` repo has no consumer of any kind** — gabagent's
+installer runs against its own in-tree copy, voice-agent has none. Today it is a *publication*, not a
+dependency. The only honest reading of "current pin `d3451cb`" is *"the SHA the shared repo happens to be
+at"*, not *"the SHA either consumer is running."*
+
+**Standing rule this proves out (CR-3):** a pin asserted as a string in prose is not a pin. Any pin guard
+must be **content-derived** — compare a hash of the vendored tree against the upstream object — never a
+string compared against a number written in a document. This drift existed for a month precisely because
+three documents agreed with each other and nothing compared them to a tree.
 
 *Why not a published package:* it would only buy independent third-party reuse and an independent release
 cadence — we have neither, and a hard cross-repo *installed* dependency cuts against "installs separately."
@@ -169,6 +206,11 @@ release cadence, the "installs separately but coordinated" rule, and the Debian 
    slimming, unit generation, satellite token-pairing. **This phase forces A.3/A.4/A.5 into their real shape;
    snapshot the reference host + satellite live units as templates FIRST. Voice-agent vendors `installkit/` here — vendor-pin +
    SHA-match CI go live at this point, not before.**
+   > **⚠ Reconciled 2026-07-22.** 3a and 3b shipped; the snapshot requirement *was* honoured (voice-agent's
+   > `units.py` header records the live satellite unit and it immediately earned its keep — the running unit
+   > turned out to be transient, i.e. no persistent unit exists on any satellite today). But the vendoring
+   > clause did **not** happen (**D1**), A.4 could not express the unit this phase needed (**D2**), and 3b's
+   > provisioner is not reachable from any entry point (**D3**). 3c is not started.
 4. **Addon plugin installers** — Jellyfin (URL + key only; never sets up the server), Tidal/Mopidy (optional
    OAuth, skippable), desktop-control, etc.
 5. **Full-stack orchestrator + release** (package reconcile, packaged units, docs).
@@ -177,10 +219,103 @@ release cadence, the "installs separately but coordinated" rule, and the Debian 
 - **(a) The four MVP forks (§1) are under maintainer re-review.** Locked *provisionally*. The layered model
   survives a fork change; the piece most exposed is the **build order** (MVP = text-first).
 - **(b) Canonical home for `installkit/` — DECIDED 2026-07-20: its own repo.** Promoted to
-  github.com/indyfive11/installkit; both layers vendor from it at a pinned SHA. Chosen to dissolve the
-  authorship deadlock (voice-agent git-operates only its own tree, so shared code inside gabagent couldn't be
-  authored there). A.4/A.5 shaped + landed at pin `d3451cb`. *(was: deferred to Phase-3.)*
-- **Current directive: stop at scope.** No build until a Phase-1 go.
+  github.com/indyfive11/installkit to dissolve the authorship deadlock (voice-agent git-operates only its own
+  tree, so shared code inside gabagent couldn't be authored there). A.4/A.5 were shaped and landed there at
+  `d3451cb`. *(was: deferred to Phase-3.)* **The repo decision stands; the vendoring that was supposed to
+  follow it did not happen — see §4 and D1.**
+- **(c) DECIDED 2026-07-27 (maintainer) = Option 1, fix-and-consume.** A.4 is now fixed (`9b389a4`
+  RestartSec-chokepoint + WorkingDirectory, `0b8ae18` docs); voice-agent's satellite unit will **consume
+  `installkit.templating.render_unit`** instead of its own `units.py` renderer — making A.4 its first real
+  consumer and proving the shared boot-safety surface. Scoped + 2-agent pressure-tested (both trees) and
+  ratified in GA↔VAC collab (full consensus 2026-07-27). Findings that shaped the build:
+  1. **No boot-safety regression** — installkit is equal-or-stronger on all six invariants `units.py`
+     encodes (`Requires=`/sub-second-restart are *unexpressible*); the two rendered-text diffs
+     (`TimeoutStartSec=15`, one-per-line Wants/After) are systemd-inert.
+  2. **Vendor the WHOLE `installkit/` package (all 6 modules) at content-derived pin `78ff1cd`** as tracked
+     top-level `*.py` — NOT the old prose pin `d3451cb` (predates the A.4 fix → would ship a weaker renderer
+     green). Whole-package (not a 2-file subset) is required so the SHA-match stays a clean whole-tree
+     compare and the pinned `__init__` isn't forced into a lie; all 6 modules are stdlib-only so nothing new
+     reaches the Pi, and 3c consumes `installkit.secrets` next anyway.
+  3. **Deploy-safety / separability guards:** vendor top-level so the `git ls-files '*.py'` Pi rsync carries
+     it; add an `installkit.__file__`-inside-the-voice-agent-tree test (blocks a sibling-`~/dev/installkit`
+     `path=` dep from splitting host↔Pi resolution) + a mirror stdlib-only import-isolation test over the
+     copy. voice-agent never imports gabagent; installkit stays app-agnostic → products stay separable.
+  4. **Dead-code repoint:** delete `units.py`'s `render_unit`/`UnitSpec`; repoint its tests through the
+     vendored renderer (assert the newline case on `ValueError` *type*, not message).
+
+  This resolves D1 (the vendor mechanism gets its first real consumer) and D2 (A.4 now expresses its unit).
+
+  **Ordering:** decision (done) → build + unit-test + Pi-deploy-test (freeze-safe, offline-complete) →
+  *new* public pin + SHA-match CI. installkit is public and FF-only, so the pin-publish + CI wiring
+  **cannot ship while the push freeze is on** — the vendored copy records `78ff1cd` as
+  *provisional-until-pushed*; finalizing is gated on Rob lifting the freeze. Each commit/push its own go.
+- **(d) OPEN — §6's firewall/discovery section is unwritten.** A default-drop host input policy silently
+  drops mDNS query/response, so discovery returns nothing and the symptom is indistinguishable from a broken
+  advertiser (measured 2026-07-21). The discriminator: the satellite catches the announce burst but sees
+  nothing when it merely queries. The detect-and-report check must live on the **satellite-install** path —
+  the brain host structurally cannot run an off-box reachability check on itself. Unbuilt.
+- **Current directive:** Phases 1–3b are built; every further build, commit, push, and pin move is
+  individually gated.
+
+---
+
+## Divergence ledger — where reality left the plan (dated, 2026-07-22)
+
+Recorded rather than quietly corrected, so the next reader can see *what* moved and *why*. Each entry is
+grounded in a command run against the real trees, not in another document.
+
+**D1 — Vendoring never happened (§4, §9.3).** The plan said both repos would vendor `installkit/` at pin
+`d3451cb` with a `make vendor-sync` target and a SHA-match CI gate. None of it was built. gabagent carries a
+pre-promotion snapshot matching no upstream commit; voice-agent carries nothing; the public repo has no
+consumer of any kind. *Why it went unnoticed:* the pin was asserted as a string in three documents that
+agreed with each other, and nothing ever compared a document to a tree.
+*Bounded on measurement, not assumed:* every module gabagent actually imports is byte-identical to upstream
+HEAD — the divergence is one `__init__.py` (docstring + `__all__`) plus the two modules never copied. So no
+code reconciliation is pending, and retiring the vendor model would cost one file and three documents, not a
+migration. Worth stating the inverse too: in the one place a shared surface was genuinely exercised, both
+sides converged on identical code; only the **unexercised** surface drifted.
+**Justified? No — this is drift, not a decision.** It is the open question in §10c.
+
+**D2 — The shared unit renderer could not express its only consumer (§2 Layer-A, §4).** Phase-3 was supposed
+to force A.4 into its real shape. It did the opposite: `installkit.templating.render_unit` has no
+`WorkingDirectory` parameter and never emits `RestartSec`, so voice-agent wrote its own renderer. The
+`RestartSec` gap is the serious one — with none emitted, the value falls through to the service manager's
+own `DefaultRestartUSec` (100 ms as shipped), which is per-box configurable state the renderer cannot see and
+did not write. A unit that fails at boot then exhausts its start limit in a fraction of a second and latches
+`failed`, requiring a manual `reset-failed` — the remote-hands dependency this project exists to remove. The
+realistic trigger is not an exotic fault but the cold-boot sound-server race already in the tracker.
+*Two lessons worth keeping:* (i) a boot-safety chokepoint that cannot express a safety-critical parameter
+does not omit it — it silently sources it from the machine, which is the config-generalization rule broken
+inside the safety mechanism; (ii) both renderers latch on a *persistent* fault, so the real difference
+between them is transient-tolerance (sub-second vs over a minute), not brick-vs-no-brick.
+**Justified? Partly** — writing a working renderer rather than blocking on a shared one was the right call in
+the moment; leaving the plan asserting the opposite was not.
+
+**D3 — Built ≠ reachable (§9.3).** 3b's provisioner composes and validates a `.env` and renders a unit
+string, and 26 tests pass over it — but nothing writes the unit, runs `systemctl --user enable`, or enables
+linger, and until the entry point below existed nothing invoked any of it. A tested seam with no production
+caller is unbuilt work that looks shipped, and a test suite measuring a library cannot observe that nothing
+calls it. **Standing check, not a lesson:** before claiming a component built, grep for a caller outside
+`tests/` — the exact dual of the deploy-safety rule (never an importer without its target; equally, never a
+target without its importer).
+
+**D4 — The install entry point was an empty slot (§3).** §3 named `git clone → ./bootstrap.sh` as the primary
+spine from the start, but no `bootstrap.sh` was ever tracked in either repo, so the steps between `git clone`
+and the provisioner — create a venv, know the module name, know the argument shape — were undocumented and
+untested, which is exactly the per-box-varying part. Now decided (2026-07-22): **a tracked `bootstrap.sh` at
+the voice-agent repo root is THE canonical entry point**, and the other shapes are *derived* from it, not
+rivals — the AUR package is a thin wrapper over the same path, and a satellite's rsync tree is a **deploy
+mechanism, not an install target**. Both install *layouts* remain supported (repo checkout and the XDG data
+directory), resolved from the running module's own location; the entry point decides where a *fresh* install
+lands, it does not narrow what an *existing* install may be. *Corollary for any entry point:* a handoff that
+execs a module with no `__main__` exits 0 having done nothing — success and silent no-op are indistinguishable
+by exit status, so an install must assert its **artifacts**, never `$?`.
+
+**D5 — The self-provisioning headline is not reachable from the satellite role alone (§0, §6).** The satellite
+role is the only validated profile that exists; the voice-host role that would emit the service map is
+unbuilt. Until it (or the 3c claim handshake) lands, a satellite install hand-prompts credentials that a
+human must first fetch off the brain box. **Justified as sequencing, but it was never written down** — the
+plan implied an end-to-end story the built roles cannot deliver.
 
 ---
 
