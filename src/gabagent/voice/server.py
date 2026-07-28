@@ -53,8 +53,14 @@ class _BearerAuth:
         self.token = token
         self._expected = f"Bearer {token}"
 
+    # /health is the open liveness probe; /pair is the unauthenticated pairing seam (a fresh front end
+    # has no token yet — the operator-opened window + accept is its gate, not a bearer). EXACT-match only:
+    # the operator admin routes (/pair/open, /pair/candidates, /pair/accept) are NOT exempt and stay
+    # bearer-guarded — a prefix match here would be the one foothold that hands out the token unguarded.
+    _EXEMPT = frozenset({"/health", "/pair"})
+
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope.get("path") == "/health":
+        if scope["type"] != "http" or scope.get("path") in self._EXEMPT:
             await self.app(scope, receive, send)
             return
         import hmac
@@ -79,6 +85,18 @@ def build_app(ctx: AgentContext):
 
     sessions: dict[str, VoiceSession] = {}
     _prewarm_last: dict[str, float] = {}   # room → last pre-warm monotonic time (per-room cooldown)
+
+    # Token auto-provisioning ("pairing"). Brain-global (one process, one window) — a closure like
+    # `sessions`. The client-facing CLAIM state machine lives in voice/pairing.py; the operator drives it
+    # via the /pair/open · /pair/candidates · /pair/accept admin routes (bearer-guarded). A single
+    # asyncio.Lock serialises the mutating ops so accept→retrieve is atomic (at-most-one issuance).
+    import asyncio as _pair_aio
+    from gabagent.voice.pairing import PairingState, DEFAULT_WINDOW_TTL, DEFAULT_CLAIM_TTL
+    pairing = PairingState(
+        window_ttl=float(getattr(ctx.config, "voice_pair_window_secs", DEFAULT_WINDOW_TTL)),
+        claim_ttl=float(getattr(ctx.config, "voice_pair_claim_secs", DEFAULT_CLAIM_TTL)),
+    )
+    pair_lock = _pair_aio.Lock()
 
     def get_session(sid: str) -> VoiceSession:
         vs = sessions.get(sid)
@@ -342,6 +360,71 @@ def build_app(ctx: AgentContext):
             note_duck_activity(ctx)
         return JSONResponse(await _media_state(ctx))
 
+    async def pair(request):
+        # AGNOSTIC client-facing pairing endpoint (unauthenticated — exempt from the bearer guard). A fresh
+        # front end POSTs {client_id, claim_secret?, label?, room_id?}; the CLAIM state machine returns
+        # 202{claim_secret} while pending, 200{auth_token} once the operator accepts, or 4xx/501. Body-
+        # tolerant (a malformed/empty body is treated as {} so a newer client field can't 400 an older brain).
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        token = (getattr(ctx.config, "voice_auth_token", "") or "").strip()
+        if not token:
+            # No bearer configured ⇒ nothing to hand out. Distinct from 404 (route absent = old brain):
+            # 501 tells a conforming client "pairing-capable but unprovisioned" → hard error, never store
+            # an empty token. A deliberately-open brain is reached via the client's explicit no-auth path.
+            return JSONResponse({"error": "pairing_unsupported"}, status_code=501)
+        peer_ip = request.client.host if request.client else ""
+        async with pair_lock:
+            outcome = pairing.pair(
+                client_id=body.get("client_id", ""),
+                claim_secret=body.get("claim_secret"),
+                peer_ip=peer_ip,
+                label=body.get("label", ""),
+                room_id=_coerce_room_id(body.get("room_id")),
+                auth_token=token,
+            )
+        from gabagent.voice.debuglog import dlog
+        dlog(ctx, "pair", status=outcome.status, peer=peer_ip)
+        if outcome.http == 200:
+            return JSONResponse({"auth_token": outcome.auth_token, "token_scheme": "bearer"})
+        if outcome.http == 202:
+            return JSONResponse({"status": outcome.status, "claim_secret": outcome.claim_secret},
+                                status_code=202)
+        return JSONResponse({"error": outcome.error}, status_code=outcome.http)
+
+    async def pair_open(request):
+        # OPERATOR admin route (bearer-guarded — NOT in the published contract). Opens/extends the window.
+        secs = pairing.open_window()
+        from gabagent.voice.debuglog import dlog
+        dlog(ctx, "pair_open", window_secs=secs)
+        return JSONResponse({"ok": True, "window_secs": secs})
+
+    async def pair_candidates(request):
+        # OPERATOR admin route: list live candidates for the accept prompt (labels pre-sanitised; peer_ip
+        # is the authoritative, non-forgeable identifier the human trusts).
+        return JSONResponse({"window_open": pairing.window_open(), "candidates": pairing.candidates()})
+
+    async def pair_accept(request):
+        # OPERATOR admin route: accept ONE candidate by client_id → it becomes retrievable, the window
+        # closes, all other candidates are dropped.
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        cid = (body.get("client_id", "") if isinstance(body, dict) else "")
+        async with pair_lock:
+            ok = pairing.accept(cid)
+        from gabagent.voice.debuglog import dlog
+        dlog(ctx, "pair_accept", client_id=cid, ok=ok)
+        return JSONResponse(
+            {"ok": ok, "accepted": (cid if ok else None), "error": (None if ok else "no_such_candidate")},
+            status_code=(200 if ok else 404),
+        )
+
     # A shared-secret bearer guard only when a token is configured (i.e. a LAN bind). Loopback default
     # leaves it off → zero behavior change. Added via Starlette's middleware= so build_app still returns
     # the Starlette instance (tests drive app.state.sessions directly).
@@ -361,8 +444,15 @@ def build_app(ctx: AgentContext):
         Route("/media/state", media_state, methods=["GET"]),
         Route("/builder/poll", builder_poll, methods=["GET"]),
         Route("/prewarm", prewarm, methods=["POST"]),
+        # Token pairing: /pair is the agnostic client seam (guard-exempt); the /pair/* admin routes are
+        # bearer-guarded (operator-only) and NOT part of the published contract.
+        Route("/pair", pair, methods=["POST"]),
+        Route("/pair/open", pair_open, methods=["POST"]),
+        Route("/pair/candidates", pair_candidates, methods=["GET"]),
+        Route("/pair/accept", pair_accept, methods=["POST"]),
     ], middleware=middleware)
     app.state.sessions = sessions
+    app.state.pairing = pairing   # exposed so tests drive the state machine without a live socket
     return app
 
 

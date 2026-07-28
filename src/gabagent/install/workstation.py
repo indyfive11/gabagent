@@ -163,7 +163,7 @@ def _run_enable_voice_host(argv: list[str]) -> int:
     ns, _ = p.parse_known_args(argv)
 
     from gabagent.config.loader import load_config, save_config
-    from gabagent.install.voice_host import RefuseAdvertise, enable_voice_advertise
+    from gabagent.install.voice_host import RefuseAdvertise, enable_voice_advertise, ensure_voice_auth_token
 
     cfg = load_config()
     try:
@@ -173,15 +173,24 @@ def _run_enable_voice_host(argv: list[str]) -> int:
         wizard.note(f"  {e}")
         return 2
 
-    if result.changed:
+    # Mint the brain's bearer token if absent — only AFTER advertise accepted (a loopback refusal above
+    # writes nothing), so enabling the voice-host role is atomic: token + advertise, or neither. Minting
+    # here (pre-restart) is what lets the pairing seam hand a real token out instead of 501'ing. Never
+    # prints the secret value.
+    _token, minted = ensure_voice_auth_token(cfg)
+
+    if result.changed or minted:
         save_config(cfg)
-        wizard.heading("Voice-host advertising enabled.")
+        wizard.heading("Voice-host advertising enabled." if result.changed
+                       else "Voice-host advertising already enabled.")
         wizard.note(f"  voice_advertise = true; voice_host = {result.host}")
         if result.room_id:
             wizard.note(f"  voice_room_id = {result.room_id}")
+        wizard.note("  voice_auth_token = (minted)" if minted else "  voice_auth_token = (existing)")
     else:
         wizard.heading("Voice-host advertising already enabled.")
         wizard.note(f"  voice_host = {result.host} (unchanged)")
+        wizard.note("  voice_auth_token = (existing)")
     for n in result.notes:
         wizard.note(f"  ⚠ {n}")
     return 0

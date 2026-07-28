@@ -132,6 +132,7 @@ def main(
     voice_host: str = typer.Option("", "--voice-host", help="Voice server bind address (default: config voice_host, 127.0.0.1). Set a LAN IP for a remote satellite; pair with GABAI_VOICE_AUTH_TOKEN."),
     room_id: str = typer.Option("", "--room-id", help="Durable room key this brain serves (process-per-room), e.g. 'living_room'. Used by the tiered-memory layer; empty = single-room default."),
     set_claude_key: str = typer.Option("", "--set-claude-key", help="Save an Anthropic key, switch to the Claude backend, and exit"),
+    pair_voice_agent: bool = typer.Option(False, "--pair-voice-agent", help="Pair a new voice front end: open a short window and approve the device that appears (run on the brain host), then exit"),
     models: bool = typer.Option(False, "--models", help="Refresh + inspect the live model catalog and how it validates the router ladder, then exit"),
     credits: bool = typer.Option(False, "--credits", help="Show the live Aria/Gab credit balance and the low-balance guard state, then exit"),
     version: bool = typer.Option(False, "--version", "-v", help="Show version"),
@@ -165,6 +166,11 @@ def main(
         save_config(cfg)
         typer.echo(f"Saved Claude backend to {settings_file()} (provider=claude, base model {cfg.model}).")
         raise typer.Exit()
+
+    if pair_voice_agent:
+        from gabagent.config.loader import load_config
+        from gabagent.voice.pair_console import run as run_pair_console
+        raise typer.Exit(run_pair_console(load_config()))
 
     from gabagent.tui.renderer import console
 

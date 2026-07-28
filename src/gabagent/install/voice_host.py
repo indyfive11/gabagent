@@ -42,6 +42,28 @@ def _is_wildcard(host: str) -> bool:
     return (host or "").strip() in ("0.0.0.0", "::")
 
 
+def ensure_voice_auth_token(cfg) -> tuple[str, bool]:
+    """AUTHORITY-side mint of the brain's bearer token into `cfg.voice_auth_token`, if absent.
+
+    A LAN brain REQUIRES a token: a non-loopback `/respond` is a remote command surface, and the pairing
+    seam (`POST /pair`) has nothing to hand out without one (it returns 501 `pairing_unsupported`). So the
+    voice-host role mints it HERE — before the brain service (re)starts — because the running guard reads
+    `voice_auth_token` ONCE at startup (`voice/server.py`); a token written after launch is invisible to
+    the live process until a restart. This box IS the brain (the source of truth for the token), so
+    minting is correct (contrast a satellite, which must RECEIVE it — `installkit.secrets` splits the two).
+
+    Idempotent: an existing non-empty token is NEVER rotated (rotating it would silently 401 every
+    already-paired front end). Returns `(token, minted)`. The caller owns `save_config` (mirrors the
+    advertise step); import-light (installkit is stdlib-only) so the installer registry stays lean."""
+    from installkit.secrets import ensure_tokens
+    before = (getattr(cfg, "voice_auth_token", "") or "").strip()
+    token = ensure_tokens({"voice_auth_token": before}, ["voice_auth_token"])["voice_auth_token"]
+    minted = not before
+    if minted:
+        cfg.voice_auth_token = token
+    return token, minted
+
+
 @dataclass(frozen=True)
 class AdvertiseResult:
     """What the write did. `changed` drives whether the caller persists; `notes` carries non-fatal

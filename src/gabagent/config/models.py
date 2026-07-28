@@ -357,6 +357,12 @@ class GabAgentConfig(BaseSettings):
     # is non-loopback, so a LAN-exposed /respond can't be driven by anything but the paired satellite (which
     # carries the same token in its .env). Env: GABAI_VOICE_AUTH_TOKEN.
     voice_auth_token: str = ""
+    # Token pairing (`gab pairvoiceagent`): how long the operator-opened pairing WINDOW stays open for a new
+    # front end to register (seconds), and how long an ACCEPTED candidate stays retrievable — its CLAIM TTL —
+    # so a dropped response can recover. Defaults (5 min / 30 s) suit a hands-on install; both are safe to
+    # leave unset (the getattr in the server mirrors these). Env: GABAI_VOICE_PAIR_WINDOW_SECS / _CLAIM_SECS.
+    voice_pair_window_secs: float = 300.0
+    voice_pair_claim_secs: float = 30.0
     # Advertise the brain on the LAN via mDNS/DNS-SD (_voice-brain._tcp) so a satellite can discover the
     # host without a hand-typed IP. Default False = the historical no-op: an install that never opted in
     # broadcasts nothing (a LAN brain announcing its presence is a deliberate choice, not a side effect of
