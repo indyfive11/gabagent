@@ -145,11 +145,58 @@ def _run_addons() -> int:
     return 0
 
 
-def main() -> int:
-    """Console-script entry (`gabagent-install`). Synchronous wrapper around the async wizard.
-    `--addons` runs the optional plugin-configuration flow instead of the workstation wizard."""
+def _run_enable_voice_host(argv: list[str]) -> int:
+    """Layer-C voice-host role: enable the LAN mDNS advertiser by writing `voice_advertise` + a
+    non-loopback `voice_host`. This is a NON-INTERACTIVE sub-op (like `--addons`), invoked cross-process
+    by the Layer-B voice-host provisioner — it never edits settings.json itself (it cannot `import
+    gabagent`):
+
+        gabagent-install --enable-voice-host --host <LAN_IP> [--room-id <room>]
+
+    Refuses (non-zero exit, nothing written) on a loopback effective host — a flag that advertises nothing
+    is worse than no flag, because the satellite-side §10d remedy text would then contradict the config."""
+    import argparse
+
+    p = argparse.ArgumentParser(prog="gabagent-install --enable-voice-host", add_help=False)
+    p.add_argument("--host", default=None, help="the brain's LAN bind address (non-loopback)")
+    p.add_argument("--room-id", dest="room_id", default=None, help="this brain's room identity")
+    ns, _ = p.parse_known_args(argv)
+
+    from gabagent.config.loader import load_config, save_config
+    from gabagent.install.voice_host import RefuseAdvertise, enable_voice_advertise
+
+    cfg = load_config()
     try:
-        if "--addons" in sys.argv[1:]:
+        result = enable_voice_advertise(cfg, host=ns.host, room_id=ns.room_id)
+    except RefuseAdvertise as e:
+        wizard.heading("Voice-host advertising NOT enabled.")
+        wizard.note(f"  {e}")
+        return 2
+
+    if result.changed:
+        save_config(cfg)
+        wizard.heading("Voice-host advertising enabled.")
+        wizard.note(f"  voice_advertise = true; voice_host = {result.host}")
+        if result.room_id:
+            wizard.note(f"  voice_room_id = {result.room_id}")
+    else:
+        wizard.heading("Voice-host advertising already enabled.")
+        wizard.note(f"  voice_host = {result.host} (unchanged)")
+    for n in result.notes:
+        wizard.note(f"  ⚠ {n}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Console-script entry (`gabagent-install`). Synchronous wrapper around the async wizard.
+    `--addons` runs the optional plugin-configuration flow; `--enable-voice-host` runs the Layer-B-invoked
+    voice-host advertise write. `argv` defaults to `sys.argv[1:]` (an explicit list makes both non-interactive
+    sub-ops unit-testable)."""
+    args = sys.argv[1:] if argv is None else argv
+    try:
+        if "--enable-voice-host" in args:
+            return _run_enable_voice_host(args)
+        if "--addons" in args:
             return _run_addons()
         return asyncio.run(_run())
     except wizard.WizardCancelled:
