@@ -41,13 +41,20 @@ if [ -n "$new_fields" ]; then
 fi
 
 # --- (blocking) untracked local module imported by tracked code -------------------------------------
-untracked=$(git ls-files --others --exclude-standard -- 'src/gabagent/**/*.py' 'installkit/**/*.py' || true)
+# NB: a '**/*.py' git pathspec does NOT match files directly under the dir — list the dirs and filter .py.
+untracked=$(git ls-files --others --exclude-standard -- src/gabagent installkit | grep '\.py$' || true)
 for f in $untracked; do
-  mod=$(basename "$f" .py)
-  [ "$mod" = "__init__" ] && continue
-  if git grep -lE "(^|[^.])\b(import +${mod}\b|from +[A-Za-z0-9_.]*\.?${mod} +import)" -- '*.py' \
-       | grep -vqx "$f"; then
-    echo "PARITY FAIL: untracked module '$f' is imported by tracked code (New-Module Deploy-Safety SOP)."
+  base=$(basename "$f" .py)
+  [ "$base" = "__init__" ] && continue
+  # Module's dotted path, e.g. src/gabagent/x.py -> gabagent.x ; installkit/y.py -> installkit.y
+  dotted=$(printf '%s' "$f" | sed -E 's#^src/##; s#\.py$##; s#/#.#g')
+  parent=${dotted%.*}; leaf=${dotted##*.}
+  # FIRE if tracked code references the dotted path ('import pkg.mod' / 'from pkg.mod import ...') OR
+  # the from-parent form ('from pkg import mod'). git grep searches TRACKED files only, so the untracked
+  # module can't match itself. Aliased/dynamic imports stay regex-uncatchable — the canary is the backstop.
+  if git grep -lFe "$dotted" -- '*.py' 2>/dev/null | grep -q . \
+     || git grep -lE "from +${parent//./\\.} +import +([A-Za-z0-9_, ]*[, ])?${leaf}\b" -- '*.py' 2>/dev/null | grep -q .; then
+    echo "PARITY FAIL: untracked module '$f' (module '$dotted') is imported by tracked code (New-Module Deploy-Safety SOP)."
     echo "  git-track it in the same commit, or fail-soft guard the import+construction."
     fail=1
   fi
