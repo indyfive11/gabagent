@@ -74,7 +74,7 @@ confirmation, and it stays honest about what it can and can't do.
 **Companion project:** the reference voice front-end (microphone, wake word,
 STT/TTS) is [voice-agent](https://github.com/indyfive11/voice-agent). The two are
 **loosely coupled** — they only share a small brain-agnostic HTTP+SSE protocol
-([docs/VOICE_PROTOCOL.md](docs/VOICE_PROTOCOL.md)), so any compatible front-end can
+([Voice Brain Protocol](https://github.com/indyfive11/voice-agent/blob/main/docs/VOICE_PROTOCOL.md)), so any compatible front-end can
 drive gabagent, and gabagent can be swapped for any brain that speaks the protocol.
 
 ## License
