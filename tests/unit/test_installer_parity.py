@@ -64,25 +64,59 @@ def _expected_pkgbuild_names() -> set[str]:
     return expected
 
 
-def _pkgbuild_provided_names() -> set[str]:
-    """Parse the AUR PKGBUILD `depends=(...)` and `optdepends=(...)` arrays into a normalised name set.
-    optdepends entries are 'pkgname: description' — take the token before the colon."""
-    text = AUR_PKGBUILD.read_text()
+def _provided_names_from_text(text: str) -> set[str]:
+    """Parse a PKGBUILD's `depends=(...)` and `optdepends=(...)` arrays into a normalised name set.
+    optdepends entries are 'pkgname: description' — take the token before the colon.
+
+    A parser that can't parse must FAIL, not guess (ledger-171 class; cross-flagged by VAC): a malformed
+    array — an opener with no closing ')', so the non-greedy capture over-runs across newlines into a LATER
+    array — must raise, never silently over-capture and pass on the inflated blob."""
     names: set[str] = set()
     for field in ("depends", "optdepends"):
+        if not re.search(rf"^{field}=\(", text, re.MULTILINE):
+            continue  # field genuinely absent (optdepends is optional) — fine
         # Close on a ')' at the START of a line — an optdepends description may itself contain ')'
         # (e.g. 'python-anthropic: Claude/Anthropic backend (/backend claude)'), which a naive
         # non-greedy '.*?)' would stop at, silently truncating the array.
         m = re.search(rf"^{field}=\((.*?)^\)", text, re.DOTALL | re.MULTILINE)
         if not m:
-            continue
-        for raw in re.findall(r"""['"]([^'"]+)['"]""", m.group(1)):
+            raise ValueError(f"PKGBUILD {field}=() array has no closing ')': refusing to guess — fix the PKGBUILD.")
+        body = m.group(1)
+        # A well-formed array body never contains another `word=(` opener. If it does, this array's ')'
+        # was missing and the capture ran into a later array — malformed, fail loud.
+        if re.search(r"^\w+=\(", body, re.MULTILINE):
+            raise ValueError(
+                f"PKGBUILD {field}=() over-captured into a later array (missing ')'): refusing to guess — "
+                "fix the PKGBUILD."
+            )
+        for raw in re.findall(r"""['"]([^'"]+)['"]""", body):
             token = raw.split(":", 1)[0].strip()
             # strip any version constraint on a depends entry (e.g. 'python>=3.12')
             token = re.split(r"[<>=]", token, maxsplit=1)[0]
             if token:
                 names.add(_norm(token))
     return names
+
+
+def _pkgbuild_provided_names() -> set[str]:
+    """Gate-1 helper: the normalised name set the AUR PKGBUILD provides (depends ∪ optdepends)."""
+    return _provided_names_from_text(AUR_PKGBUILD.read_text())
+
+
+def test_pkgbuild_parser_fails_loud_on_malformed():
+    """Gate-1 parser robustness — a parser that can't parse must FAIL, not guess (ledger-171 class; VAC
+    cross-flag). A depends array missing its closing ')' must raise, not silently over-capture the following
+    optdepends array (which would inflate the provided set and pass a malformed PKGBUILD)."""
+    well_formed = "depends=(\n  'python'\n)\noptdepends=(\n  'python-x: y'\n)\n"
+    assert _provided_names_from_text(well_formed) == {"python", "python-x"}
+
+    missing_close_runs_into_next = "depends=(\n  'python'\noptdepends=(\n  'python-x: y'\n)\n"
+    with pytest.raises(ValueError):
+        _provided_names_from_text(missing_close_runs_into_next)
+
+    last_array_unclosed = "depends=(\n  'python'\n)\noptdepends=(\n  'python-x: y'\n"
+    with pytest.raises(ValueError):
+        _provided_names_from_text(last_array_unclosed)
 
 
 @pytest.mark.skipif(
