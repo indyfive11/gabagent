@@ -13,7 +13,7 @@ gated on explicit approval.
 | 2 — plugin-installer contract + reference plugin | **built** | `src/gabagent/install/{contract,aggregate,registry}.py` |
 | 3a — audio/GPU detect-and-write, mDNS discovery | **built** (voice-agent) | its `voice_agent_install/{audio_detect,discovery}.py` |
 | 3b — satellite role provisioner (`.env` composition) | **built, not yet reachable** | see the divergence ledger below |
-| 3c — credential claim handshake | not started | — |
+| 3c — credential claim handshake | **built + live-verified** | operator-authorized `POST /pair` token handout + config-precedence fix (2026-07-28); see D5 |
 | 4–5 — addon installers, orchestrator + release | not started | — |
 
 **Read the divergence ledger at the end before trusting any section below it.** Three things this document
@@ -374,14 +374,21 @@ lands, it does not narrow what an *existing* install may be. *Corollary for any 
 execs a module with no `__main__` exits 0 having done nothing — success and silent no-op are indistinguishable
 by exit status, so an install must assert its **artifacts**, never `$?`.
 
-**D5 — The self-provisioning headline is now partly reachable (§0, §6) — updated 2026-07-27.** The
-voice-host role now exists (Layer-C seam `aea1306` + Layer-B caller) and enables mDNS discovery, so a
-satellite can *find* the brain automatically — the discovery half of the story is delivered. **Still
-unbuilt: the credential half** — the 3c claim handshake / richer service-map emission that would let the
-satellite auto-fetch its token. Until that lands, a satellite install still hand-prompts credentials a human
-must first fetch off the brain box. **Justified as sequencing, and now written down** — the discovery half
-shipped ahead of the credential half rather than the plan implying an end-to-end story the roles couldn't
-deliver.
+**D5 — The self-provisioning headline is now reachable end-to-end (§0, §6) — updated 2026-07-28.** The
+voice-host role (Layer-C seam `aea1306` + Layer-B caller) enables mDNS discovery, so a satellite can *find*
+the brain automatically — the discovery half. **The credential half (3c) is now built + live-verified too:**
+an operator-authorized `POST /pair` handshake hands the brain's bearer token to a fresh front end over the
+wire (`gab --pair-voice-agent` operator console + client provisioning), and the config-precedence fix
+(2026-07-28, gabagent `fdada76`) makes an env-supplied token effective so a LAN brain actually enforces auth.
+Validated end-to-end on real hardware (satellite → brain → token → authenticated). The one remaining human
+step is by design — the trust anchor is an operator approving a specific device, not the network (see
+`docs/PAIRING.md`). **★ Maintainer-signed-off 2026-07-28** — a from-scratch run on the real Pi satellite
+completed the whole story (discover → clear token + fresh identity → `pair_for_token` → operator-approved
+`.108` → 200 → authenticated live front-end → live voice turn + music-on-command). Real from-scratch finding
+fixed en route: the Pi's tree predated 3c so `pairing.py` was absent — deployed additively (exactly what a
+fresh `bootstrap.sh` install carries). **Justified as sequencing, now delivered + signed off** — the discovery
+half shipped ahead of the credential half, and the credential half has since landed and been confirmed on
+hardware.
 
 ---
 
