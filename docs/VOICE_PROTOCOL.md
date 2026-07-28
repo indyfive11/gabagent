@@ -53,6 +53,34 @@ omitted. `type` is always present.
 | `voice_volume` | `op, value?` | Change the **assistant's own** TTS gain (not media volume). `op` ∈ `up`\|`down`\|`set`; on `set`, `value` is an absolute level `0..1` (1.0 = full, 0.0 = silent). |
 | `done`    | — | Terminal: the turn (or confirm continuation) is complete. |
 
+## Stream properties (audio duck-exclude)
+
+The one property the protocol reserves — stamped on the front-end's **own TTS output** sink-input
+(PipeWire/PulseAudio):
+
+| Property | Value | Stamped by | Read by |
+|----------|-------|------------|---------|
+| `voicebrain.duck_exclude` | `"1"` | the front-end, on its TTS output stream | the brain's local-audio logic |
+
+- **Why.** The brain's local duck and its local-audio media-detection both scan sink-inputs. Without a marker
+  they would mute Aria's own voice (a self-duck) and count her TTS as "media playing." This property tells the
+  brain "this stream is the assistant — never duck it, never treat it as media."
+- **Transport.** Stamp it on **both** the native (PipeWire `PIPEWIRE_PROPS`) and libpulse (`PULSE_PROP`) paths
+  — a one-path stamp has regressed before. The brain matches the rendered `voicebrain.duck_exclude = "1"` as a
+  case-insensitive literal substring of the sink-input properties (the value is part of the match).
+- **Legacy alias (migration).** During de-branding the brain ALSO matches the legacy `gabagent.duck_exclude`.
+  A front-end may dual-stamp both through the transition and drop the legacy key once every brain it talks to
+  matches the neutral one; a mismatched ordering is cushioned by a node-name safety net, but do not rely on it.
+  New integrations stamp `voicebrain.duck_exclude` only.
+
+## Health & versioning
+
+`GET /health` returns `{"status":"ok","mode":"voice"}` today. Two fields are **reserved** for a future,
+non-breaking capability handshake: `version` (a protocol version string) and `capabilities` (a list of optional
+features the brain supports). Clients MUST treat their **absence as the baseline** contract described here — a
+brain that omits them is a baseline brain. The handshake itself is unspecified for now; reserving the names
+keeps adding it later backward-compatible.
+
 ## Design principles
 
 - **Brain-agnostic / provider-neutral.** No provider names cross the boundary. `/media/state` is generic —

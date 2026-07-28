@@ -252,6 +252,19 @@ async def test_mpris_sources_detects_local_audio_excludes_tts_and_mopidy(monkeyp
     assert any(s.state == "playing" and s.audible for s in srcs)   # → media_state.playing = True → duck
 
 
+async def test_mpris_sources_excludes_tts_on_neutral_key(monkeypatch):
+    """De-branding #1: the media-detection consumer must exclude Aria's TTS on the NEUTRAL key too, so the
+    flag-day drop of the legacy key can't make her own voice register as playing media (a self-duck loop)."""
+    from gabagent.commands.providers.mpris import PROVIDER as mpris
+    listing = ('Sink Input #500\n\tCorked: no\n\tProperties:\n'
+               '\t\tvoicebrain.duck_exclude = "1"\n\t\tnode.name = "voicebrain-tts"\n')
+    async def _pactl(*a, **k):
+        return (0, listing)
+    monkeypatch.setattr("gabagent.voice.ducking._run_pactl", _pactl)
+    srcs = await mpris.sources(_ctx())
+    assert srcs == []                                      # neutral-keyed TTS excluded → no media source
+
+
 async def test_mpris_sources_empty_when_no_pactl(monkeypatch):
     from gabagent.commands.providers.mpris import PROVIDER as mpris
     async def _no_pactl(*a, **k):

@@ -1325,6 +1325,28 @@ async def test_universal_duck_excludes_stamped_property(monkeypatch):
     assert "local" not in out["ducked"] and sets == []          # stamped stream excluded → nothing ducked
 
 
+async def test_universal_duck_excludes_neutral_property(monkeypatch):
+    # De-branding #1 migration: the brain must exclude the TTS stream on the NEUTRAL key too (additive
+    # dual-read), so the flag-day drop of the legacy key can't unmute Aria's own voice.
+    listing = ('Sink Input #21\n\tVolume: front-left: 52000 / 55% / -5 dB\n'
+               '\tProperties:\n\t\tapplication.name = "SomeApp"\n'
+               '\t\tvoicebrain.duck_exclude = "1"\n')
+    sets = []
+    monkeypatch.setattr(_dk, "_run_pactl", _fake_pactl(listing, sets))
+    monkeypatch.setattr(_dk.shutil, "which", lambda _n: "x")
+    ctx = _ctx(tidal=False, jellyfin=False)
+    out = await duck_media(ctx, True, mute=True)
+    assert "local" not in out["ducked"] and sets == []
+
+
+def test_is_tts_exclude_block_matches_both_keys():
+    # Both consumers (ducking local-duck + mpris media-detection) route through this predicate.
+    assert _dk._is_tts_exclude_block('\t\tvoicebrain.duck_exclude = "1"\n')   # neutral (migration target)
+    assert _dk._is_tts_exclude_block('\t\tgabagent.duck_exclude = "1"\n')     # legacy (still stamped today)
+    assert _dk._is_tts_exclude_block('\t\tVOICEBRAIN.DUCK_EXCLUDE = "1"\n')   # case-insensitive
+    assert not _dk._is_tts_exclude_block('\t\tapplication.name = "Chromium"\n')
+
+
 async def test_universal_duck_skips_plain_vad_duck(monkeypatch):
     listing = ('Sink Input #30\n\tVolume: front-left: 52000 / 80% / -5 dB\n'
                '\tProperties:\n\t\tapplication.name = "Chromium"\n')

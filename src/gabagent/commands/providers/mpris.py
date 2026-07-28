@@ -30,7 +30,7 @@ class MprisProvider:
         movie was invisible to /media/state because only jellyfin/tidal contributed sources → playing=False
         → no duck). Excludes Aria's own TTS and the Mopidy stream (tidal already models that source)."""
         try:
-            from gabagent.voice.ducking import _run_pactl, _parse_sink_inputs, _TTS_EXCLUDE_PROP
+            from gabagent.voice.ducking import _run_pactl, _parse_sink_inputs, _is_tts_exclude_block
             from gabagent.commands.media import MediaSource
         except Exception:
             return []
@@ -40,7 +40,7 @@ class MprisProvider:
         srcs = []
         for si in _parse_sink_inputs(out):
             block = si.get("block", "")
-            if _TTS_EXCLUDE_PROP in block:                       # never count Aria's own voice as media
+            if _is_tts_exclude_block(block):                     # never count Aria's own voice as media
                 continue
             if 'application.name = "Mopidy"' in block or 'node.name = "Mopidy"' in block:
                 continue                                         # tidal already contributes this source

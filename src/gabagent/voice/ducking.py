@@ -30,7 +30,22 @@ _SINK_DUCK_PCT = 18         # percent to duck the Mopidy PipeWire sink-input to 
 # to the voice-gate's wake authority, which stays). Two streams are EXCLUDED: the assistant's own TTS output
 # (never mute Aria) and the owned Mopidy stream (ducked separately by _duck_tidal_sink, so it's not double-
 # managed). TTS is matched by a stable property VAC stamps on its output stream, with a node-name safety net.
-_TTS_EXCLUDE_PROP = 'gabagent.duck_exclude = "1"'   # VAC stamps this on the TTS sink-input
+# The front-end stamps its TTS output stream with a duck-exclude property so neither the local duck (here)
+# nor local-audio media-detection (mpris.py) treats Aria's own voice as duckable / as playing media. During
+# the protocol de-branding migration (#1) the brain matches EITHER the neutral, protocol-scoped
+# `voicebrain.duck_exclude` (the target name) OR the legacy `gabagent.duck_exclude` (still stamped today), so
+# no stamp/flag-day ordering can drop Aria's exclusion. Value is "1" (pactl renders `key = "1"`). BOTH brain
+# consumers match through `_is_tts_exclude_block` so they can never diverge on which keys count.
+_TTS_EXCLUDE_PROPS = ('voicebrain.duck_exclude = "1"', 'gabagent.duck_exclude = "1"')
+_TTS_EXCLUDE_PROPS_LC = tuple(p.lower() for p in _TTS_EXCLUDE_PROPS)
+
+
+def _is_tts_exclude_block(block: str) -> bool:
+    """True if a sink-input block carries the front-end's TTS duck-exclude property (neutral OR legacy key).
+    Case-insensitive — pactl's rendering is stable, and routing both brain consumers (local duck + mpris
+    media-detection) through this one predicate keeps them from ever disagreeing on which keys count."""
+    b = block.lower()
+    return any(p in b for p in _TTS_EXCLUDE_PROPS_LC)
 
 # After a new track starts, its PipeWire sink-input can appear a beat late; poll this many times (× delay)
 # for it before giving up, so apply_ambient_cap can un-strand it (F1). Tuned to ~1.6s worst case.
@@ -664,7 +679,7 @@ def _excluded_from_local_duck(block: str) -> bool:
     """A sink-input the universal local-duck must NOT touch: the assistant's own TTS output (never mute
     Aria) or the owned Mopidy stream (ducked separately, so it isn't double-managed)."""
     b = block.lower()
-    if _TTS_EXCLUDE_PROP.lower() in b:                     # the property VAC stamps on its TTS stream
+    if _is_tts_exclude_block(block):                       # the duck-exclude property the front-end stamps
         return True
     if "alsa_playback" in b or "voice-agent" in b:        # safety net for the TTS stream pre-stamp
         return True
