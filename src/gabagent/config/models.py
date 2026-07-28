@@ -306,6 +306,14 @@ class GabAgentConfig(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # An empty GABAI_* env var (exported but "") is treated as UNSET, for every field — so an
+        # accidentally-blank export can't override a configured file/default value. This closes two live
+        # footguns under the env-over-file precedence: a blank GABAI_VOICE_ADVERTISE= silently flipping
+        # discovery off, and a blank GABAI_VOICE_AUTH_TOKEN=/GABAI_API_KEY= silently disabling a configured
+        # secret. Side effect: a blank numeric env (e.g. GABAI_VOICE_PORT=) degrades to unset→default rather
+        # than a ValidationError. The only thing lost is "force a field to empty via env over a non-empty
+        # file value" — exotic and recoverable by editing the file. Applies to env AND dotenv sources.
+        env_ignore_empty=True,
     )
 
     # Active LLM backend: "gab" (OpenAI-compatible gab.ai) or "claude" (Anthropic). The

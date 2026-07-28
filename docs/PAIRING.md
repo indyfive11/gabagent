@@ -65,3 +65,15 @@ self-reported label** next to the **authoritative observed source IP** — and i
 the one the operator approves with a keystroke. A prerequisite: the brain must hold a bearer token; the
 voice-host installer (`gabagent-install --enable-voice-host`) mints one **before** the brain starts, so
 an unprovisioned brain answers `POST /pair` with `501` rather than handing out an empty secret.
+
+## Where the brain's bearer token comes from (config precedence)
+
+The token the brain enforces and hands out is `voice_auth_token`, resolved by the standard config
+precedence: **CLI/override > env (`GABAI_VOICE_AUTH_TOKEN`) > `settings.json` > default (empty)**. So a
+deployment MAY supply the token purely via the environment — e.g. a systemd `EnvironmentFile` — and the
+brain honors it; no copy needs to live in `settings.json`. A token present **only** in the env is
+deliberately **not** written back into `settings.json` on a later config save, so the plaintext file
+never accumulates a second copy of a secret the operator chose to keep in the environment. Either source
+satisfies the "brain must hold a bearer token" prerequisite above; with **no** effective token from any
+source, auth is off and `POST /pair` returns `501`. (An empty `GABAI_VOICE_AUTH_TOKEN=` is treated as
+*unset*, not as an empty token, so a stray blank export can't silently disable a configured secret.)
