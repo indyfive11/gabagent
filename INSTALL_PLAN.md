@@ -304,10 +304,13 @@ release cadence, the "installs separately but coordinated" rule, and the Debian 
   - **Validated on real hardware (2026-07-27):** the brain's `_voice-brain._tcp` advert was independently
     observed resolving to its LAN IP (non-loopback) via an off-box browse; the satellite attaches +
     authenticates to the brain (`/health` ok); and a live spoken-wake→brain-response→TTS cycle completed
-    (brain generated a reply, front-end spoke it). Scope note: the *running* satellite attaches to its
-    **stored** host — mDNS auto-discovery is an install-time convenience (advert + Layer-B browse verified,
-    ARM Pi deploy-test `PROVISION_EXIT 0`), not a per-boot event. The credential auto-fetch (3c) is the
-    remaining self-provisioning leg.
+    (brain generated a reply, front-end spoke it). Scope note (mDNS lifecycle): discovery runs at
+    install time **and** as a **boot self-heal** — `decide_host()` keeps the stored host when reachable
+    (`written-reachable`), and only when it's unreachable does the satellite re-resolve via `mdns_discover`
+    and adopt a routable result (`rediscovered`), never overwriting a good pin with loopback/nothing. Verified
+    from voice-agent source + live: `mdns_discover` → `source=mdns`, and a stale pin was corrected to the live
+    brain on boot; the steady-state connection uses the stored host (so a healthy runtime log shows no browse).
+    ARM Pi deploy-test `PROVISION_EXIT 0`. The credential auto-fetch (3c) is the remaining self-provisioning leg.
   - **Corollary carried from the mDNS close-out (now honored by the shipped build):** a fail-soft `except`
     around discovery converts a hard failure into a silent absence, so any discovery path owes an
     **out-of-process, off-box effect check** and must not fold an installed-but-broken zeroconf into "no
