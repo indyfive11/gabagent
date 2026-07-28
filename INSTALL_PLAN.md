@@ -249,8 +249,9 @@ release cadence, the "installs separately but coordinated" rule, and the Debian 
   *new* public pin + SHA-match CI. installkit is public and FF-only, so the pin-publish + CI wiring
   **cannot ship while the push freeze is on** — the vendored copy records `78ff1cd` as
   *provisional-until-pushed*; finalizing is gated on the maintainer lifting the freeze. Each commit/push its own go.
-- **(d) Firewall / discovery reachability check — DESIGN RATIFIED 2026-07-21 (GA↔VAC consensus), authoring
-  gated.** A brain host with a default-drop input policy silently drops inbound mDNS (5353/udp). Because mDNS
+- **(d) Firewall / discovery reachability check — DESIGN RATIFIED 2026-07-21 (GA↔VAC consensus); Layer-B
+  BUILT + public (voice-agent `7217ad5`), Layer-C authoring gated.** A brain host with a default-drop input
+  policy silently drops inbound mDNS (5353/udp). Because mDNS
   is query/response, discovery then returns nothing and the symptom is **indistinguishable from a broken
   advertiser** — the failure looks like the wrong layer. Measured on a live default-drop host: firewall
   closed → `12.2s → None`; the same host with `224.0.0.251:5353/udp` allowed → `0.27s → BrainEndpoint`. This
@@ -273,18 +274,30 @@ release cadence, the "installs separately but coordinated" rule, and the Debian 
     introspectable, fail-open); (3) **non-fatal** — a filtered/absent responder does not abort the install;
     the satellite falls back to the typed `host + port` path (§10c pairing floor) and prints the gap.
     Auto-discovery is a **parallel enhancement (CR-4)**, never a hard dependency.
-  - **Reason vocabulary the browse reports** (drives the operator remedy text): `no-adverts` (nothing seen —
-    likely filtered or advertiser off), `filtered=N` (adverts seen for other services but not the brain),
-    `unconfirmed` (advert seen but the resolved endpoint didn't answer a probe), `loopback-advert` (advert
-    resolves to a loopback address — misconfigured bind).
-  - **Build state (measured, do not read the design above as shipped):** the browse *primitive* exists and is
-    tested (`voice_agent_install/discovery.py`) but is **UNWIRED** — `discover_brain`/`default_providers`
-    have **no production caller** outside the boot re-resolve path; the reason-vocabulary reporting and the
-    operator remedy rendering are **unbuilt**. This section specifies work to do, not work done.
-  - **Corollary carried from the mDNS close-out:** a fail-soft `except` around discovery converts a hard
-    failure into a silent absence — so any discovery path owes an **out-of-process, off-box effect check**;
-    `discovery.py`'s bare `except Exception` (not `except ImportError`) means an *installed-but-broken*
-    zeroconf renders identically to "no adverts," which this check must not mask.
+  - **Reason vocabulary the browse reports** (drives the operator remedy text; the shipped set, 7 reasons):
+    `no-adverts` (total silence, including a broad `_services._dns-sd._udp.local.` meta-browse — multicast
+    likely blocked at the box), `filtered=N` (other service types seen but not the brain — multicast reaches
+    the box, so the gap is at the brain), `unconfirmed` (advert seen but the resolved endpoint didn't answer
+    a probe), `loopback-advert` (advert resolves to a loopback address — misconfigured bind), `room-filtered`
+    (a brain advert seen but for a different room — mDNS works, explicitly **not** a firewall remedy),
+    `no-mdns` (zeroconf absent — an optional path, not a fault), `zeroconf-error` (an installed zeroconf
+    raised during the browse — never masked as `no-adverts`, per the corollary below). The broad meta-browse
+    is the firewall discriminator: other services visible ⇒ multicast reaches the box; total silence ⇒ it
+    likely doesn't.
+  - **Build state (measured 2026-07-27) — Layer-B BUILT + public, Layer-C remains:** voice-agent `7217ad5`
+    wired the browse primitive into the satellite-install path — `discovery.py`'s `diagnose_brain_discovery()`
+    / `DiscoveryDiagnosis` are called from `satellite.py` `gather()` via a `report` callback into
+    `default_providers`, emitting the reason vocabulary + rendered firewall-aware remedy **before** the seam
+    falls through to the manual `host + port` floor (so the operator learns *why* they're typing a host).
+    726 green (+12 §10d tests covering every reason incl. the broken-zeroconf corollary and the non-fatal
+    fall-through), live-verified on real hardware. **Still unbuilt = Layer C:** the voice-host role that
+    writes `voice_advertise: true` (§6 role 2) — the one knob the remedy text points operators at.
+  - **Corollary carried from the mDNS close-out (now honored by the shipped build):** a fail-soft `except`
+    around discovery converts a hard failure into a silent absence, so any discovery path owes an
+    **out-of-process, off-box effect check** and must not fold an installed-but-broken zeroconf into "no
+    adverts." The shipped `_brain_browse` probes the import explicitly — `ImportError` ⇒ `no-mdns` (an
+    optional path, not a fault), an installed stack that raises ⇒ `zeroconf-error` — so the two are
+    distinguished, not masked.
 - **Current directive:** Phases 1–3b are built; every further build, commit, push, and pin move is
   individually gated.
 
