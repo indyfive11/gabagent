@@ -166,14 +166,17 @@ intentional, not a gap.
 
 ## 6. Role matrix (the installer's first question)
 1. **Workstation** — CLI/TUI, text-only, pick AI backend(s). No voice. ← MVP target.
-2. **Full voice host** — brain + full voice co-located + optional media/desktop addons. **Must WRITE
-   `voice_advertise: true`** when it provisions a LAN-bound brain: the code default is `false` (unset = the
-   historical no-op, nothing broadcast), so mDNS discovery is an install-time opt-in the detect-and-write step
-   owns — per the hardware/config-generalization SOP. **Layer split:** the role is provisioned by Layer B, but
-   `voice_advertise` is a gabagent pydantic `settings.json` field, so per §2's "each repo writes its own
-   config" the WRITE is **Layer C's** — Layer B invokes the Layer-C step, never edits `settings.json` itself
-   (it cannot `from gabagent…`). Conditional on the gabagent brain: a `BRAIN=local/ollama` voice host has no
-   gabagent config and nothing to write.
+2. **Full voice host** — brain + full voice co-located + optional media/desktop addons. **BUILT (gabagent
+   `aea1306` + voice-agent caller).** **Writes `voice_advertise: true`** when it provisions a LAN-bound brain:
+   the code default is `false` (unset = the historical no-op, nothing broadcast), so mDNS discovery is an
+   install-time opt-in the detect-and-write step owns — per the hardware/config-generalization SOP. **Per the
+   ratified graft** the same step co-writes a non-loopback `voice_host` (the flag is inert on a loopback bind)
+   and refuses on a loopback/wildcard host, so the knob can never advertise nothing. **Layer split:** the role
+   is provisioned by Layer B, but `voice_advertise`/`voice_host` are gabagent pydantic `settings.json` fields,
+   so per §2's "each repo writes its own config" the WRITE is **Layer C's** — Layer B invokes the Layer-C step
+   (`gabagent-install --enable-voice-host --host <ip> [--room-id]`) across the venv boundary, never edits
+   `settings.json` itself (it cannot `from gabagent…`). Conditional on the gabagent brain: a `BRAIN=local/ollama`
+   voice host has no gabagent config and nothing to write.
 3. **Satellite** — voice + local STT/TTS, attaches to a remote LAN brain (token-paired), no desktop. (Debian/apt.)
 4. **Laptop** — Gab-Agent + optional voice; own brain or thin client.
 
@@ -249,8 +252,8 @@ release cadence, the "installs separately but coordinated" rule, and the Debian 
   *new* public pin + SHA-match CI. installkit is public and FF-only, so the pin-publish + CI wiring
   **cannot ship while the push freeze is on** — the vendored copy records `78ff1cd` as
   *provisional-until-pushed*; finalizing is gated on the maintainer lifting the freeze. Each commit/push its own go.
-- **(d) Firewall / discovery reachability check — DESIGN RATIFIED 2026-07-21 (GA↔VAC consensus); Layer-B
-  BUILT + public (voice-agent `7217ad5`), Layer-C authoring gated.** A brain host with a default-drop input
+- **(d) Firewall / discovery reachability check — DESIGN RATIFIED 2026-07-21 (GA↔VAC consensus); FULLY
+  BUILT + public — Layer-B (voice-agent `7217ad5`) + Layer-C voice-host role (gabagent `aea1306`).** A brain host with a default-drop input
   policy silently drops inbound mDNS (5353/udp). Because mDNS
   is query/response, discovery then returns nothing and the symptom is **indistinguishable from a broken
   advertiser** — the failure looks like the wrong layer. Measured on a live default-drop host: firewall
@@ -266,8 +269,9 @@ release cadence, the "installs separately but coordinated" rule, and the Debian 
     host + port are known.
   - **Layer split (ratified, no new shared surface):** **Layer B (voice-agent)** owns the browse, the reason
     vocabulary, and the rendered operator remedy · **Layer A (installkit)** gets **nothing new** · **Layer C
-    (gabagent)** does one thing: the voice-host role enables the advertiser (`voice_advertise: true`, per §6
-    role 2). That is its entire involvement here.
+    (gabagent)** owns the voice-host role: it enables the advertiser (`voice_advertise: true`, per §6 role 2)
+    and — per the ratified graft — co-writes a non-loopback `voice_host` so the flag is never inert, refusing
+    on a loopback/wildcard bind. That is its entire involvement here.
   - **Rules the check obeys:** (1) **detect-and-report, never mutate** — the installer prints the gap and the
     remedy, it never edits a host firewall; (2) **effect-check, not rule-parse** — verify by attempting the
     browse and observing the result, never by parsing nftables/iptables/firewalld rules (not portably
@@ -284,14 +288,26 @@ release cadence, the "installs separately but coordinated" rule, and the Debian 
     raised during the browse — never masked as `no-adverts`, per the corollary below). The broad meta-browse
     is the firewall discriminator: other services visible ⇒ multicast reaches the box; total silence ⇒ it
     likely doesn't.
-  - **Build state (measured 2026-07-27) — Layer-B BUILT + public, Layer-C remains:** voice-agent `7217ad5`
+  - **Build state (measured 2026-07-27) — FULLY BUILT + public, both layers:** voice-agent `7217ad5`
     wired the browse primitive into the satellite-install path — `discovery.py`'s `diagnose_brain_discovery()`
     / `DiscoveryDiagnosis` are called from `satellite.py` `gather()` via a `report` callback into
     `default_providers`, emitting the reason vocabulary + rendered firewall-aware remedy **before** the seam
     falls through to the manual `host + port` floor (so the operator learns *why* they're typing a host).
     726 green (+12 §10d tests covering every reason incl. the broken-zeroconf corollary and the non-fatal
-    fall-through), live-verified on real hardware. **Still unbuilt = Layer C:** the voice-host role that
-    writes `voice_advertise: true` (§6 role 2) — the one knob the remedy text points operators at.
+    fall-through), live-verified on real hardware. **Layer C shipped (gabagent `aea1306`):** the voice-host
+    role writes `voice_advertise: true` (§6 role 2) — the one knob the remedy text points operators at — via
+    the `gabagent-install --enable-voice-host --host <ip> [--room-id]` console seam that Layer B invokes
+    across the venv boundary (never `import gabagent`). Per the ratified graft it also co-writes a
+    non-loopback `voice_host` and refuses on a loopback/wildcard bind (so the flag can never be inert), with
+    a fork-(a) no-clobber rule that keeps an operator's explicit bind over a diverging `--host`. 18 Layer-C
+    tests; cross-reviewed both ways (the review caught a silent bind-clobber bug pre-commit).
+  - **Validated on real hardware (2026-07-27):** the brain's `_voice-brain._tcp` advert was independently
+    observed resolving to its LAN IP (non-loopback) via an off-box browse; the satellite attaches +
+    authenticates to the brain (`/health` ok); and a live spoken-wake→brain-response→TTS cycle completed
+    (brain generated a reply, front-end spoke it). Scope note: the *running* satellite attaches to its
+    **stored** host — mDNS auto-discovery is an install-time convenience (advert + Layer-B browse verified,
+    ARM Pi deploy-test `PROVISION_EXIT 0`), not a per-boot event. The credential auto-fetch (3c) is the
+    remaining self-provisioning leg.
   - **Corollary carried from the mDNS close-out (now honored by the shipped build):** a fail-soft `except`
     around discovery converts a hard failure into a silent absence, so any discovery path owes an
     **out-of-process, off-box effect check** and must not fold an installed-but-broken zeroconf into "no
@@ -355,11 +371,14 @@ lands, it does not narrow what an *existing* install may be. *Corollary for any 
 execs a module with no `__main__` exits 0 having done nothing — success and silent no-op are indistinguishable
 by exit status, so an install must assert its **artifacts**, never `$?`.
 
-**D5 — The self-provisioning headline is not reachable from the satellite role alone (§0, §6).** The satellite
-role is the only validated profile that exists; the voice-host role that would emit the service map is
-unbuilt. Until it (or the 3c claim handshake) lands, a satellite install hand-prompts credentials that a
-human must first fetch off the brain box. **Justified as sequencing, but it was never written down** — the
-plan implied an end-to-end story the built roles cannot deliver.
+**D5 — The self-provisioning headline is now partly reachable (§0, §6) — updated 2026-07-27.** The
+voice-host role now exists (Layer-C seam `aea1306` + Layer-B caller) and enables mDNS discovery, so a
+satellite can *find* the brain automatically — the discovery half of the story is delivered. **Still
+unbuilt: the credential half** — the 3c claim handshake / richer service-map emission that would let the
+satellite auto-fetch its token. Until that lands, a satellite install still hand-prompts credentials a human
+must first fetch off the brain box. **Justified as sequencing, and now written down** — the discovery half
+shipped ahead of the credential half rather than the plan implying an end-to-end story the roles couldn't
+deliver.
 
 ---
 
