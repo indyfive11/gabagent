@@ -159,6 +159,18 @@ async def _backend(arg: str, ctx: AgentContext) -> None:
         )
         return
 
+    # 'anthropic' is an optional package (absent on a default AUR install). Refuse the switch with an
+    # install hint BEFORE mutating provider, so a missing package can't leave provider half-switched.
+    if target == "claude":
+        from gabagent.api.factory import anthropic_available
+        if not anthropic_available():
+            console.print(
+                "[warning]The Claude backend needs the 'anthropic' package, which isn't installed. "
+                "Install it:  pacman -S python-anthropic   (or:  pip install anthropic)[/warning]",
+                markup=True,
+            )
+            return
+
     ctx.config.provider = target
     if target == "claude":
         ctx.config.model = ctx.config.claude.ladder[0].model

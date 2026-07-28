@@ -35,6 +35,32 @@ class LLMClient(Protocol):
     ) -> str: ...
 
 
+def anthropic_available() -> bool:
+    """Whether the optional 'anthropic' package is importable.
+
+    It is a PKGBUILD optdepend (absent on a default AUR install), so a Claude client can only be built
+    when it is present. Callers gate on this so the escalation ladder never selects a claude rung it
+    cannot construct, and an explicit switch fails soft with an install hint instead of a raw traceback.
+    """
+    import importlib.util
+
+    return importlib.util.find_spec("anthropic") is not None
+
+
+def _load_claudette():
+    """Import ClaudetteClient, or raise a friendly, actionable error when 'anthropic' isn't installed."""
+    try:
+        from .claudette import ClaudetteClient
+    except ModuleNotFoundError as e:
+        if e.name != "anthropic":
+            raise
+        raise RuntimeError(
+            "The Claude backend needs the 'anthropic' package, which isn't installed. "
+            "Install it:  pacman -S python-anthropic   (or:  pip install anthropic)"
+        ) from e
+    return ClaudetteClient
+
+
 def build_client(
     cfg: GabAgentConfig,
     rate_limiter: UsageTracker,
@@ -48,7 +74,7 @@ def build_client(
     this factory is only for the primary, provider-selectable brain.
     """
     if cfg.provider == "claude":
-        from .claudette import ClaudetteClient
+        ClaudetteClient = _load_claudette()
         rung0 = cfg.claude.ladder[0]
         return ClaudetteClient(
             api_key=api_key or cfg.claude.api_key,
@@ -69,9 +95,26 @@ def build_client(
 
 
 def anthropic_configured(cfg: GabAgentConfig) -> bool:
-    """True when a Claude client can be built (so the ladder may include the real Anthropic rungs)."""
+    """True when a Claude client can actually be built — an API key AND the 'anthropic' package present.
+
+    Importability must be checked, not just the key: 'anthropic' is a PKGBUILD optdepend absent on a
+    default AUR install, so a key-only check would let the escalation ladder select a claude rung it
+    can't construct (raw ModuleNotFoundError). With this gate the ladder cleanly omits claude instead.
+    """
     import os
-    return bool(cfg.claude.api_key or os.environ.get("ANTHROPIC_API_KEY"))
+    has_key = bool(cfg.claude.api_key or os.environ.get("ANTHROPIC_API_KEY"))
+    return has_key and anthropic_available()
+
+
+def degrade_provider_if_unavailable(cfg: GabAgentConfig) -> bool:
+    """Fail-soft: if provider is 'claude' but the 'anthropic' package is absent, fall back to 'gab' in the
+    runtime cfg and return True (the caller warns). Keeps a claude-configured install usable on a box
+    without the optional package instead of crashing at build_client. Returns False when no change is made.
+    """
+    if cfg.provider == "claude" and not anthropic_available():
+        cfg.provider = "gab"
+        return True
+    return False
 
 
 def build_client_for(
@@ -90,7 +133,7 @@ def build_client_for(
     if backend == "claude":
         if not anthropic_configured(cfg):
             return None
-        from .claudette import ClaudetteClient
+        ClaudetteClient = _load_claudette()
         rung0 = cfg.claude.ladder[0]
         return ClaudetteClient(
             api_key=cfg.claude.api_key or None,   # None → SDK reads ANTHROPIC_API_KEY

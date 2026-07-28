@@ -17,8 +17,15 @@ on:
       - 'src/gabagent/config/**'
       - 'src/gabagent/install/**'
       - 'src/gabagent/commands/providers/**'
+      - 'src/gabagent/api/factory.py'
+      - 'src/gabagent/api/claudette.py'
+      - 'src/gabagent/cli.py'
+      - 'src/gabagent/slash/commands.py'
+      - 'src/gabagent/commands/browser.py'
       - 'tests/unit/test_installer_parity.py'
+      - 'tests/unit/test_firstrun_failsoft.py'
       - 'scripts/installer-parity.sh'
+      - 'scripts/firstrun_smoke.sh'
       - '.github/workflows/installer-parity.yml'
 
 jobs:
@@ -32,7 +39,9 @@ jobs:
         uses: astral-sh/setup-uv@v5
       - name: Sync (dev group)
         run: uv sync --extra dev --inexact   # --inexact: never prune ad-hoc extras (SOP)
-      - name: Parity gates (pytest 1/1b/2)
-        run: uv run pytest tests/unit/test_installer_parity.py -q
+      - name: Parity gates (pytest 1/1b/2) + first-run fail-soft (Gate 4)
+        run: uv run pytest tests/unit/test_installer_parity.py tests/unit/test_firstrun_failsoft.py -q
       - name: Delta pre-filter (Gate 3)
         run: bash scripts/installer-parity.sh
+      - name: First-run fail-soft smoke (Gate 4, real absent package)
+        run: bash scripts/firstrun_smoke.sh

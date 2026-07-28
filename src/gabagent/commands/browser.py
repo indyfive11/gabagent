@@ -39,7 +39,15 @@ async def ensure_browser(ctx: AgentContext, profile: str = "default"):
             return existing
         await close_browser(ctx)   # dead — stop its playwright + clear refs before relaunching
 
-    from playwright.async_api import async_playwright
+    try:
+        from playwright.async_api import async_playwright
+    except ModuleNotFoundError as e:
+        if e.name != "playwright":
+            raise
+        raise RuntimeError(
+            "The browser command needs the 'playwright' package, which isn't installed. "
+            "Install it:  pacman -S python-playwright   (or:  pip install playwright)"
+        ) from e
 
     pw = await async_playwright().start()
     profile_dir = config_dir() / "browser" / profile

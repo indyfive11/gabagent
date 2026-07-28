@@ -59,6 +59,17 @@ def _build_context(
 
     cfg = load_config(overrides)
 
+    # Fail-soft: a saved provider=claude on a box without the optional 'anthropic' package (e.g. a fresh
+    # AUR install where it's an optdepend) would crash at build_client. Degrade to gab with a warning so
+    # the app stays usable — an explicit `/backend claude` still refuses with an install hint.
+    from gabagent.api.factory import degrade_provider_if_unavailable
+    if degrade_provider_if_unavailable(cfg):
+        typer.echo(
+            "warning: provider is 'claude' but the 'anthropic' package isn't installed "
+            "(pacman -S python-anthropic / pip install anthropic) — using the gab backend.",
+            err=True,
+        )
+
     # Provider-aware tier seeding: when on Claude, the bottom ladder rung is the base model and the
     # display badge's "simple" tier (mutating the runtime cfg is the existing pattern, cf. sub_agent).
     if cfg.provider == "claude" and not model:

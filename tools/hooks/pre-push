@@ -7,5 +7,6 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 bash scripts/installer-parity.sh
 if [ -x .venv/bin/python ]; then
-  .venv/bin/python -m pytest tests/unit/test_installer_parity.py -q
+  # fast fail-soft gate (Gate 4); the heavier real-absent-package smoke runs in CI + `make installer-parity`
+  .venv/bin/python -m pytest tests/unit/test_installer_parity.py tests/unit/test_firstrun_failsoft.py -q
 fi

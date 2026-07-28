@@ -55,9 +55,10 @@ vendor-check:  ## Fail if vendored installkit/ diverges from installkit@$(INSTAL
 	[ $$rc -eq 0 ] || echo "vendor-check FAILED — run 'make vendor-sync' or reconcile the pin."; \
 	exit $$rc
 
-installer-parity:  ## Installer Parity gates (SOP in CLAUDE.md): parity pytests (1/1b/2) + delta pre-filter (3)
-	@python -m pytest tests/unit/test_installer_parity.py -q
+installer-parity:  ## Installer Parity gates (SOP in CLAUDE.md): parity pytests (1/1b/2/4) + delta pre-filter (3) + first-run smoke (4)
+	@python -m pytest tests/unit/test_installer_parity.py tests/unit/test_firstrun_failsoft.py -q
 	@bash scripts/installer-parity.sh
+	@bash scripts/firstrun_smoke.sh
 
 install-hooks:  ## Install the repo pre-push hook (chained by the global identity guard; core.hooksPath is global)
 	@git_dir="$$(git rev-parse --absolute-git-dir)"; \

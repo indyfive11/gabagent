@@ -140,10 +140,19 @@ installkit capability bump → re-vendor at the pin.
    - *Gate 2* — plugin-registry conformance: every `registry.INSTALLERS` entry satisfies the contract + its
      declared `system_pkgs` resolve per-distro. (Conformance/typo check only — NOT proof the plugin is
      satisfied; reachability is the install-smoke's job.)
-2. **`scripts/installer-parity.sh`** (Gate 3, `make installer-parity` + the `make install-hooks` pre-push
+2. **First-run fail-soft (Gate 4)** — the BEHAVIOR the packaging superset (Gate 1) is blind to. Gate 1 proves
+   an optdepend is *declared*; it can't prove a code path that needs an **optional** package degrades when
+   it's absent. `anthropic`/`playwright` are pyproject *core* deps demoted to PKGBUILD *optdepends* (pacman
+   doesn't auto-install optdepends), so a default install runs without them — an unconditional import
+   raw-crashes (the voice-agent dotenv class). Two parts: **`tests/unit/test_firstrun_failsoft.py`** (fast,
+   in-suite: importability-aware `anthropic_configured`, ladder-omit, startup degrade) + **`scripts/firstrun_smoke.sh`**
+   (authoritative: clean venv with core deps MINUS the optdepend-gated list, asserts every gated seam fails
+   soft against a REALLY absent package — an in-tree test can't uninstall a dep it runs under). Keep the
+   `OPTDEP_GATED` list explicit: a new optional backend must be added there **and** given a fail-soft guard.
+3. **`scripts/installer-parity.sh`** (Gate 3, `make installer-parity` + the `make install-hooks` pre-push
    hook): delta pre-filter with a **canary** (a knob scan that matches nothing is a false green → fail),
    `git merge-base origin/master HEAD` delta base, and a **blocking** untracked-importer check.
-3. **Reachability backstop:** in-tree gates prove the artifact was *edited*, not that a fresh install
+4. **Reachability backstop:** in-tree gates prove the artifact was *edited*, not that a fresh install
    *reaches* the feature ("off-box = reachability"). The scripted Headline-PoC install is the standing
    backstop; a new user-facing surface owes a line in it.
 
