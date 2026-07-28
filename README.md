@@ -28,6 +28,9 @@ For JS-rendered page fetching (optional):
 playwright install chromium
 ```
 
+**From source?** `./bootstrap.sh` runs a guided installer (sets up the environment with `uv`, then a
+setup wizard). See the [install & configuration guide](docs/INSTALL.md).
+
 ## Setup
 
 ```bash
@@ -35,7 +38,11 @@ export GABAI_API_KEY=your_key_here
 gab
 ```
 
-Or add `api_key` to `~/.config/gabagent/settings.json`.
+On first run (with no backend configured) `gab` walks you through picking a backend — Gab AI (default),
+Claude, or a local Ollama model — and saves it. Or add `api_key` to `~/.config/gabagent/settings.json`.
+
+Settings resolve **CLI flag > environment (`GABAI_*`) > `settings.json` > default**, so an env var
+overrides the file. Full config reference (fields, precedence, env vars): [docs/INSTALL.md](docs/INSTALL.md#configuration).
 
 ## Usage
 
@@ -55,6 +62,10 @@ gabagent serves the conversation and the actions over a small local HTTP+SSE pro
 ```bash
 gab --voice-serve            # start the brain on 127.0.0.1:8765
 ```
+
+To serve a voice satellite over the LAN, provision a LAN bind address + bearer token
+(`gabagent-install --enable-voice-host --host <LAN_IP>`) and pair the device with `gab --pair-voice-agent`.
+Walkthrough: [docs/INSTALL.md](docs/INSTALL.md#running-a-lan-voice-host) · pairing protocol: [docs/PAIRING.md](docs/PAIRING.md).
 
 By voice you can control:
 
