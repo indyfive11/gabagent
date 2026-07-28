@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gabagent"
-version = "0.8.0"
+version = "0.8.1"
 description = "Claude Code reimplementation targeting the Gab AI Developer API"
 requires-python = ">=3.12"
 dependencies = [
@@ -48,6 +48,15 @@ gabagent-install = "gabagent.install.workstation:main"
 # works from a wheel too; it is later vendored into voice-agent at a pinned SHA (import-isolation enforced
 # by tests/unit/test_installkit_import_isolation.py).
 packages = ["src/gabagent", "installkit"]
+
+[tool.gabagent.install]
+# Installer-parity declared surface (see the Installer Parity HARD SOP in CLAUDE.md).
+# `system_pkgs`: non-python OS packages the CORE gabagent package needs at runtime — a shelled-to binary or
+# a linked system lib that is NOT a pip dependency, so it cannot be derived from `[dependencies]`. The
+# packaging-parity test unions this with the pyproject-derived `python-*` names and asserts the union is
+# covered by the AUR PKGBUILD `depends`/`optdepends`. Empty today (gabagent core is pure-python + the
+# stdlib-shipped bash); declared here so the moment a non-python dep is added, the gate covers it.
+system_pkgs = []
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

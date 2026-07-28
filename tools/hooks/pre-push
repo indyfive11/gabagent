@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Repo-local pre-push — runs the installer-parity gates before a push. CHAINED by the global identity
+# guard (~/.config/git/hooks/pre-push execs $git_dir/hooks/pre-push after its own check), so it fires
+# even though core.hooksPath is global. Belt-and-suspenders to CI, which is the authoritative gate (a
+# local hook is --no-verify-able). Install with `make install-hooks`.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+bash scripts/installer-parity.sh
+if [ -x .venv/bin/python ]; then
+  .venv/bin/python -m pytest tests/unit/test_installer_parity.py -q
+fi

@@ -21,7 +21,7 @@ INSTALLKIT_SRC ?= $(HOME)/dev/installkit
 VENDOR_DIR     := installkit
 MODULES        := __init__.py deps.py hardware.py secrets.py templating.py wizard.py
 
-.PHONY: vendor-sync vendor-check
+.PHONY: vendor-sync vendor-check installer-parity install-hooks
 
 vendor-sync:   ## Re-copy installkit modules from $(INSTALLKIT_SRC) at $(INSTALLKIT_PIN) into $(VENDOR_DIR)/
 	@for m in $(MODULES); do \
@@ -54,3 +54,12 @@ vendor-check:  ## Fail if vendored installkit/ diverges from installkit@$(INSTAL
 	done; \
 	[ $$rc -eq 0 ] || echo "vendor-check FAILED — run 'make vendor-sync' or reconcile the pin."; \
 	exit $$rc
+
+installer-parity:  ## Installer Parity gates (SOP in CLAUDE.md): parity pytests (1/1b/2) + delta pre-filter (3)
+	@python -m pytest tests/unit/test_installer_parity.py -q
+	@bash scripts/installer-parity.sh
+
+install-hooks:  ## Install the repo pre-push hook (chained by the global identity guard; core.hooksPath is global)
+	@git_dir="$$(git rev-parse --absolute-git-dir)"; \
+	  install -m 755 tools/hooks/pre-push "$$git_dir/hooks/pre-push" \
+	  && echo "installed pre-push hook -> $$git_dir/hooks/pre-push"
