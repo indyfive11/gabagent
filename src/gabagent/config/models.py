@@ -265,10 +265,12 @@ class StratumConfig(BaseModel):
     `enabled`, the store is created lazily (no new files while off), and the tools register only when
     enabled. Coding-lane only (never the voice runner) and gated OFF inside sub-agents."""
     enabled: bool = False  # master switch; off = byte-identical to today
-    # "surface" (default): compact-prep proposes habit observations as CANDIDATES (not injected) — the
-    # never-fabricate-safe default. "auto": accrete observations directly (still subordinate; promotion
-    # to a durable rule is always user-gated). Change only after a bake cycle earns precision.
-    observation_mode: str = "surface"
+    # "reviewed" (default): at compact-prep, proposed habit accretions pass through ONE adversarial
+    # reviewer (the user's proxy) that vets them against scope + existing memory before they land — the
+    # reviewer fires ONLY when there are habits to judge, so the common Current-Focus-only compaction
+    # stays a single call. "auto": skip the reviewer, trust the deterministic bound (cheapest). Either
+    # way habits are subordinate and promotion to a durable rule is always user-gated.
+    observation_mode: str = "reviewed"
     # compact-prep runs at the top of _compact_context (before the summary); this ratio is documentary
     # (the trigger is the existing 0.85 compaction path). Kept for future use; must stay < 0.85.
     compact_prep_ratio: float = 0.70
@@ -289,6 +291,17 @@ class StratumConfig(BaseModel):
     # Staleness audit horizon (observed-store last_seen); light. Identical (tool,args) N times → signal.
     audit_threshold_days: int = 90
     repeat_signal_threshold: int = 3
+    # Same-file re-edit count that emits an edit-churn signal (deterministic indecision marker).
+    edit_churn_threshold: int = 3
+    # Optional model override for the out-of-band compact-prep + reviewer calls ("" = inherit self.model).
+    # These are off-live-path judgment calls, so a cheaper/faster model is usually right.
+    model: str = ""
+    # Deterministic "nothing drastic" bound on a Current Focus rewrite: reject (keep the old window) if
+    # the rewrite drops more than this fraction of the old block's non-blank lines, or drops a Blocked
+    # line the old block had. Guards memory files without an LLM.
+    cf_max_line_drop_frac: float = 0.5
+    # Retention for the compact-prep memory snapshots (`*.pre-stratum-*`): keep the newest N per file.
+    snapshot_keep: int = 5
 
 
 class DesktopConfig(BaseModel):

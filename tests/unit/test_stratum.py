@@ -18,7 +18,7 @@ from gabagent.stratum.observed import Habit, ObservedStore, normalize
 def test_stratum_config_default_is_off():
     c = GabAgentConfig()
     assert c.stratum.enabled is False
-    assert c.stratum.observation_mode == "surface"
+    assert c.stratum.observation_mode == "reviewed"  # proxy-reviewed by default
     assert c.stratum.compact_prep_ratio < 0.85  # must stay below the compaction ratio
 
 
@@ -36,6 +36,10 @@ def test_active_gate():
     assert active(_ctx(off)) is False                       # disabled
     assert active(_ctx(on)) is True                          # enabled, top-level
     assert active(_ctx(on, is_subagent=True)) is False       # gated OFF in sub-agents
+    # voice_mode is NOT a gate: Stratum's seams live only in the coding loop (agent/loop.py); the
+    # voice runner (voice/turn.py) wires none of them, so voice exclusion is structural, not a check
+    # here. The former voice_mode gate was a redundant no-op guard (voice never reaches active()).
+    assert active(_ctx(on, voice_mode=True)) is True         # enabled + not sub-agent ⇒ active, regardless of voice_mode
 
 
 # --------------------------------------------------------------------------- observed store
@@ -160,6 +164,26 @@ def test_observer_captures_error_and_repeat(tmp_path):
     assert "repeated identical calls" in observer.summary(ctx)
 
 
+def test_observer_denial_and_edit_churn(tmp_path):
+    c = GabAgentConfig()
+    c.stratum.enabled = True
+    c.stratum.edit_churn_threshold = 3
+    ctx = _ctx(c)
+    # a user/permission denial is a distinct, stronger signal than a runtime error
+    denied = ToolResult(output="", error="Denied by user: rm -rf /")
+    observer.capture(ctx, [ToolCallSpec(id="1", name="bash", arguments='{"cmd":"rm"}')], [denied])
+    assert any(s["kind"] == "denied" and s["tool"] == "bash" for s in ctx.stratum_signals)
+    # 3 DIFFERENT edits to the same file trip edit-churn (which the exact-args repeat check misses)
+    ok = ToolResult(output="ok")
+    for i in range(3):
+        tc = ToolCallSpec(id=str(i), name="edit", arguments='{"file_path":"/x.py","old":"' + str(i) + '"}')
+        observer.capture(ctx, [tc], [ok])
+    churn = [s for s in ctx.stratum_signals if s["kind"] == "edit_churn"]
+    assert len(churn) == 1 and churn[0]["path"] == "/x.py"
+    summ = observer.summary(ctx)
+    assert "user-denied" in summ and "edit churn" in summ
+
+
 # --------------------------------------------------------------------------- inject
 def test_inject_empty_when_disabled(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
@@ -202,7 +226,29 @@ class _FakeClient:
         return self.out
 
 
-def _prep_ctx(tmp_path, out, mode="surface"):
+class _ScriptedClient:
+    """Returns a different reply for the sweep call vs the reviewer call (keyed on the system prompt)."""
+    def __init__(self, sweep, review=""):
+        self.sweep = sweep
+        self.review = review
+        self.calls = 0
+        self.review_calls = 0
+
+    async def complete_simple(self, messages, model=None, effort=None):
+        self.calls += 1
+        sysc = messages[0].content if messages else ""
+        if "adversarial reviewer" in sysc:
+            self.review_calls += 1
+            return self.review
+        return self.sweep
+
+
+def _xdg(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+
+def _prep_ctx(tmp_path, client, mode="reviewed"):
     c = GabAgentConfig()
     c.stratum.enabled = True
     c.stratum.observation_mode = mode
@@ -211,71 +257,127 @@ def _prep_ctx(tmp_path, out, mode="surface"):
         msgs.append(ChatMessage(role="user", content=f"do task {i}"))
         msgs.append(ChatMessage(role="assistant", content=f"did task {i}"))
     return AgentContext(
-        config=c, client=_FakeClient(out), rate_limiter=None,
+        config=c, client=client, rate_limiter=None,
         session=_FakeSession(msgs), session_id="t", cwd=tmp_path,
     )
 
 
+def test_current_focus_bound_check():
+    c = GabAgentConfig().stratum
+    old = "## Current Focus\n\n" + "\n".join(f"- item {i}" for i in range(10))
+    assert CF.bound_check(old, "Doing: tiny", c)[0] is False            # drops >50% of lines → reject
+    ok_body = "\n".join(f"- item {i}" for i in range(8))
+    assert CF.bound_check(old, ok_body, c)[0] is True                    # modest trim → ok
+    withb = "## Current Focus\n\nDoing: x\nBlocked:\n- on Y\n- keep\n- keep2"
+    assert CF.bound_check(withb, "Doing: x\n- keep\n- keep2", c)[0] is False  # drops the Blocked line
+    assert CF.bound_check(None, "Doing: fresh", c)[0] is True            # first-ever window passes
+
+
 @pytest.mark.asyncio
-async def test_compact_prep_writes_window_and_surfaces_candidate(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-    from gabagent.config.paths import memory_file, observed_habits_file
+async def test_compact_prep_reviewed_approves_habit(tmp_path, monkeypatch):
+    _xdg(monkeypatch, tmp_path)
+    from gabagent.config.paths import observed_habits_file
     from gabagent.session.memory import MemoryManager
     from gabagent.stratum import compact_prep
 
-    out = ("<CURRENT_FOCUS>Doing (since 2026-08-12): stratum build</CURRENT_FOCUS>\n"
-           "<HABITS>User tends to run tests before committing</HABITS>\n"
-           "<NOTE>the loop merges system msgs at assembly</NOTE>")
-    ctx = _prep_ctx(tmp_path, out, mode="surface")
+    sweep = ("<CURRENT_FOCUS>Doing (since 2026-08-12): stratum build</CURRENT_FOCUS>\n"
+             "<HABITS>User tends to run tests before committing</HABITS>\n"
+             "<NOTE>a durable lesson</NOTE>")
+    client = _ScriptedClient(sweep, review="1: APPROVE")
+    ctx = _prep_ctx(tmp_path, client, mode="reviewed")
     await compact_prep.run(ctx)
 
+    assert client.review_calls == 1  # reviewer fired because there were habits to judge
     mem = MemoryManager(ctx.cwd).load()
-    assert "## Current Focus" in mem and "stratum build" in mem
-    assert "[stratum]" in mem  # the NOTE was appended
-    habits = ObservedStore(observed_habits_file()).load()
-    assert len(habits) == 1
-    assert habits[0].state == "candidate"  # surface mode → candidate, not injected
-
-
-@pytest.mark.asyncio
-async def test_compact_prep_auto_mode_accretes(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-    from gabagent.config.paths import observed_habits_file
-    from gabagent.stratum import compact_prep
-
-    out = "<HABITS>User tends to prefer master branch</HABITS>"
-    ctx = _prep_ctx(tmp_path, out, mode="auto")
-    await compact_prep.run(ctx)
+    assert "## Current Focus" in mem and "stratum build" in mem and "[stratum]" in mem
     habits = ObservedStore(observed_habits_file()).load()
     assert len(habits) == 1 and habits[0].state == "accreting"
 
 
 @pytest.mark.asyncio
+async def test_compact_prep_reviewed_rejects_habit(tmp_path, monkeypatch):
+    _xdg(monkeypatch, tmp_path)
+    from gabagent.config.paths import observed_habits_file
+    from gabagent.stratum import compact_prep
+
+    client = _ScriptedClient("<HABITS>User tends to do something dubious</HABITS>", review="1: REJECT")
+    ctx = _prep_ctx(tmp_path, client, mode="reviewed")
+    await compact_prep.run(ctx)
+    assert ObservedStore(observed_habits_file()).load() == []  # rejected by the proxy → not stored
+
+
+@pytest.mark.asyncio
+async def test_compact_prep_auto_skips_reviewer(tmp_path, monkeypatch):
+    _xdg(monkeypatch, tmp_path)
+    from gabagent.config.paths import observed_habits_file
+    from gabagent.stratum import compact_prep
+
+    client = _ScriptedClient("<HABITS>User tends to prefer master branch</HABITS>", review="1: REJECT")
+    ctx = _prep_ctx(tmp_path, client, mode="auto")
+    await compact_prep.run(ctx)
+    assert client.review_calls == 0  # auto mode → no reviewer round-trip
+    habits = ObservedStore(observed_habits_file()).load()
+    assert len(habits) == 1 and habits[0].state == "accreting"
+
+
+@pytest.mark.asyncio
+async def test_compact_prep_bound_rejects_drastic_cf(tmp_path, monkeypatch):
+    _xdg(monkeypatch, tmp_path)
+    from gabagent.config.paths import memory_file
+    from gabagent.session.memory import MemoryManager
+    from gabagent.stratum import compact_prep
+
+    big = "## Current Focus\n\n" + "\n".join(f"- item {i}" for i in range(10)) + "\n"
+    memory_file(tmp_path).write_text(big)
+    client = _ScriptedClient("<CURRENT_FOCUS>Doing: tiny</CURRENT_FOCUS>")  # drops >50% → must be rejected
+    ctx = _prep_ctx(tmp_path, client, mode="reviewed")
+    await compact_prep.run(ctx)
+    after = MemoryManager(ctx.cwd).load()
+    assert "item 0" in after and "tiny" not in after  # drastic rewrite rejected; old window kept
+
+
+@pytest.mark.asyncio
 async def test_compact_prep_zero_tags_leaves_memory_unchanged(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    _xdg(monkeypatch, tmp_path)
     from gabagent.config.paths import memory_file
     from gabagent.stratum import compact_prep
 
-    ctx = _prep_ctx(tmp_path, "sorry, I cannot help with that", mode="surface")
+    ctx = _prep_ctx(tmp_path, _ScriptedClient("sorry, I cannot help"), mode="reviewed")
     await compact_prep.run(ctx)
     assert not memory_file(ctx.cwd).exists() or memory_file(ctx.cwd).read_text() == ""
 
 
 @pytest.mark.asyncio
 async def test_compact_prep_noop_when_disabled(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    _xdg(monkeypatch, tmp_path)
     from gabagent.config.paths import memory_file
     from gabagent.stratum import compact_prep
 
-    ctx = _prep_ctx(tmp_path, "<CURRENT_FOCUS>x</CURRENT_FOCUS>", mode="surface")
+    client = _ScriptedClient("<CURRENT_FOCUS>x</CURRENT_FOCUS>")
+    ctx = _prep_ctx(tmp_path, client, mode="reviewed")
     ctx.config.stratum.enabled = False
     await compact_prep.run(ctx)
-    assert ctx.client.calls == 0                      # no LLM call
+    assert client.calls == 0                          # no LLM call
     assert not memory_file(ctx.cwd).exists()          # nothing written
+
+
+@pytest.mark.asyncio
+async def test_disabled_session_touches_zero_stratum_files(tmp_path, monkeypatch):
+    """The §5.C promise, at the filesystem level: an enabled=False run end-to-end creates no store."""
+    _xdg(monkeypatch, tmp_path)
+    from gabagent.config.paths import observed_habits_file, stratum_dir
+    from gabagent.stratum import compact_prep
+    from gabagent.stratum.inject import session_block
+
+    client = _ScriptedClient("<CURRENT_FOCUS>x</CURRENT_FOCUS>\n<HABITS>User tends to X</HABITS>")
+    ctx = _prep_ctx(tmp_path, client, mode="reviewed")
+    ctx.config.stratum.enabled = False
+    for _ in range(3):
+        session_block(ctx)          # simulate several turns of injection
+    await compact_prep.run(ctx)     # and a compaction
+    assert client.calls == 0
+    assert not stratum_dir().exists()
+    assert not observed_habits_file().exists()
 
 
 # --------------------------------------------------------------------------- loop wiring (integration)

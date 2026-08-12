@@ -16,6 +16,7 @@ async def handle_slash(command: str, ctx: AgentContext) -> bool:
         "/help": _help,
         "/clear": _clear,
         "/compact": _compact,
+        "/reconcile": _reconcile,
         "/model": _model,
         "/cost": _cost,
         "/usage": _usage,
@@ -56,6 +57,7 @@ async def _help(arg: str, ctx: AgentContext) -> None:
         ("/help", "Show this help"),
         ("/clear", "Clear screen and reset display"),
         ("/compact", "Compress conversation context"),
+        ("/reconcile", "Read-only audit of project memory vs scope (Stratum) — findings for your review"),
         ("/model [name|auto]", "Pin one model (opus/sonnet/haiku/aria/local) — no escalation; /model auto to resume"),
         ("/cost", "Show token usage and model info"),
         ("/usage", "Detailed session usage"),
@@ -90,6 +92,55 @@ async def _clear(arg: str, ctx: AgentContext) -> None:
 async def _compact(arg: str, ctx: AgentContext) -> None:
     from gabagent.agent.loop import _compact_context
     await _compact_context(ctx)
+
+
+_RECONCILE_SYSTEM = (
+    "You are running an on-demand, READ-ONLY reconcile audit of this project's persistent memory "
+    "against its scope/charter, for the user to review. Flag concisely: (1) drift — memory that no "
+    "longer matches the project's stated scope; (2) stale or contradictory notes; (3) observed-habit "
+    "entries that look unsupported, wrong, or redundant; (4) anything worth pruning or promoting. "
+    "These are SUGGESTIONS — nothing is applied automatically. Be specific and brief."
+)
+
+
+async def _reconcile(arg: str, ctx: AgentContext) -> None:
+    """Single-lens, human-invoked Stratum audit. Reads scope + memory + observed habits, returns
+    findings as text for review, and writes NOTHING."""
+    from gabagent.api.models import ChatMessage
+    from gabagent.config.paths import observed_habits_file
+    from gabagent.session.memory import MemoryManager
+    from gabagent.stratum.observed import ObservedStore
+
+    memory = MemoryManager(ctx.cwd).load() or "(empty)"
+    habits = ObservedStore(observed_habits_file()).load()
+    habit_txt = "\n".join(
+        f"- [{h.state}] {h.heading} (hits={h.hits}, conflicts={h.conflict_count})" for h in habits
+    ) or "(none)"
+    scope = "(no plan/charter doc found)"
+    for name in ("ROADMAP.md", "CLAUDE.md", "README.md"):
+        p = ctx.cwd / name
+        if p.exists():
+            scope = "\n".join(p.read_text(encoding="utf-8").splitlines()[:80])
+            break
+
+    console.print("[dim]Running Stratum reconcile (read-only audit)…[/dim]", markup=True)
+    try:
+        out = await ctx.client.complete_simple(
+            [
+                ChatMessage(role="system", content=_RECONCILE_SYSTEM),
+                ChatMessage(role="user", content=(
+                    f"=== PROJECT SCOPE ===\n{scope}\n\n=== memory.md ===\n{memory}\n\n"
+                    f"=== OBSERVED HABITS ===\n{habit_txt}"
+                )),
+            ],
+            model=(ctx.config.stratum.model or None),
+        )
+    except Exception as e:
+        console.print(f"[error]Reconcile failed: {e}[/error]", markup=True)
+        return
+    from rich.panel import Panel
+    console.print(Panel(out, title="[bold cyan]Stratum Reconcile — for your review[/bold cyan]",
+                        border_style="cyan", padding=(0, 1)))
 
 
 async def _model(arg: str, ctx: AgentContext) -> None:

@@ -17,23 +17,50 @@ if TYPE_CHECKING:
 _MAX_SIGNALS = 200  # in-memory guard; the log is flushed/interpreted at compact-prep
 
 
+# Stable rejection prefixes emitted by the permission/hook layer (loop.py) — a denial is a much
+# stronger habit signal ("user always denies X") than an ordinary runtime error.
+_DENIAL_PREFIXES = ("Blocked by permissions:", "Denied by user:", "Blocked by hook:")
+
+
+def _file_path(arguments: str) -> str | None:
+    try:
+        import json
+        return json.loads(arguments).get("file_path") or None
+    except Exception:
+        return None
+
+
 def capture(ctx: AgentContext, tool_calls: list[ToolCallSpec], results: list[ToolResult]) -> None:
     """Record deterministic signals for one tool turn. Never raises, never touches disk."""
     try:
         signals = ctx.stratum_signals
         seen = ctx.stratum_seen_calls
-        threshold = int(getattr(ctx.config.stratum, "repeat_signal_threshold", 3))
+        repeat_t = int(getattr(ctx.config.stratum, "repeat_signal_threshold", 3))
+        churn_t = int(getattr(ctx.config.stratum, "edit_churn_threshold", 3))
         for tc, result in zip(tool_calls, results):
             if result is None:
                 continue
             if not result.success:
-                _push(signals, {"kind": "tool_error", "tool": tc.name,
-                                "detail": (result.error or "")[:200]})
+                err = result.error or ""
+                if any(err.startswith(p) for p in _DENIAL_PREFIXES):
+                    _push(signals, {"kind": "denied", "tool": tc.name, "detail": err[:200]})
+                else:
+                    _push(signals, {"kind": "tool_error", "tool": tc.name, "detail": err[:200]})
+            # identical (tool, args) repeated — a redo/oscillation marker
             key = f"{tc.name}\x1f{tc.arguments}"
             n = seen.get(key, 0) + 1
             seen[key] = n
-            if n == threshold:  # emit once, exactly at the threshold crossing
+            if n == repeat_t:  # emit once, exactly at the threshold crossing
                 _push(signals, {"kind": "repeat", "tool": tc.name, "count": n})
+            # same-file edit churn — the repeat check above misses it because the args differ each edit
+            if tc.name in ("edit", "write"):
+                path = _file_path(tc.arguments)
+                if path:
+                    ckey = f"edit\x1f{path}"
+                    cn = seen.get(ckey, 0) + 1
+                    seen[ckey] = cn
+                    if cn == churn_t:
+                        _push(signals, {"kind": "edit_churn", "tool": tc.name, "path": path, "count": cn})
     except Exception:
         pass
 
@@ -50,15 +77,26 @@ def summary(ctx: AgentContext) -> str:
     if not signals:
         return ""
     errors: dict[str, int] = {}
+    denied: dict[str, int] = {}
     repeats: dict[str, int] = {}
+    churn: dict[str, int] = {}
     for s in signals:
-        if s.get("kind") == "tool_error":
+        k = s.get("kind")
+        if k == "tool_error":
             errors[s["tool"]] = errors.get(s["tool"], 0) + 1
-        elif s.get("kind") == "repeat":
+        elif k == "denied":
+            denied[s["tool"]] = denied.get(s["tool"], 0) + 1
+        elif k == "repeat":
             repeats[s["tool"]] = max(repeats.get(s["tool"], 0), s.get("count", 0))
+        elif k == "edit_churn":
+            churn[s["path"]] = max(churn.get(s["path"], 0), s.get("count", 0))
     parts = []
+    if denied:
+        parts.append("user-denied/blocked: " + ", ".join(f"{k}×{v}" for k, v in denied.items()))
     if errors:
-        parts.append("tool errors/rejections: " + ", ".join(f"{k}×{v}" for k, v in errors.items()))
+        parts.append("tool errors: " + ", ".join(f"{k}×{v}" for k, v in errors.items()))
     if repeats:
         parts.append("repeated identical calls: " + ", ".join(f"{k}×{v}" for k, v in repeats.items()))
+    if churn:
+        parts.append("same-file edit churn: " + ", ".join(f"{k}×{v}" for k, v in churn.items()))
     return "; ".join(parts)

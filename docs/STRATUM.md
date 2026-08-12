@@ -1,10 +1,13 @@
 # Stratum — native memory-management subsystem for gabagent
 
-**Status:** design spec, adversarially reviewed (design pressure-test + independent audit) and
-hardened. Ready for implementation. Reachable branch of [ROADMAP.md](../ROADMAP.md) — not a second
-plan root.
+**Status:** implemented (v2 "reviewed"). Reachable branch of [ROADMAP.md](../ROADMAP.md) — not a second
+plan root. Default `observation_mode="reviewed"`: proposed habit accretions are vetted by one
+adversarial reviewer (the user's proxy) before they land; a deterministic bound guards every
+Current-Focus rewrite; there are **no model-facing tools** (the model never invokes a memory action);
+a human-invoked `/reconcile` gives an on-demand read-only audit.
 **Scope:** thin additions to gabagent's existing memory surface. Explicitly **not** a spine-wide
-unification (see §2).
+unification (see §2). Coding-lane only — gated off in sub-agents; voice exclusion is structural (the
+voice runner wires none of Stratum's seams).
 
 ---
 
@@ -139,57 +142,70 @@ tool-call turns, and the voice runner never calls it. So:
    non-Stratum scope, so a `## Current Focus` block never surfaces in voice via its `memory.md`
    read, `voice/turn.py:176-183`.)
 
-### 5.C — Registry / no-op honesty
-The tool registry is last-writer-wins by name, with no config-gated registration and no unregister
-(`registry.py:15`). Therefore:
+### 5.C — No model-facing tools / no-op honesty
+Stratum exposes **no** model-facing tools. (An earlier revision registered `current_focus_update` /
+`observed_habit_note` / `stratum_status`; because the voice tool filter `_voice_tool_schemas`
+(`turn.py:318`) is a denylist that only strips `bash`/`run_shell`, those tools leaked to the Aria
+voice model — the live bug that prompted this redesign. Removing them fixes it at the root.) Therefore:
 
-1. **New tools take new names** (`current_focus_update`, `observed_habit_note`, `stratum_status`) —
-   never re-register `memory_write` (that would silently shadow it). Enhance the existing
-   `MemoryWriteTool` in place (`session/memory.py:70`) if needed.
-2. **Config-gate at call sites, not registration.** Tools may register unconditionally (harmless when
-   unused); the loop seams (trigger, observer, injection) each guard on `ctx.config.stratum.enabled`.
-3. **`enabled=False` is genuinely byte-identical:** nothing reshaped, no migration, the store is
-   created lazily (only on first accretion when enabled). Matches the pure-runtime-gate precedent of
-   the optional integrations (`models.py:125-133,164-174`). **Test:** an `enabled=False` session
-   touches zero new files.
+1. **The model never invokes a Stratum action.** Stratum runs only as the compact-prep routine + the
+   human-invoked `/reconcile`. Nothing to leak into any lane.
+2. **Call-site gating, not registration.** The loop seams (compact-prep trigger, observer) guard on
+   `active(ctx)` — which is False when disabled or in a sub-agent. Voice exclusion is **structural, not a
+   gate here**: the seams live only in the coding loop (`agent/loop.py`); the voice runner
+   (`voice/turn.py`) wires none of them, so a voice ctx never reaches `active()`. (When the voice loop
+   ever wires a Stratum seam, that seam gates on its own task/context — 2026-08-12 charter re-baseline.)
+3. **`enabled=False` is genuinely byte-identical:** nothing reshaped, no migration, no tools registered,
+   the store is created lazily (only on first accretion when enabled). Matches the pure-runtime-gate
+   precedent of the optional integrations. **Test:** an `enabled=False` session touches zero new files.
 
 ## 6. Config — `StratumConfig` (all defaults = historical no-op)
 
 ```
 stratum.enabled: bool = False                 # OFF = byte-identical to today
-stratum.observation_mode: "surface"|"auto" = "surface"
-stratum.compact_prep_ratio: float = 0.70      # must be < the 0.85 compaction ratio
+stratum.observation_mode: "reviewed"|"auto" = "reviewed"  # reviewed = proxy vets accretions; auto = deterministic bound only
+stratum.model: str = ""                       # optional cheap model for the out-of-band sweep/reviewer calls ("" = inherit)
+stratum.compact_prep_ratio: float = 0.70      # documentary; trigger is the top of _compact_context
+stratum.cf_max_line_drop_frac: float = 0.5    # deterministic "nothing drastic" bound on a CF rewrite
+stratum.snapshot_keep: int = 5                # retention for *.pre-stratum-* memory snapshots
 stratum.tier05_halflife_days: int = 30
 stratum.tier05_caps: (soft=40, hard=75)
 stratum.tier05_gate: (adv_days=30, adv_hits=5, adv_weeks=3)
 stratum.cf_line_bands:  (150, 300, 600)       # Current Focus, LINES
 stratum.idx_line_bands: (400, 700, 1000)      # whole memory.md, LINES
 stratum.audit_threshold_days: int = 90        # observed-store last_seen (light)
+stratum.repeat_signal_threshold / edit_churn_threshold: int = 3   # deterministic observer signals
 ```
 
-Follows the codebase pattern (nested `BaseModel` via `Field(default_factory)`; `env_ignore_empty`
-protects the flag from a blank export). **Installer parity is mandatory in the same change:** the new
-config block owes `docs/INSTALL.md` wiring, the AUR PKGBUILD, and the installer-parity gates. No new
-system dependency; no provisioning (lazy store), so the no-op default genuinely holds. `enabled`
-stays opt-in through at least one bake cycle in `surface` mode before any default flip is considered
-— auto-accreting facts about the user touches the never-fabricate constraint, so precision must be
-earned on real logs first.
+Follows the codebase pattern (nested `BaseModel` via `Field(default_factory)`; the flag is nested so
+it is set in `settings.json`, not via env). **Installer parity in the same change:** `docs/INSTALL.md`
+wiring. No new system dependency; no provisioning (lazy store), so the no-op default genuinely holds.
 
-## 7. Proposed package layout
+**Observation modes.** `reviewed` (default): at compact-prep, proposed habit accretions pass through
+one adversarial reviewer (the user's proxy) that vets them against scope + existing memory before they
+land — and it fires ONLY when there are habits to judge, so a Current-Focus-only compaction stays a
+single call. `auto`: skip the reviewer, trust the deterministic diff-bound (cheapest). Either way the
+deterministic `cf_max_line_drop_frac` bound guards every Current-Focus rewrite for free, and promotion
+of a habit to a durable rule is always user-gated.
+
+## 7. Package layout (as built)
 
 ```
 src/gabagent/stratum/
-  config.py           # StratumConfig (or a block in config/models.py)
-  current_focus.py    # window schema: parse / measure LINES / rewrite helpers; size-check
-  observed.py         # observed-habits store: record format, scoring, caps/decay, gate, state machine
-  observer.py         # per-turn in-memory signal capture + compact-prep interpretation
-  compact_prep.py     # the routine (snapshot + deterministic mechanics + awaited out-of-band call)
-  tools.py            # new-name tools: current_focus_update, observed_habit_note, stratum_status
+  __init__.py         # active(ctx) gate: enabled AND not sub-agent (voice exclusion is structural — voice wires no seam)
+  current_focus.py    # window schema: parse / measure LINES / rewrite + bound_check (nothing-drastic guard)
+  observed.py         # observed-habits store: record format, scoring, caps/decay, eligibility gate, state machine
+  observer.py         # per-turn in-memory signals: tool_error / denied / repeat / edit_churn (zero-IO)
+  compact_prep.py     # the routine: snapshot+prune → out-of-band sweep → deterministic bound → gated reviewer → writes
+  inject.py           # the transient subordinate injection block (in-memory, never persisted)
 ```
-Wired via one guarded import in `_register_tools()` (`cli.py:474`) + call-site guards in `loop.py`
-(the compact-prep trigger, the observer seam) — the minimal spine footprint. Injection uses the
-`system`-message pattern (`loop.py:217`), NOT `build_system_prompt` params: the ranked observed-habits
-block is volatile per session and must not bust prompt-cache stability.
+**No model-facing tools** — Stratum exposes none, so the model never proactively invokes a memory
+action (this is what fixed the voice leak). It runs only as the compact-prep routine (call-site-gated
+in `loop.py`: the trigger at the top of `_compact_context`, the observer seam after the tool loop) and
+via the human-invoked `/reconcile` slash command (single-lens, read-only, writes nothing). Injection
+is an in-memory tail-segment appended after the frozen prefix (never `ctx.session`, so it can't stack
+across `--continue`/`--resume`). Voice exclusion is structural: no tools to leak, and the seams live
+only in the coding loop — the voice runner wires none, so a voice ctx never reaches `active()`.
 
 ## 8. Deferred (recorded with re-entry gates)
 
