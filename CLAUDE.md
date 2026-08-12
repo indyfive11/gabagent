@@ -2,38 +2,71 @@
 
 A Claude Code-style AI coding assistant built on the Gab AI Developer API.
 
-## Project Scope & Charter (living — updated 2026-07-12)
+## Project Scope & Charter (living — re-baselined 2026-08-12)
 
-**gabagent is two products in one repo, sharing one spine:**
+**gabagent is one assistant on one engine, reached through two interfaces.**
 
-1. **gabagent** — a Claude-Code-style terminal coding assistant on the Gab AI API. The founding
-   product (2026-05-19) and the engine everything else is built on.
-2. **Aria** — a voice-driven home/media brain built on that engine: an HTTP+SSE "brain" server plus a
-   pluggable capability plane (media, desktop, timers, and more).
+The assistant is **Aria**. The engine is the shared agent spine (loop, tool registry, config,
+capability plane, memory, persona, the Key Invariants below). The two interfaces are:
 
-Both are **first-class**. They share the agent loop, tool registry, config, and the Key Invariants
-below. Design rules: **AI-agnostic** (voice never *requires* the gabagent brain — `BRAIN=local/ollama`
-stays first-class) and **new capabilities are plugins, never spine edits**.
+1. **Keyboard — the `gab` TUI.** A Claude-Code-style terminal coding assistant on the Gab AI API. The
+   founding product (2026-05-19) and the engine everything else is built on.
+2. **Voice — the HTTP+SSE brain.** A hands-free home/media brain: music, movies, desktop, timers,
+   whole-house/satellite, and a pluggable capability plane.
+
+These are **two doors into the same assistant, not two products.** Aria is Aria whether you type or
+speak — shared identity (the global persona layer), tools, and memory; the interface only changes
+*how* you reach her.
+
+**Capability spectrum (the design target).** Aria spans a continuum: ambient/media (home brain) →
+conversation → **supplemental, bounded coding** ("continue this," small edits, keep a project moving
+while I'm away) → **full project handoff** (the headless builder, already shipped). Coding is part of
+Aria, not a walled-off product.
+
+**Gating principle — by TASK/CONTEXT, not INTERFACE.** What memory loads and how strict a
+confirmation is are decided by *what Aria is doing* (a project/coding task? an irreversible action?),
+not by *which door* you came through. Security is **proportional to the task** — a simple media
+command should not demand a keyboard confirmation. Bounded elevation (double-voice-confirm or a spoken
+override passphrase) is the intended mechanism: **direction, not yet shipped** (see ROADMAP.md).
+
+Design rules (unchanged): **AI-agnostic** (voice never *requires* the gabagent brain — `BRAIN=local/
+ollama` stays first-class) and **new capabilities are plugins, never spine edits**.
 
 **Single source of truth for plan & status: [ROADMAP.md](ROADMAP.md).** These founding docs are
-*living*: where we diverged from the original scope, we record it below rather than pretend the plan
-never moved.
+*living*: where reality diverged from the original scope, we record it below rather than pretend the
+plan never moved.
+
+### Architecture note — one engine, honestly (2026-08-12)
+
+"One engine" is true at the toolbox layer and aspirational at the loop layer, and we say so rather
+than overstate it. **Shared today:** one Gab client (`api/client.py`), one flat tool registry
+(`tools/registry.py`), one `AgentContext`, one config/session/memory stack, and a genuinely
+plugin-shaped capability plane (media/downloads/recommender reached through generic
+`run_command`/`list_capabilities` tools — zero new schemas per capability). **Forked today:** the
+agent loop itself — `voice/turn.py::_run_turn` *mirrors* `agent/loop.py::run_loop` (~1300 LOC of
+parallel loop), with a second system prompt and a second permission surface. **Converging the two
+loops (or extracting a shared turn core) is a tracked goal**, not a claim of current state — it is the
+seam any context-gated memory or shared security model must reconcile.
 
 ### Divergences from founding intent (and why)
 
 Founding intent (README `72f07b6`, 2026-05-19): *"A Claude Code-style AI coding assistant"* — a terminal
-coding tool, with no voice, media, or home control. Recorded divergences:
+coding tool, with no voice, media, or home control, and no "Aria." The five Key Invariants below are
+founding and survive **verbatim**. Recorded divergences:
 
 - **2026-06-01 — Voice + media pivot (birth of "Aria").** Added a voice brain (HTTP+SSE) and, the *same
   day*, media control (Jellyfin, TIDAL) via a new command-provider framework. *Justified:* built on the
   existing agent spine as plugins; the coding invariants were untouched; driven by real daily use.
-- **2026-06-20 → now — Whole-house expansion.** LAN brain, room addressing, Pi satellite, per-room
-  media, cross-room arbiter. *Justified:* natural extension of the voice product to multiple rooms, still
-  plugin-shaped.
-- **2026-07 — Breadth grafts.** Image generation, movie *downloading* (Radarr/Sonarr), a taste
-  recommender (MovieScout), self-introspection, a headless "builder." *Caveat, not a clean win:* each is a
-  plugin so the core stayed clean, but this is where scope sprawl set in — hence the **close-the-loop
-  gate** in ROADMAP.md (no new domain until the installer MVP lands and a release ships the backlog).
+- **2026-06-20 → 2026-07 — Whole-house + breadth.** LAN brain, room addressing, Pi satellite, per-room
+  media, cross-room arbiter; then image generation, movie *downloading* (Radarr/Sonarr), a taste
+  recommender (MovieScout), self-introspection, and a headless "builder." *Justified but watched:* each
+  is a plugin so the core stayed flat — but this is where scope sprawl set in, hence the **close-the-loop
+  gate** in ROADMAP.md.
+- **2026-08-12 — Charter re-baseline (this rewrite).** The docs had drifted to "two products, one repo,
+  both first-class" (a framing first written 2026-07-12, ~8 weeks *after* founding). A Deep Reconcile
+  against git + the code surface found the codebase never forked into two products — it is one engine
+  that grew capabilities. Re-baselined to **"one assistant, two interfaces,"** which matches the shipped
+  code; and re-based the memory/security gating on **context, not interface.**
 
 ## Dev Setup
 

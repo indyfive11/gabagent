@@ -4,18 +4,21 @@
 Supersedes the scattered `PLAN_*` / roadmap docs (archived locally in `docs/archive/`, gitignored).
 Keep this living: when a plan changes, change it *here* — don't start a new plan doc.
 
-_Last reconciled: 2026-07-20 (post-v0.7.0 — the close-the-loop gate is now CLOSED)._
-_Prior: 2026-07-12 (full founding-vs-shipped audit)._
+_Last reconciled: 2026-08-12 (Deep Reconcile — charter re-baseline + release-sync catch-up)._
+_Prior: 2026-07-20 (post-v0.7.0, gate CLOSED); 2026-07-12 (founding-vs-shipped audit)._
 
 ---
 
 ## Charter (see [CLAUDE.md → Project Scope](CLAUDE.md))
-**Two products, one repo, one spine:**
-1. **gabagent** — a Claude-Code-style terminal coding assistant on the Gab AI API (the founding product and the engine).
-2. **Aria** — a voice-driven home/media brain built on that engine.
+**One assistant, one engine, two interfaces (re-baselined 2026-08-12):**
+Aria is one assistant on one shared spine, reached two ways —
+1. **Keyboard — the `gab` TUI:** a Claude-Code-style terminal coding assistant on the Gab AI API (the founding product and the engine).
+2. **Voice — the HTTP+SSE brain:** a hands-free home/media brain.
 
-Both first-class. Shared agent loop, tool registry, config, and Key Invariants. Design rules:
-**AI-agnostic** (voice never *requires* the gabagent brain) and **new capabilities are plugins, never spine edits.**
+Two doors into the same assistant, not two products. Shared agent loop\*, tool registry, config, memory,
+persona, and Key Invariants. Design rules: **AI-agnostic** (voice never *requires* the gabagent brain),
+**capabilities are plugins never spine edits**, and **memory/security gate by TASK/CONTEXT, not interface.**
+_\*The turn loop is currently duplicated (`voice/turn.py` mirrors `agent/loop.py`); unifying it is a tracked goal — see CLAUDE.md architecture note._
 
 ---
 
@@ -35,18 +38,35 @@ _Why: live feature requests kept deferring the release gate indefinitely — thi
 
 ---
 
+## ★ ANTI-DRIFT — keep this tracker honest (2026-08-12)
+The 2026-08-12 Deep Reconcile found the *scope gate held* but the *docs lagged ~3 releases* (this file
+still claimed v0.7.0 as "last release" while v0.8.0/0.8.1/0.8.2 had shipped). Forcing functions, so
+reporting-drift fails structurally rather than relying on memory:
+1. **Release-sync gate (to build):** a `tests/unit/test_roadmap_sync.py` that fails CI when this file's
+   "Last release" ≠ the latest git tag, or a tag has no SHIPPED row. Mirrors the installer-parity gate
+   pattern. _[tracked in NEXT]_
+2. **One tracker, no orphans:** ROADMAP.md is the single plan root. `.claude/TASKS.md` (an orphan second
+   root) is archived to `docs/archive/` (2026-08-12); `INSTALL_PLAN.md`'s vendoring self-contradiction is
+   to be reconciled.
+3. **Compact-prep reconcile step:** the compact-prep routine diffs ROADMAP "Shipped" vs `git tag` and
+   flags any tag missing a row.
+
+---
+
 ## NOW — active
 _The next active piece is the maintainer's call (see NEXT). In flight:_
-- **Stratum — native memory subsystem** — design hardened + adversarially reviewed; implementation
-  in progress. Thin additions (Current Focus window + compact-prep routine + observed-habits store)
-  to the existing `memory.md` surface — deliberately **not** a memory unification. Design spec (this
-  branch of the plan tree): [docs/STRATUM.md](docs/STRATUM.md).
+- **Stratum — native memory subsystem** — **v1 SHIPPED `167e68b`** (Current Focus window + compact-prep
+  routine + observed-habits store; thin additions to the `memory.md` surface, deliberately **not** a
+  memory unification; default `enabled=false`). **v2 "reviewed" built but uncommitted + disabled** —
+  drops model-facing tools (root-fix for a voice tool-leak), adds a gated-hybrid reviewer + deterministic
+  diff-bound + `/reconcile`. Open (maintainer's call): commit v2? re-enable? and **re-gate on CONTEXT not
+  interface** per the 2026-08-12 charter re-baseline. Design spec: [docs/STRATUM.md](docs/STRATUM.md).
 - **reSpeaker mic-wedge cures** _(voice-agent side)_ — Class A solved; Class B USB-power-cycle rung shipped. Remaining: a live watchdog-driven cycle (maintainer-gated). voice-agent is currently **push-frozen** — this + the confirm-parser stack await the maintainer's direct go.
 
 ## NEXT — queued (gate is closed; pick to pull in)
-- **Installer — Phase-2 (plugin-installer contract)** — _built + public (`66cae4f`), unreleased (lands in the next tag)._ Each plugin package ships an installer exposing `manifest` + `check`/`install`/`configure`, wired through an **explicit registry** — deliberately *not* auto-discovery.
-- **Installer — Phase-3 (voice)** _(voice-agent's build, not ours)_ — 3a + 3b **built**; **3c token pairing built + live-verified** (see §10d below). `installkit/` is its **own repo** (github.com/indyfive11/installkit); A.4 templating + A.5 tokens first landed there at `d3451cb`, and the operative consume pin is now **`78ff1cd`** (post the A.4 boot-safety fix). The shared-artifact-surface question was §10c — **RESOLVED 2026-07-27 = Option 1 (fix-and-consume):** **both repos now vendor the whole `installkit` package byte-for-byte at `78ff1cd`** (the 2026-07-22 pre-promotion-snapshot drift is closed on both sides — gabagent re-vendored the full 6-module package, all byte-identical to the pin), and voice-agent's satellite unit consumes the vendored `render_unit` — A.4's first real consumer. **Committed + public** (gabagent `fa02142` vendor + `b0692a5` content-guard CI; voice-agent side pushed); the live Pi-test remains the maintainer's gate. See `INSTALL_PLAN.md` §10c + its divergence ledger.
-- **Installer — §10d voice-host discovery** — **BUILT + public** (unreleased). The full-voice-host role now enables the brain's mDNS advertiser: Layer-B firewall/discovery diagnosis (voice-agent `7217ad5`) + Layer-C voice-host seam (gabagent `aea1306`, `gabagent-install --enable-voice-host --host <ip> [--room-id]`; the ratified graft co-writes a non-loopback `voice_host` and refuses on loopback). **Validated on real hardware 2026-07-27:** the brain's `_voice-brain._tcp` advert is live at its LAN IP (non-loopback, confirmed by an off-box browse); the satellite attaches + authenticates to the brain; and a live spoken-wake→brain-response→TTS cycle completed. (mDNS discovery runs at install time **and** as a boot self-heal: verified from voice-agent source + live hardware, the satellite's `mdns_discover` resolves the brain via mDNS, and a stale pin is corrected to the live brain on boot when the stored host is unreachable — a reachable stored host is kept without a browse, which is the steady state. ARM Pi deploy-test `PROVISION_EXIT 0`.) **The credential half (3c) is now built + live-verified:** an operator-authorized `POST /pair` handshake mints/hands the brain's bearer token to a fresh front end over the wire (`gab --pair-voice-agent` operator console + client provisioning; the config-precedence fix makes an env-supplied token effective) — validated end-to-end on real hardware (satellite → brain → token → authenticated). User docs: [docs/INSTALL.md](docs/INSTALL.md#pairing-a-voice-device) + [docs/PAIRING.md](docs/PAIRING.md). **★ Headline self-provisioning PoC — maintainer-signed-off 2026-07-28:** run from-scratch on the real Pi satellite — mDNS discover → token cleared + fresh identity → `pair_for_token` → operator-approved `.108` at the brain → 200 (token hash-matched, no rotation) → authenticated live front-end → live "Hey Aria" voice turn + music-on-command. See `INSTALL_PLAN.md` §10d.
+- **Release-sync test gate** _(anti-drift #1, to build)_ — a `tests/unit/test_roadmap_sync.py` asserting "Last release" == latest git tag and every tag has a SHIPPED row; fails CI on drift. See ANTI-DRIFT above.
+- **Aria context-gating + voice-security model** _(post charter re-baseline, maintainer-gated design step)_ — re-gate Stratum memory on **context** (project cwd + coding intent), not `voice_mode`; give voice a bounded "project context" it can enter (attach a cwd, gain a bounded coding toolset, load that project's Current Focus); task-proportional confirmation with **double-voice-confirm / spoken override passphrase** (the "stop lobotomizing simple tasks" fix). See CLAUDE.md → Gating principle + Capability spectrum.
+- **Loop convergence** _(tracked goal, unscheduled)_ — extract a shared turn core so `voice/turn.py` stops mirroring `agent/loop.py` (~1300 LOC of parallel loop). The seam context-gating + shared security must reconcile. See CLAUDE.md architecture note.
 - **Cross-room arbiter** — brain lane done + committed, **flag-off**. Next: Stage-1 threshold-zoning (voice-side, ~zero code), then enable only if a doorway still double-answers.
 - **✦ Builder** — dormant but wired in the CLI. Keep tracked and **surface regularly** ("use the builder").
 - **✦ MovieScout LOW-3/4/5** — deferred, but **surface soon & often** (Jellyfin overlay, Trakt, cooldown-on-add).
@@ -87,9 +107,13 @@ _The next active piece is the maintainer's call (see NEXT). In flight:_
 - **Other domains** (v0.7.0) — image generation, credit-balance guard, self-introspection, self-learning persona, timers + proactive channel, auto-Turbo latency, loop-detector + escalation ladder, movie downloads (Radarr/Sonarr), MovieScout recommender, headless builder.
 - **Installer — Phase-1 MVP** (v0.7.0) — text-only workstation wizard + top-level `installkit/` (Layer-A, stdlib-only) + `bootstrap.sh` + `gabagent-install`. Closed the gate's installer half.
 - **Headline self-provisioning thin-client PoC** (2026-07-28, maintainer-signed-off) — a from-scratch voice satellite provisions itself end-to-end: **mDNS discover → over-the-wire operator-approved token pairing → authenticate → live voice turn + real action (music)**, proven on real hardware (Pi satellite → LAN brain). Closes the §10d/3c credential half. See §10d + `INSTALL_PLAN.md`.
-- **Config precedence fix** (2026-07-28, unreleased) — settings now resolve **CLI/override > env (`GABAI_*`) > `settings.json` > default**; previously the whole file was passed as init kwargs (the highest source), so any saved field silently shadowed its env var — an `EnvironmentFile` deploy was a no-op and a LAN brain provisioned with `GABAI_VOICE_AUTH_TOKEN` ran with no effective auth. An empty `GABAI_*` is now treated as unset, and env-only secrets are never written back to the plaintext file. Live-verified on the LAN brain (bearer auth now enforced). Documented in [docs/INSTALL.md](docs/INSTALL.md#configuration). `config/loader.py`, `config/models.py`.
+- **Config precedence fix** (v0.8.0) — settings now resolve **CLI/override > env (`GABAI_*`) > `settings.json` > default**; previously the whole file was passed as init kwargs (the highest source), so any saved field silently shadowed its env var — an `EnvironmentFile` deploy was a no-op and a LAN brain provisioned with `GABAI_VOICE_AUTH_TOKEN` ran with no effective auth. An empty `GABAI_*` is now treated as unset, and env-only secrets are never written back to the plaintext file. Live-verified on the LAN brain (bearer auth now enforced). Documented in [docs/INSTALL.md](docs/INSTALL.md#configuration). `config/loader.py`, `config/models.py`.
 - **Polish pass** (v0.7.0) — P1 `system.fix_audio` (`944730e`, idempotent "can't hear" recovery — unmute + 50% floor, default-sink only, user-invoked), P2 TIDAL normalized-query cache (`bd3f99f`), P3 eye `error` state (`5c50467`). P4 → DEFERRED (below).
-- **Last release:** **v0.7.0 (2026-07-13)** — image gen, movie downloads, MovieScout, headless builder, first installer; closed the close-the-loop gate. (Prior: v0.6.0, 2026-06-20.)
+- **Installer — self-provisioning** (v0.8.0) — mDNS discovery/advertiser, voice-host role, over-the-wire token pairing (`POST /pair`), the Phase-2 plugin-installer contract (explicit registry), and vendored `installkit` at pin `78ff1cd`. Absorbs the former NEXT items (Phase-2/Phase-3/§10d) that were "built, unreleased"; the headline self-provisioning PoC (Pi satellite → LAN brain, live) landed here.
+- **Installer parity — anti-drift** (v0.8.1) — 3 automatic pytest gates + CI + pre-push hook + delta pre-filter + the mirrored Installer-Parity HARD SOP (dev-infra only).
+- **First-run fail-soft** (v0.8.2) — optional backend packages (`anthropic`/`playwright`) absent no longer crash a default install: guarded imports + importability-aware backend detection + startup degrade + Gate 4.
+- **Stratum memory v1** (HEAD `167e68b`, untagged) — native memory subsystem: Current Focus window + compact-prep routine + observed-habits store; default `enabled=false`. See NOW for the v2/re-gate status.
+- **Last release:** **v0.8.2 (2026-07-28)** — first-run fail-soft. (Prior tags: v0.8.1, v0.8.0 self-provisioning installer; v0.7.0 2026-07-13; v0.6.0 2026-06-20.)
 
 ## Open questions the maintainer owns
 - ~~Phase-3 `installkit/` canonical home~~ — **RESOLVED 2026-07-20: its own repo** (github.com/indyfive11/installkit), both layers vendor at a pinned SHA.
