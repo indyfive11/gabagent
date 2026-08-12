@@ -78,6 +78,7 @@ async def _spawn_foreground(ctx: AgentContext, prompt: str, model: str | None) -
         cwd=ctx.cwd,
         system_prompt=sp,
         headless=True,
+        is_subagent=True,  # gate Stratum OFF: a sub-agent must not rewrite Current Focus or accrete habits
     )
 
     console.rule(f"[dim]Sub-agent {sid[:8]}[/dim]")

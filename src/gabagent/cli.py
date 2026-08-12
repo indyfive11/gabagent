@@ -528,3 +528,11 @@ def _register_tools() -> None:
         import gabagent.commands.tools  # noqa: F401
     except ImportError:
         pass
+    # Stratum tools register ONLY when enabled — so a disabled install's tool list is byte-identical
+    # (the registry is last-writer-wins with no config-gated registration, so we gate the import here).
+    try:
+        from gabagent.config.loader import get_config
+        if get_config().stratum.enabled:
+            import gabagent.stratum.tools  # noqa: F401
+    except Exception:
+        pass

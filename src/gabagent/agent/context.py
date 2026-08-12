@@ -73,3 +73,8 @@ class AgentContext:
     jellyfin_playing_page: Any = field(default=None)  # Playwright Page driving a browser-launched movie
     jellyfin_paused: bool = field(default=False)      # our tracked play/pause state for that page
     voice_announced_model: Any = field(default=None)  # last model we spoke an "escalating" notice for
+    # Stratum (memory subsystem) — all inert unless config.stratum.enabled. is_subagent gates Stratum
+    # OFF inside sub-agents (they must not rewrite the parent's Current Focus or accrete habits).
+    is_subagent: bool = False
+    stratum_signals: list = field(default_factory=list)   # in-memory per-turn observer signals (never disk)
+    stratum_seen_calls: dict = field(default_factory=dict)  # (tool,args) → count, for repeat detection

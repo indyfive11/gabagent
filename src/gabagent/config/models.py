@@ -258,6 +258,39 @@ class TmiConfig(BaseModel):
     reconcile_interval_secs: int = 0
 
 
+class StratumConfig(BaseModel):
+    """Stratum — native memory-management subsystem (docs/STRATUM.md). Three thin additions to the
+    existing per-cwd memory.md: a Current Focus window, a Prep-for-Compact routine, and a subordinate
+    Observed-Habits store. DEFAULT OFF ⇒ byte-identical to today: every lifecycle seam is gated on
+    `enabled`, the store is created lazily (no new files while off), and the tools register only when
+    enabled. Coding-lane only (never the voice runner) and gated OFF inside sub-agents."""
+    enabled: bool = False  # master switch; off = byte-identical to today
+    # "surface" (default): compact-prep proposes habit observations as CANDIDATES (not injected) — the
+    # never-fabricate-safe default. "auto": accrete observations directly (still subordinate; promotion
+    # to a durable rule is always user-gated). Change only after a bake cycle earns precision.
+    observation_mode: str = "surface"
+    # compact-prep runs at the top of _compact_context (before the summary); this ratio is documentary
+    # (the trigger is the existing 0.85 compaction path). Kept for future use; must stay < 0.85.
+    compact_prep_ratio: float = 0.70
+    # Tier-0.5 scoring/decay + caps + eligibility gate (Stratum §7.4-§7.6). Defaults are conservative.
+    tier05_halflife_days: int = 30
+    tier05_soft_cap: int = 40
+    tier05_hard_cap: int = 75
+    adv_days: int = 30
+    adv_hits: int = 5
+    adv_weeks: int = 3
+    # Current Focus / whole-memory.md LINE budgets (never bytes) for the size reminder.
+    cf_notice: int = 150
+    cf_firm: int = 300
+    cf_strict: int = 600
+    idx_notice: int = 400
+    idx_firm: int = 700
+    idx_strict: int = 1000
+    # Staleness audit horizon (observed-store last_seen); light. Identical (tool,args) N times → signal.
+    audit_threshold_days: int = 90
+    repeat_signal_threshold: int = 3
+
+
 class DesktopConfig(BaseModel):
     """KDE/Wayland desktop control (first-party provider)."""
     # Friendly monitor names → KWin connector (e.g. {"hisense": "DP-1"}). Display make/model isn't
@@ -328,6 +361,7 @@ class GabAgentConfig(BaseSettings):
     mcp_servers: dict[str, MCPServer] = Field(default_factory=dict)
     lsp: LSPConfig = Field(default_factory=LSPConfig)
     router: RouterConfig = Field(default_factory=RouterConfig)
+    stratum: StratumConfig = Field(default_factory=StratumConfig)
     searxng_url: str = ""
     vim_mode: bool = False
     theme: str = "monokai"

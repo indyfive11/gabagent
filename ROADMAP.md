@@ -36,8 +36,11 @@ _Why: live feature requests kept deferring the release gate indefinitely — thi
 ---
 
 ## NOW — active
-_Between milestones — no gabagent build is in flight. The next active piece is the maintainer's call
-(see NEXT). Standing item:_
+_The next active piece is the maintainer's call (see NEXT). In flight:_
+- **Stratum — native memory subsystem** — design hardened + adversarially reviewed; implementation
+  in progress. Thin additions (Current Focus window + compact-prep routine + observed-habits store)
+  to the existing `memory.md` surface — deliberately **not** a memory unification. Design spec (this
+  branch of the plan tree): [docs/STRATUM.md](docs/STRATUM.md).
 - **reSpeaker mic-wedge cures** _(voice-agent side)_ — Class A solved; Class B USB-power-cycle rung shipped. Remaining: a live watchdog-driven cycle (maintainer-gated). voice-agent is currently **push-frozen** — this + the confirm-parser stack await the maintainer's direct go.
 
 ## NEXT — queued (gate is closed; pick to pull in)

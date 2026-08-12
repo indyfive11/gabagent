@@ -114,6 +114,14 @@ async def _compact_context(ctx: AgentContext) -> None:
     if len(user_assistant) < 4:
         console.print("[dim]Nothing to compact — conversation is too short.[/dim]", markup=True)
         return
+    # Stratum Prep-for-Compact: sweep session insight into durable memory BEFORE the summary rewrites
+    # the transcript. Isolated + self-gated (no-op unless config.stratum.enabled and not a sub-agent);
+    # must never block the compaction that follows. Covers both auto (0.85) and manual (/compact) paths.
+    try:
+        from gabagent.stratum import compact_prep
+        await compact_prep.run(ctx)
+    except Exception:
+        pass
     tokens_before = _estimate_tokens(
         [ChatMessage(role="system", content=ctx.system_prompt)]
         + [m for m in messages if m.role != "system"]
@@ -362,6 +370,10 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
             system_content = ctx.system_prompt
             if extra_sys:
                 system_content = ctx.system_prompt + "\n\n" + "\n\n".join(extra_sys)
+            # Stratum: append the transient subordinate block AFTER the frozen prefix — in memory only,
+            # never persisted (empty string when disabled ⇒ byte-identical).
+            from gabagent.stratum.inject import session_block
+            system_content = system_content + session_block(ctx)
             system_msg = ChatMessage(role="system", content=system_content)
             all_messages = [system_msg] + non_sys_messages
 
@@ -374,6 +386,8 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
                 system_content = ctx.system_prompt
                 if extra_sys:
                     system_content = ctx.system_prompt + "\n\n" + "\n\n".join(extra_sys)
+                from gabagent.stratum.inject import session_block
+                system_content = system_content + session_block(ctx)
                 system_msg = ChatMessage(role="system", content=system_content)
                 all_messages = [system_msg] + non_sys_messages
             elif ctx.token_estimate > ctx.config.max_context_tokens * CONTEXT_WARN_RATIO:
@@ -469,6 +483,16 @@ async def run_loop(ctx: AgentContext, initial_prompt: str | None = None) -> None
                     tool_call_id=tc.id,
                 )
             )
+
+        # Stratum observer: cheap, deterministic, in-memory signal capture for this tool turn.
+        # This is the one seam that sees tool-call turns (run_stop only fires on text-only terminals).
+        try:
+            from gabagent.stratum import active as _stratum_active
+            if _stratum_active(ctx):
+                from gabagent.stratum import observer as _stratum_observer
+                _stratum_observer.capture(ctx, tool_calls, results)
+        except Exception:
+            pass
 
 
 async def _execute_tool_calls(

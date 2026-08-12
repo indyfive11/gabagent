@@ -69,6 +69,18 @@ def room_dir(room_id: str | None = None) -> Path:
     return p
 
 
+def stratum_dir() -> Path:
+    """Root of the Stratum store (data_dir, machine-wide). Created lazily by the first save so a
+    disabled install touches nothing."""
+    return data_dir() / "stratum"
+
+
+def observed_habits_file() -> Path:
+    """Stratum Tier-0.5 SHARED observed-habits store. NOT created here — the store writes it lazily
+    on first accretion, keeping `stratum.enabled=False` free of any new files."""
+    return stratum_dir() / "observed_habits.md"
+
+
 def history_file() -> Path:
     return config_dir() / "history"
 

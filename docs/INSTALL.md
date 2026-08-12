@@ -116,9 +116,10 @@ Each `GABAI_*` variable maps to the matching top-level field (uppercased): `api_
 | `voice_port` | `GABAI_VOICE_PORT` | Voice brain port (default `8765`) |
 | `voice_host` | `GABAI_VOICE_HOST` | Voice brain bind address (default `127.0.0.1`; a LAN IP exposes it to satellites) |
 | `voice_auth_token` | `GABAI_VOICE_AUTH_TOKEN` | Bearer token a LAN voice brain requires and hands out on pairing |
+| `stratum.enabled` | — | Opt-in native memory subsystem (Current Focus window + Prep-for-Compact + observed habits). Default `false` = byte-identical to today. Nested — set in `settings.json`, not via env. See [docs/STRATUM.md](STRATUM.md). |
 
-`permissions.allow` / `permissions.deny`, `hooks`, `mcp_servers`, and `lsp.servers` are also
-configured here — see the project README.
+`permissions.allow` / `permissions.deny`, `hooks`, `mcp_servers`, `lsp.servers`, and the `stratum`
+block are also configured here — see the project README and [docs/STRATUM.md](STRATUM.md).
 
 ---
 
