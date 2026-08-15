@@ -60,7 +60,7 @@ def test_unpin_meta_detected(text):
 
 
 @pytest.mark.parametrize("text,kind,val", [
-    ("use aria", "brain", "cloud"),       # bare switch, NOT a pin
+    ("switch to arya model", "brain", "cloud"),   # explicit model switch, NOT a pin
     ("switch to local", "brain", "local"),
     ("make local the floor", "floor", "local"),
 ])

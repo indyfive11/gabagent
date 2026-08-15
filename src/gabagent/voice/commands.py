@@ -25,11 +25,27 @@ class MetaCommand:
 
 _VERB = r"(?:switch(?:\s+to)?|go(?:\s+to)?|back\s+to|move\s+to|change\s+to|use|launch|run|load)"
 _TO_LOCAL = re.compile(rf"\b{_VERB}\s+(?:the\s+)?(?:local|devstral)\b", re.I)
-# Cloud aliases include the persona name "Aria" and model "arya" (they sound alike; users say "Aria").
+# Cloud switch. `cloud|online|remote|claude` are unambiguous bare triggers. The names `arya|aria|gab`
+# require an explicit noun ("aria brain", "arya model", "gab brain") — bare "use aria"/"work on gab…"
+# are the assistant's name / the project, NOT a brain switch (they'd collide with `work_on_project`).
 _TO_CLOUD = re.compile(
-    rf"\b{_VERB}\s+(?:the\s+)?(?:cloud|online|claude|arya|aria|remote|gab)\b", re.I
+    rf"\b{_VERB}\s+(?:the\s+)?(?:"
+    rf"(?:cloud|online|remote)(?:\s+brain)?"
+    rf"|claude"
+    rf"|(?:arya|aria|gab)\s+(?:brain|model)"
+    rf")\b",
+    re.I,
 )
 _GO_ONLINE = re.compile(r"\bgo\s+(?:back\s+)?online\b", re.I)
+
+# Project attach fast-path (Part B): deterministic "work on <project>" at the meta layer. Single-token
+# name capture so a descriptive phrase ("work on the bug in gabagent") can't smuggle a project name
+# into the resolver's fuzzy fallback — membership in the allow-list is what actually authorizes it.
+_ATTACH = re.compile(
+    r"\b(?:work on|switch to|jump (?:in)?to)\s+(?:the\s+)?(?P<name>[\w-]+)(?:\s+project)?\b", re.I)
+_DETACH = re.compile(
+    r"\b(?:leave|detach from|stop working on|exit)\s+(?:the\s+)?(?:project|this)\b"
+    r"|\bback to (?:normal|ambient)\b", re.I)
 
 _UNDO = re.compile(r"\b(?:undo|revert|roll\s*back|take\s+that\s+back)\b", re.I)
 
@@ -169,7 +185,7 @@ _FORGET = re.compile(
 _FORGET_ALL = re.compile(r"\b(?:everything|all(?:\s+of\s+it)?|your\s+memory|memory)\b", re.I)
 
 
-def detect_meta_command(text: str) -> MetaCommand | None:
+def detect_meta_command(text: str, config=None) -> MetaCommand | None:
     t = text.strip()
     # Builder VUI verbs first — tightly anchored on "builder"/"build"/"graduate", so they win over the
     # generic switch/query patterns ("switch builder to X" must not read as a brain switch).
@@ -202,6 +218,19 @@ def detect_meta_command(text: str) -> MetaCommand | None:
         return MetaCommand("brain", "local")
     if _TO_CLOUD.search(t) or _GO_ONLINE.search(t):
         return MetaCommand("brain", "cloud")
+    # Project attach fast-path — AFTER the reserved brain aliases (so a project literally named
+    # "cloud"/"local"/"aria" can't shadow a brain switch), gated on config so it's inert without the
+    # allow-list. Returns "attach" ONLY on a real allow-list HIT; a miss falls through to the LLM
+    # work_on_project tool (which owns the "I don't have that project" messaging).
+    if config is not None:
+        if _DETACH.search(t):
+            return MetaCommand("attach", "")
+        am = _ATTACH.search(t)
+        if am:
+            from gabagent.tools.project_tool import resolve_project
+            target, _ = resolve_project(am.group("name"), config)
+            if target is not None:
+                return MetaCommand("attach", str(target))
     if _QUIET.search(t):
         return MetaCommand("quiet")
     if _UNDO.search(t):

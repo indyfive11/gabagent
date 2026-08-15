@@ -1,8 +1,10 @@
-"""Per-session voice state: confirm round-trips, undo stack, Tier-3 arming."""
+"""Per-session voice state: confirm round-trips, undo stack, Tier-3 arming, project attach."""
 from __future__ import annotations
 import asyncio
 import time
 from typing import Any
+
+_UNSET = object()  # sentinel: no project change staged (distinct from a staged detach, which is None)
 
 
 class VoiceSession:
@@ -39,6 +41,36 @@ class VoiceSession:
         # Session-scoped (lost on a brain restart in v1); _timer_n is the per-session id counter.
         self.timers: dict = {}
         self._timer_n: int = 0
+        # Voice project attach (Part B). `active_project` is the currently-attached project root (or
+        # None = ambient). `base_cwd` is the pre-attach cwd, saved on first attach so "leave" restores
+        # it. A change is STAGED by the attach/leave tool and applied by `apply_pending` at the NEXT
+        # turn boundary — never mid-round, so a same-round write_file can't race on ctx.cwd.
+        # Session-scoped (lost on a brain restart, like timers).
+        self.active_project: Any = None   # Path | None
+        self.base_cwd: Any = None         # Path | None
+        self._pending_project: Any = _UNSET  # _UNSET = nothing staged; Path = attach; None = detach
+
+    # -- project attach (Part B) --------------------------------------------
+    def stage_project(self, target: Any) -> None:
+        """Stage an attach (target=Path) or detach (target=None) to apply at the next turn boundary."""
+        self._pending_project = target
+
+    def apply_pending_project(self, ctx: Any) -> Any:
+        """Apply any staged attach/detach to ctx.cwd. Called once at the top of a turn, before the
+        round loop, so it never races a same-round tool. Returns the new active_project (or None)."""
+        if self._pending_project is _UNSET:
+            return self.active_project
+        target = self._pending_project
+        self._pending_project = _UNSET
+        if self.base_cwd is None:
+            self.base_cwd = ctx.cwd
+        if target is None:
+            ctx.cwd = self.base_cwd
+            self.active_project = None
+        else:
+            ctx.cwd = target
+            self.active_project = target
+        return self.active_project
 
     def set_error(self, msg: str) -> None:
         self.last_error = msg

@@ -493,6 +493,10 @@ def _register_tools() -> None:
     except ImportError:
         pass
     try:
+        import gabagent.tools.project_tool  # noqa: F401  (voice project attach — Part B)
+    except ImportError:
+        pass
+    try:
         import gabagent.plan.mode  # noqa: F401
     except ImportError:
         pass

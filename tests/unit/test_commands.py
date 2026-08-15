@@ -58,10 +58,17 @@ def test_turn_off_local_drops_to_aria(text):
     assert mc is not None and mc.kind == "floor" and mc.value == "aria"
 
 
-@pytest.mark.parametrize("text", ["switch to Aria", "go back to the cloud", "use arya"])
-def test_bare_aria_switch_is_still_exclusive_cloud(text):
+@pytest.mark.parametrize("text", ["go back to the cloud", "use claude", "switch to arya model", "use the aria brain"])
+def test_explicit_cloud_switch(text):
     mc = detect_meta_command(text)
     assert mc is not None and mc.kind == "brain" and mc.value == "cloud"
+
+
+@pytest.mark.parametrize("text", ["switch to Aria", "use arya", "use aria", "switch to arya"])
+def test_bare_name_is_not_a_cloud_switch(text):
+    # Require-noun tightening: a BARE assistant/model/project name is not a brain switch (it collides
+    # with the assistant's name and the "work on <project>" command) → falls through to the model.
+    assert detect_meta_command(text) is None
 
 
 def _ctx(tmp_path, **kw):
@@ -103,12 +110,16 @@ def test_detect_quiet_does_not_eat_media_stop():
         assert mc is None or mc.kind != "quiet", phrase
 
 
-def test_detect_cloud_by_persona_name_aria():
-    # Users say the persona name "Aria" (sounds like the model "arya").
-    assert detect_meta_command("let's stop this and go back to Aria").value == "cloud"
+def test_cloud_switch_by_name_requires_a_noun():
+    # Names (aria/arya/gab) require an explicit brain/model noun, so they don't collide with the
+    # assistant's own name or the "work on <project>" command.
     assert detect_meta_command("switch to ARIA model").value == "cloud"
-    assert detect_meta_command("use aria").value == "cloud"
-    assert detect_meta_command("switch to arya").value == "cloud"
+    assert detect_meta_command("use the aria brain").value == "cloud"
+    assert detect_meta_command("go to gab brain").value == "cloud"
+    # Bare names are NOT a switch (fall through to the model / project path).
+    assert detect_meta_command("let's stop this and go back to Aria") is None
+    assert detect_meta_command("use aria") is None
+    assert detect_meta_command("switch to arya") is None
     # Not a switch — just mentioning the name.
     assert detect_meta_command("tell me about aria") is None
 

@@ -445,6 +445,14 @@ class GabAgentConfig(BaseSettings):
     # <root>/X), after which <root>/X is appended to builder_allowed_roots. Empty (default) ⇒ graduation
     # is unavailable until configured. Set to e.g. ~/dev. Env: GABAI_BUILDER_GRADUATE_ROOT.
     builder_graduate_root: str = ""
+    # Voice project attach (Part B): directory roots whose immediate child folders may be attached over
+    # voice ("Aria, work on X") — attaching sets the session's working dir to that project so its memory
+    # + Current Focus load and edits under it resolve there. A spoken name is matched against the
+    # enumerated child folders of these roots (never joined as a path). Empty (default) ⇒ NOTHING is
+    # attachable over voice ⇒ historical no-op. A root that is `$HOME`, `/`, or an ancestor of a sensitive
+    # zone (`~/.ssh`, `~/.config`, `~/.aws`, `~/.gnupg`, `/etc`) is refused. Set to e.g. ~/dev.
+    # Env: GABAI_VOICE_ATTACHABLE_ROOTS.
+    voice_attachable_roots: list[str] = Field(default_factory=list)
     # Closed-set fuzzy-salvage strictness — how confidently a garbled command id / playlist name is
     # auto-resolved against the real catalog before we ask "did you mean …?" instead. Defaults are the
     # historical bare constants (resolve.py 0.6/0.86, tidal 0.72) ⇒ an unconfigured install behaves

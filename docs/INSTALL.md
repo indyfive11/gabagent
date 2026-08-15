@@ -116,6 +116,7 @@ Each `GABAI_*` variable maps to the matching top-level field (uppercased): `api_
 | `voice_port` | `GABAI_VOICE_PORT` | Voice brain port (default `8765`) |
 | `voice_host` | `GABAI_VOICE_HOST` | Voice brain bind address (default `127.0.0.1`; a LAN IP exposes it to satellites) |
 | `voice_auth_token` | `GABAI_VOICE_AUTH_TOKEN` | Bearer token a LAN voice brain requires and hands out on pairing |
+| `voice_attachable_roots` | `GABAI_VOICE_ATTACHABLE_ROOTS` | Directory roots whose child folders can be attached by voice ("work on X") — loads that project's memory + Current Focus. Empty (default) = nothing attachable. `$HOME`, `/`, and ancestors of sensitive dirs are refused. |
 | `stratum.enabled` | — | Opt-in native memory subsystem (Current Focus window + Prep-for-Compact + observed habits). Default `false` = byte-identical to today. Nested — set in `settings.json`, not via env. See [docs/STRATUM.md](STRATUM.md). |
 | `stratum.observation_mode` | — | `reviewed` (default; an adversarial reviewer vets habit accretions) or `auto` (deterministic bound only). Coding-lane only. |
 

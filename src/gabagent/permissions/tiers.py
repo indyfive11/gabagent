@@ -108,6 +108,12 @@ def tier_of(
     if tool_name in ("list_capabilities", "rescan_capabilities"):
         return 1
 
+    # Voice project attach (Part B): authorization is the allow-list containment INSIDE the tool (a
+    # target outside voice_attachable_roots is refused there), not a confirm — so Tier-1 auto, never a
+    # meaningless keyboard prompt over voice.
+    if tool_name in ("work_on_project", "leave_project"):
+        return 1
+
     if tool_name in _TIER1_READS:
         return 1
 

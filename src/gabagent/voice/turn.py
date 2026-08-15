@@ -161,6 +161,11 @@ def _voice_system(ctx: AgentContext) -> str:
     caps = _capability_brief(ctx)
     if caps:
         s += f"\n\n{caps}"
+    # Project Current Focus (Part B) — branch-independent, BEFORE the tmi/else split so it surfaces
+    # whether or not TMI is enabled. Gated on an explicit project attach; empty otherwise.
+    cf_brief = _current_focus_brief(ctx)
+    if cf_brief:
+        s += f"\n\n{cf_brief}"
     tmi_cfg = getattr(ctx.config, "tmi", None)
     if tmi_cfg is not None and tmi_cfg.enabled:
         # Tiered-memory recall: Tier 1 (this room's notes) + Tier 0 (shared identity). Tier 2 is the
@@ -299,6 +304,26 @@ def _memory_brief(ctx: AgentContext, limit: int = 1500) -> str:
     if len(mem) > limit:
         mem = "…" + mem[-limit:]
     return f"What you remember about this project (your own saved notes):\n{mem}"
+
+
+def _current_focus_brief(ctx: AgentContext) -> str:
+    """Project-scoped Current Focus (Part B). Surfaces ONLY when a project is explicitly attached over
+    voice (``vs.active_project``) — a different axis from TMI's room memory, and branch-independent so
+    it works whether or not TMI is enabled (the tmi branch bypasses ``_memory_brief`` entirely). Never
+    fires for the brain's default cwd, so a run dir that happens to be a managed scope can't leak a
+    stray Current Focus. Fully defensive."""
+    vs = getattr(ctx, "voice_session", None)
+    if not getattr(vs, "active_project", None):
+        return ""
+    try:
+        from gabagent.session.memory import MemoryManager
+        from gabagent.stratum.current_focus import extract_block
+        cf = extract_block(MemoryManager(ctx.cwd).load())
+        if not cf:
+            return ""
+        return f"Current focus on {ctx.cwd.name}:\n{cf}"
+    except Exception:
+        return ""
 
 
 def _persona_brief(ctx: AgentContext) -> str:
@@ -714,6 +739,15 @@ async def _handle_meta(ctx: AgentContext, mc: commands.MetaCommand, emit) -> Non
     elif mc.kind == "builder":
         from gabagent.builder import vui
         await vui.handle(ctx, mc, emit)
+    elif mc.kind == "attach":
+        from gabagent.tools import project_tool
+        vs = ctx.voice_session
+        if vs is None:
+            await emit(events.token("I can only work on a project over voice."))
+        elif mc.value == "":
+            await emit(events.token(project_tool.stage_detach(vs)))
+        else:
+            await emit(events.token(project_tool.stage_attach(vs, mc.value)))
     await emit(events.done())
 
 
@@ -782,7 +816,7 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
         if _had_offer:
             # The offer lapsed (user said something else) → release the held window before handling normally.
             await emit(events.wake_hold(False))
-        mc = commands.detect_meta_command(user_text)
+        mc = commands.detect_meta_command(user_text, ctx.config)
         if mc is not None:
             dlog(ctx, "meta", matched=f"{mc.kind}:{mc.value}".rstrip(":"))
             await _handle_meta(ctx, mc, emit)
@@ -948,6 +982,9 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
         # Routing has committed to answering (asides/meta returned earlier) → arm the progress-ack so a slow
         # think/command fills the silence. Cancelled in the finally regardless of how the turn exits.
         _progress_task = asyncio.create_task(_progress_ack_watchdog(ctx, emit, _stamped, _progress))
+        # Apply any staged project attach/detach (Part B) at the turn boundary — never mid-round, so a
+        # same-round write_file can't race on ctx.cwd. The prompt build + memory brief below reflect it.
+        vs.apply_pending_project(ctx)
         while True:
             cur = ctx.active_model or simple
             # Announce an arya→premium transition ONCE (vs. every turn), and de-escalate silently.
@@ -1101,6 +1138,16 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
             results = await _execute_tool_calls(
                 tool_calls, ctx, perm_engine, None, NullToolDisplay(), router
             )
+            # Stratum observer (Part B) — capture coding signals only when Stratum is enabled AND a
+            # project is attached (the context gate). Wired ahead of a voice-side consumer; defensive
+            # like the coding loop (agent/loop.py) so it never breaks a turn.
+            try:
+                from gabagent.stratum import active as _stratum_active
+                if _stratum_active(ctx) and getattr(vs, "active_project", None):
+                    from gabagent.stratum import observer as _stratum_observer
+                    _stratum_observer.capture(ctx, tool_calls, results)
+            except Exception:
+                pass
             for tc, result in zip(tool_calls, results):
                 # Record the run_command command_id so the debug log shows WHICH capability ran each
                 # turn (was inferred-by-tier before) — e.g. to see exactly what a "move the window" turn
