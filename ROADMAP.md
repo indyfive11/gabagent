@@ -55,17 +55,12 @@ reporting-drift fails structurally rather than relying on memory:
 
 ## NOW — active
 _The next active piece is the maintainer's call (see NEXT). In flight:_
-- **Stratum — native memory subsystem** — **v1 SHIPPED `167e68b`** (Current Focus window + compact-prep
-  routine + observed-habits store; thin additions to the `memory.md` surface, deliberately **not** a
-  memory unification; default `enabled=false`). **v2 "reviewed" built but uncommitted + disabled** —
-  drops model-facing tools (root-fix for a voice tool-leak), adds a gated-hybrid reviewer + deterministic
-  diff-bound + `/reconcile`. Open (maintainer's call): commit v2? re-enable? and **re-gate on CONTEXT not
-  interface** per the 2026-08-12 charter re-baseline. Design spec: [docs/STRATUM.md](docs/STRATUM.md).
+- **Stratum re-gate on CONTEXT** — v1 + v2 both SHIPPED (v0.9.0; see SHIPPED); ships **default `enabled=false`** (byte-identical off). The one open piece is **re-gating on CONTEXT not interface** per the 2026-08-12 charter re-baseline — folded into the context-gating design step in NEXT. Design spec: [docs/STRATUM.md](docs/STRATUM.md).
 - **reSpeaker mic-wedge cures** _(voice-agent side)_ — Class A solved; Class B USB-power-cycle rung shipped. Remaining: a live watchdog-driven cycle (maintainer-gated). voice-agent is currently **push-frozen** — this + the confirm-parser stack await the maintainer's direct go.
 
 ## NEXT — queued (gate is closed; pick to pull in)
 - **Release-sync test gate** _(anti-drift #1, to build)_ — a `tests/unit/test_roadmap_sync.py` asserting "Last release" == latest git tag and every tag has a SHIPPED row; fails CI on drift. See ANTI-DRIFT above.
-- **Aria context-gating + voice-security model** _(post charter re-baseline, maintainer-gated design step)_ — re-gate Stratum memory on **context** (project cwd + coding intent), not `voice_mode`; give voice a bounded "project context" it can enter (attach a cwd, gain a bounded coding toolset, load that project's Current Focus); task-proportional confirmation with **double-voice-confirm / spoken override passphrase** (the "stop lobotomizing simple tasks" fix). See CLAUDE.md → Gating principle + Capability spectrum.
+- **Aria context-gating + voice-security model** _(post charter re-baseline, maintainer-gated design step)_ — the **project-context half SHIPPED in v0.9.0** (voice project attach: `"work on <project>"` swaps cwd, resolves edits there, loads that project's Current Focus, under the `voice_attachable_roots` allow-list). Remaining: (a) re-gate Stratum memory on **context** (project cwd + coding intent), not `voice_mode`; (b) **voice-security (Part C)** — task-proportional confirmation with **double-voice-confirm / spoken override passphrase** + 2 speaker-verified voice gates for CRITICAL ops (speaker verification is a FRONT-END capability ⇒ needs a GA↔VAC design round). See CLAUDE.md → Gating principle + Capability spectrum.
 - **Loop convergence** _(tracked goal, unscheduled)_ — extract a shared turn core so `voice/turn.py` stops mirroring `agent/loop.py` (~1300 LOC of parallel loop). The seam context-gating + shared security must reconcile. See CLAUDE.md architecture note.
 - **Cross-room arbiter** — brain lane done + committed, **flag-off**. Next: Stage-1 threshold-zoning (voice-side, ~zero code), then enable only if a doorway still double-answers.
 - **✦ Builder** — dormant but wired in the CLI. Keep tracked and **surface regularly** ("use the builder").
@@ -112,8 +107,11 @@ _The next active piece is the maintainer's call (see NEXT). In flight:_
 - **Installer — self-provisioning** (v0.8.0) — mDNS discovery/advertiser, voice-host role, over-the-wire token pairing (`POST /pair`), the Phase-2 plugin-installer contract (explicit registry), and vendored `installkit` at pin `78ff1cd`. Absorbs the former NEXT items (Phase-2/Phase-3/§10d) that were "built, unreleased"; the headline self-provisioning PoC (Pi satellite → LAN brain, live) landed here.
 - **Installer parity — anti-drift** (v0.8.1) — 3 automatic pytest gates + CI + pre-push hook + delta pre-filter + the mirrored Installer-Parity HARD SOP (dev-infra only).
 - **First-run fail-soft** (v0.8.2) — optional backend packages (`anthropic`/`playwright`) absent no longer crash a default install: guarded imports + importability-aware backend detection + startup degrade + Gate 4.
-- **Stratum memory v1** (HEAD `167e68b`, untagged) — native memory subsystem: Current Focus window + compact-prep routine + observed-habits store; default `enabled=false`. See NOW for the v2/re-gate status.
-- **Last release:** **v0.8.2 (2026-07-28)** — first-run fail-soft. (Prior tags: v0.8.1, v0.8.0 self-provisioning installer; v0.7.0 2026-07-13; v0.6.0 2026-06-20.)
+- **Stratum memory** (v1 `167e68b`; **v2 in v0.9.0**) — native memory subsystem: Current Focus window + compact-prep routine + observed-habits store. v2 added reviewed mode + structural voice exclusion + dropped model-facing tools; default `enabled=false`.
+- **Voice project attach** (v0.9.0) — voice-only meta-intents `"work on <project>"` / `"leave project"`: the brain attaches to a project under a configured allow-list (`voice_attachable_roots`, default empty = off), swaps cwd so edits resolve there, and surfaces that project's Current Focus. Brain-internal; the front-end↔brain HTTP+SSE contract is unchanged. Also tightened brain-switch routing so a bare assistant-name no longer hijacks as a cloud switch.
+- **Offline-failover anti-flap** (v0.9.0) — the internet-outage RECOVERY probe now checks a **real cloud completion** (the path that actually flaps) instead of a bare host GET, rate-limited to once/45s with a 60s re-announce cooldown, ending the online/offline oscillation. Unit-verified; a live outage is months-apart so it carries a live-verification tripwire.
+- **Charter re-baseline** (v0.9.0) — founding docs re-framed as *one assistant (Aria), one engine, two interfaces (voice + the `gab` TUI)*; memory/security gated by task/context, not by interface.
+- **Last release:** **v0.9.0 (2026-08-15)** — voice project attach + Stratum v2 + offline-failover anti-flap + charter re-baseline. (Prior tags: v0.8.2 2026-07-28 first-run fail-soft; v0.8.1, v0.8.0 self-provisioning installer; v0.7.0 2026-07-13; v0.6.0 2026-06-20.)
 
 ## Open questions the maintainer owns
 - ~~Phase-3 `installkit/` canonical home~~ — **RESOLVED 2026-07-20: its own repo** (github.com/indyfive11/installkit), both layers vendor at a pinned SHA.
