@@ -602,16 +602,34 @@ def _reassemble_floor(ctx: AgentContext):
 _OFFLINE_NOTICE = "I've lost my internet connection — switching to my local brain. I won't have web access until it's back."
 _BACK_ONLINE_NOTICE = "I'm back online."
 
+# While auto-failed-over, retry the REAL cloud path at most this often (seconds). Universal behavioral
+# tuning constant — the empirical flap timescale is ~seconds, 45s is a stability margin; it does not vary
+# by hardware/install (unlike GPU/audio/LAN values), so it stays a constant per the config-generalization
+# SOP's universal-constant carve-out, mirroring _STARTUP_TIMEOUT (ollama.py) and the probe timeout below.
+# TRIPWIRE: the fix here is a COMPLETION probe, not a longer dwell — if flaps still slip through, the
+# answer is a stronger/more-frequent real-path probe, never reverting on bare-GET (host-answers) health.
+_RECOVERY_PROBE_INTERVAL = 45
+# Don't re-speak the outage notice within this window — suppresses a fast up/down flap re-announcing
+# "lost internet / back online" each cycle. A genuinely new outage minutes later still announces.
+_OFFLINE_NOTICE_COOLDOWN = 60
 
-async def _cloud_reachable(ctx: AgentContext) -> bool:
-    """True if the cloud backend host answers AT ALL (any HTTP status ⇒ the internet is back). A
-    connect/DNS/timeout failure ⇒ still offline. Cheap, short-timeout, never raises — used by the
-    per-turn recovery probe to decide when to leave an offline failover."""
-    import httpx
-    url = ctx.config.base_url or "https://gab.ai/v1"
+
+async def _cloud_completion_ok(ctx: AgentContext) -> bool:
+    """True if the CLOUD backend can complete a real (tiny) inference — i.e. the same streaming/HTTP path
+    an offline failover tripped on actually works again. Deliberately NOT a bare GET to the host: a GET
+    answers even while the completion endpoint is down (observed live 2026-08-15 — GET succeeded 1s after
+    the streaming call failed), which is exactly the false-recovery that makes a GET-based revert flap.
+    Cheap (a 1-message prompt), never raises — a connectivity error just returns False, keeping us local."""
+    client = ctx.clients.get("gab") or ctx.client
+    if client is None:
+        return False
     try:
-        async with httpx.AsyncClient() as c:
-            await c.get(url, timeout=2.0)
+        # Bound the probe: a fast connect failure (the common outage) returns quickly, but a hung endpoint
+        # that accepts the socket and never answers must not stall this turn — cap it like the old GET did.
+        await asyncio.wait_for(
+            client.complete_simple([ChatMessage(role="user", content="ping")], model=ctx.config.model),
+            timeout=6.0,
+        )
         return True
     except Exception:
         return False
@@ -771,15 +789,20 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
             return
         dlog(ctx, "meta", matched="none", routed="llm")
 
-        # Internet-outage recovery: if a prior turn auto-failed over to the local model, probe the cloud
-        # once at the top of THIS turn. Reachable again ⇒ revert to the cloud router and say so; still down
-        # ⇒ stay on local silently and answer this turn there. Per-turn (not a background task) so it can
-        # never race a turn's backend state. Only fires for an AUTO failover (offline_failover); a manual
-        # "switch to local" is left alone. Skips the ~2s probe entirely when we never failed over.
-        if ctx.offline_failover and await _cloud_reachable(ctx):
-            from gabagent.local.ollama import exit_offline_local
-            await exit_offline_local(ctx)
-            await emit(events.token(_BACK_ONLINE_NOTICE))
+        # Internet-outage recovery with a STABILIZATION GUARD: if a prior turn auto-failed over to the
+        # local model, retry the cloud at the top of THIS turn — but only with a REAL completion probe
+        # (_cloud_completion_ok exercises the streaming/HTTP path that flapped; a bare GET answers while
+        # that path is still down and would revert into a broken endpoint, flapping every cycle). Rate-
+        # limited to once per _RECOVERY_PROBE_INTERVAL so a sustained outage isn't probed every turn. Only
+        # revert — and speak "back online" — when the real path genuinely answers; otherwise stay on local
+        # silently and answer this turn there. Per-turn (not a background task) so it can never race a
+        # turn's backend state. Only fires for an AUTO failover (offline_failover); a manual pick is left.
+        if ctx.offline_failover and time.monotonic() >= ctx.cloud_probe_after:
+            ctx.cloud_probe_after = time.monotonic() + _RECOVERY_PROBE_INTERVAL
+            if await _cloud_completion_ok(ctx):
+                from gabagent.local.ollama import exit_offline_local
+                await exit_offline_local(ctx)
+                await emit(events.token(_BACK_ONLINE_NOTICE))
 
         # "Addressed-to-me?" filter: the wake window passes follow-on speech for multi-part commands,
         # so undirected speech (a curse, thinking aloud, commentary about the assistant) can land here
@@ -991,19 +1014,26 @@ async def _run_turn(ctx: AgentContext, vs, user_text: str, wake: dict | None = N
                             and getattr(ctx.config, "voice_offline_failover", True)
                             and ctx.config.local_model and _is_connectivity_error(e)):
                         from gabagent.local.ollama import enter_offline_local
-                        # Speak BEFORE the (possibly slow, cold ROCm) Ollama start so the user isn't left in
-                        # silence; sets the expectation that web access is gone until the connection returns.
-                        await emit(events.token(_OFFLINE_NOTICE))
+                        # Announce at most once per outage: suppress a repeat within the cooldown so a fast
+                        # up/down flap can't spam "lost internet". Speak BEFORE the (possibly slow, cold
+                        # ROCm) Ollama start so the user isn't left in silence when we do speak.
+                        _t = time.monotonic()
+                        announce = _t - ctx.offline_notice_at >= _OFFLINE_NOTICE_COOLDOWN
+                        if announce:
+                            await emit(events.token(_OFFLINE_NOTICE))
+                            ctx.offline_notice_at = _t
                         err = await enter_offline_local(ctx)
                         if not err:
                             ctx.voice_announced_model = ctx.config.local_model  # don't also announce a "switch"
+                            ctx.cloud_probe_after = time.monotonic() + _RECOVERY_PROBE_INTERVAL  # first retry in a bit
                             continue                                            # retry this turn on local
                         # Local couldn't start either → honest combined line, then end the turn gracefully.
                         dlog(ctx, "offline_failover", on=False, error=str(err)[:120])
                         msg = " I can't reach my local brain either, so I'm stuck until the connection's back."
                         await emit(events.token(msg))
-                        ctx.session.append_message(ChatMessage(role="assistant", content=_OFFLINE_NOTICE + msg))
-                        text_buf = _OFFLINE_NOTICE + msg
+                        head = _OFFLINE_NOTICE if announce else ""
+                        ctx.session.append_message(ChatMessage(role="assistant", content=head + msg))
+                        text_buf = head + msg
                         break
                     # HARD backend failure (402 billing / auth / missing model) — NEVER silent. Announce
                     # ONCE, mark the backend degraded so the ladder skips it (the floor moves up), and

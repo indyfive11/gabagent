@@ -1,4 +1,5 @@
 import json
+import time
 import types
 from pathlib import Path
 import pytest
@@ -531,25 +532,105 @@ async def test_offline_failover_kill_switch_disables_it(home, monkeypatch):
     assert any(e.type == "error" for e in evs)
 
 
-async def test_recovery_probe_reverts_to_cloud_when_back(home, monkeypatch):
-    """While offline-failed-over, the per-turn probe checks the cloud at the top of the turn; when it's
-    reachable again, revert to the cloud router, say 'back online', and answer on the cloud model."""
-    import gabagent.voice.turn as turnmod
+async def test_recovery_probe_reverts_when_real_completion_succeeds(home, monkeypatch):
+    """While offline-failed-over, the per-turn probe attempts a REAL cloud completion at the top of the
+    turn; when it genuinely answers, revert to the cloud router, say 'back online', and answer on cloud.
+    (FakeClient.complete_simple returns without raising ⇒ the probe passes — no _cloud_reachable stub.)"""
     import gabagent.local.ollama as ol
-    async def _reachable(ctx): return True
     async def _noop(ctx): return None
-    monkeypatch.setattr(turnmod, "_cloud_reachable", _reachable)  # cloud is back
     monkeypatch.setattr(ol, "unload_local", _noop)               # don't hit a real Ollama to free VRAM
     proj = home / "proj"; proj.mkdir()
     ctx = make_ctx(proj, [["Welcome back — 2 plus 2 is 4."]], voice_intent_filter=False,
                    local_model="devstral:24b")
     ctx.local_mode = True; ctx.offline_failover = True           # pretend a prior turn failed over
+    ctx.cloud_probe_after = 0.0                                  # probe is due
     ctx.local_client = FakeClient([["should not be used"]])
     evs = await run_turn(ctx, "what is two plus two")
     spoken = "".join(e.text for e in evs if e.type == "token").lower()
     assert "back online" in spoken                               # the recovery notice
     assert "4" in spoken                                         # answered on the cloud model
     assert not ctx.local_mode and not ctx.offline_failover       # reverted cleanly
+    assert ctx.cloud_probe_after == 0.0                          # rate-limiter re-armed for a future outage
+
+
+async def test_recovery_stays_local_when_completion_probe_fails(home, monkeypatch):
+    """The core anti-flap guarantee: a host that would answer a bare GET but whose COMPLETION path is
+    still down must NOT trigger a revert. The probe is a real completion, so it fails ⇒ we stay local,
+    say nothing about being back, and answer this turn on the local model."""
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [], voice_intent_filter=False, local_model="devstral:24b")
+    ctx.client = _OutageClient()                                 # completion path still down (GET would lie)
+    ctx.local_mode = True; ctx.offline_failover = True
+    ctx.cloud_probe_after = 0.0                                  # probe is due
+    ctx.local_client = FakeClient([["Two plus two is four."]])
+    evs = await run_turn(ctx, "what is two plus two")
+    spoken = "".join(e.text for e in evs if e.type == "token").lower()
+    assert "back online" not in spoken                           # did NOT falsely revert
+    assert ctx.local_mode and ctx.offline_failover               # still failed over
+    assert "four" in spoken                                      # answered on local
+
+
+async def test_recovery_probe_is_rate_limited(home, monkeypatch):
+    """The probe fires at most once per interval: with cloud_probe_after in the future the cloud isn't
+    probed at all this turn (even though it's back), so we don't hammer the API every turn while offline."""
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [], voice_intent_filter=False, local_model="devstral:24b")
+    # ctx.client is a healthy FakeClient (probe WOULD pass) — but the rate-limit gate blocks it.
+    ctx.local_mode = True; ctx.offline_failover = True
+    ctx.cloud_probe_after = time.monotonic() + 1000             # not due yet
+    ctx.local_client = FakeClient([["Answered locally."]])
+    evs = await run_turn(ctx, "you there")
+    spoken = "".join(e.text for e in evs if e.type == "token").lower()
+    assert "back online" not in spoken                           # probe skipped → no revert
+    assert ctx.local_mode and ctx.offline_failover
+    assert "answered locally" in spoken
+
+
+async def test_offline_notice_suppressed_within_cooldown(home, monkeypatch):
+    """A fresh failover whose last outage notice was just spoken (a fast flap) fails over SILENTLY — no
+    repeated 'lost my internet' — while still switching to local and answering."""
+    import gabagent.local.ollama as ol
+    async def _ok(ctx): return None
+    monkeypatch.setattr(ol, "ensure_ollama_running", _ok)
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [], voice_intent_filter=False, local_model="devstral:24b")
+    ctx.client = _OutageClient()                                 # cloud down → triggers failover
+    ctx.local_client = FakeClient([["Paris is the capital of France."]])
+    ctx.offline_notice_at = time.monotonic()                    # just announced (flap) → within cooldown
+    evs = await run_turn(ctx, "what's the capital of France")
+    spoken = "".join(e.text for e in evs if e.type == "token").lower()
+    assert "local brain" not in spoken                           # the notice was suppressed
+    assert ctx.local_mode and ctx.offline_failover               # but we DID fail over
+    assert "paris" in spoken                                     # and answered, on local
+
+
+def test_switch_to_cloud_clears_stale_failover(home, monkeypatch):
+    import asyncio
+    import gabagent.local.ollama as ol
+    from gabagent.voice.commands import switch_to_cloud
+    async def _noop(ctx): return None
+    monkeypatch.setattr(ol, "unload_local", _noop)
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [])
+    ctx.offline_failover = True; ctx.cloud_probe_after = 123.0
+    asyncio.run(switch_to_cloud(ctx))
+    assert not ctx.local_mode and not ctx.offline_failover       # manual cloud pick clears the auto flag
+    assert ctx.cloud_probe_after == 0.0
+
+
+def test_switch_to_local_clears_stale_failover(home, monkeypatch):
+    import asyncio
+    import gabagent.local.ollama as ol
+    from gabagent.voice.commands import switch_to_local
+    async def _ok(ctx): return None
+    monkeypatch.setattr(ol, "ensure_ollama_running", _ok)
+    proj = home / "proj"; proj.mkdir()
+    ctx = make_ctx(proj, [], local_model="devstral:24b")
+    ctx.local_client = FakeClient([])                            # preset → skips real client build
+    ctx.offline_failover = True; ctx.cloud_probe_after = 123.0
+    asyncio.run(switch_to_local(ctx))
+    assert ctx.local_mode and not ctx.offline_failover           # deliberate local pick is not an auto-failover
+    assert ctx.cloud_probe_after == 0.0
 
 
 def test_offline_addendum_only_present_when_failed_over(home):

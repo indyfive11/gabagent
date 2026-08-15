@@ -307,6 +307,8 @@ async def switch_to_local(ctx: AgentContext) -> str | None:
         except Exception:
             ctx.local_context_summary = None
     ctx.local_mode = True
+    ctx.offline_failover = False   # a DELIBERATE local pick is not an auto-failover — don't auto-revert it
+    ctx.cloud_probe_after = 0.0
     if ctx.voice_session is not None:
         ctx.voice_session.disarm_all()
     return None
@@ -316,6 +318,8 @@ async def switch_to_cloud(ctx: AgentContext) -> str | None:
     """Return to the cloud brain (router re-enabled). Ollama is left running, but the
     local model is proactively unloaded so VRAM frees immediately."""
     ctx.local_mode = False
+    ctx.offline_failover = False   # clear any stale failover flag so the recovery probe won't fire/revert
+    ctx.cloud_probe_after = 0.0
     ctx.active_model = None
     if ctx.voice_session is not None:
         ctx.voice_session.disarm_all()

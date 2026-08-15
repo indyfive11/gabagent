@@ -52,6 +52,13 @@ class AgentContext:
     # manual "switch to local", which leaves this False). Gates the per-turn cloud-recovery probe so
     # only an auto-failover reverts to the cloud when the connection returns; a deliberate local pick stays.
     offline_failover: bool = False
+    # Anti-flap for the auto offline-failover. `cloud_probe_after` rate-limits the per-turn cloud
+    # recovery probe (a REAL completion, not a bare GET) to once per interval while failed over, so a
+    # host that answers a GET while its streaming endpoint is still down can't trigger a premature
+    # revert. `offline_notice_at` timestamps the last spoken outage notice so a fast up/down flap can't
+    # re-announce every cycle. Both monotonic seconds; 0.0 = never/re-armed.
+    cloud_probe_after: float = 0.0
+    offline_notice_at: float = 0.0
     # Lazily-built per-backend clients keyed "gab" | "claude" | "local", for the cross-backend
     # escalation ladder. `client`/`local_client` remain for back-compat and the exclusive local_mode.
     clients: dict[str, Any] = field(default_factory=dict)

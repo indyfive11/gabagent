@@ -97,6 +97,7 @@ async def exit_offline_local(ctx: AgentContext) -> None:
     VRAM, and clear the per-turn routing so the next turn re-routes through the cloud ladder normally."""
     ctx.local_mode = False
     ctx.offline_failover = False
+    ctx.cloud_probe_after = 0.0        # episode over — a future outage re-arms the probe from scratch
     ctx.active_model = ctx.active_effort = ctx.active_backend = None
     await unload_local(ctx)
     from gabagent.voice.debuglog import dlog
